@@ -17,6 +17,7 @@ from collections import namedtuple
 import ep_xpress
 from ep_xpress.adapters.sglang_config import (
     contiguous_expert_map,
+    receive_capacity_from_scheduler,
     validate_runner_config,
     validate_server_args,
 )
@@ -45,7 +46,7 @@ class Tensor:
 
 
 @contextmanager
-def fake_adapter(rows=3):
+def fake_adapter(rows=3, scheduler_counts=(2, 1)):
     calls = []
     topk_type = namedtuple("StandardTopKOutput", "topk_weights topk_ids router_logits")
     output_type = namedtuple("StandardDispatchOutput", "hidden_states hidden_states_scale topk_output")
@@ -105,6 +106,7 @@ def fake_adapter(rows=3):
            StandardCombineInput=combine_type, StandardDispatchOutput=output_type)
     module("sglang.srt.layers.moe.topk", StandardTopKOutput=topk_type,
            TopKOutputChecker=SimpleNamespace(format_is_standard=lambda value: isinstance(value, topk_type)))
+    module("sglang.srt.layers.dp_attention", get_dp_global_num_tokens=lambda: scheduler_counts)
     parallel = SimpleNamespace(tp_size=2, attn_dp_size=2, moe_ep_size=2, moe_ep_rank=0,
                                moe_ep_group=SimpleNamespace(cpu_group=object()))
     module("sglang.srt.runtime_context", get_parallel=lambda: parallel)
@@ -119,6 +121,15 @@ def fake_adapter(rows=3):
 
 
 class AdapterValidationTest(unittest.TestCase):
+    def test_scheduler_capacity_bound(self):
+        self.assertEqual(receive_capacity_from_scheduler(
+            [3, 0], world_size=2, max_tokens_per_rank=4), 3)
+        self.assertEqual(receive_capacity_from_scheduler(
+            [0, 0], world_size=2, max_tokens_per_rank=4), 0)
+        for counts in (None, [3], [5, 0], [-1, 2], [True, 2], [1.0, 2]):
+            with self.subTest(counts=counts), self.assertRaises(ValueError):
+                receive_capacity_from_scheduler(counts, world_size=2, max_tokens_per_rank=4)
+
     def test_contiguous_mapping(self):
         self.assertEqual(contiguous_expert_map(6, 3), [0, 0, 1, 1, 2, 2])
         with self.assertRaises(ValueError):
@@ -146,6 +157,37 @@ class AdapterValidationTest(unittest.TestCase):
 
 
 class AdapterContractTest(unittest.TestCase):
+    def test_host_sm_keeps_device_count_off_host_path(self):
+        class DeviceCount:
+            def __bool__(self):
+                raise AssertionError("device count must not be converted to bool")
+
+            def __eq__(self, other):
+                raise AssertionError("device count must not be inspected")
+
+            def __ne__(self, other):
+                raise AssertionError("device count must not be inspected")
+
+        with patch.dict(os.environ, {"EP_XPRESS_TRANSPORT": "host_sm"}):
+            with fake_adapter(rows=7, scheduler_counts=[2, 5]) as fixture:
+                fixture.batch.valid_count = DeviceCount()
+                dispatcher = fixture.module.HostEPDispatcher(runner_config())
+                output = dispatcher.dispatch(Tensor((2, 16)), fixture.topk(object(), object(), object()))
+                self.assertTrue(fixture.calls[0][1]["config"].fatal_errors)
+                self.assertEqual(fixture.calls[-1][2]["recv_capacity"], 7)
+                self.assertEqual(output.topk_output.router_logits.shape, (7, 0))
+                self.assertEqual(output.hidden_states.shape, (7, 16))
+                dispatcher.combine(fixture.combine(Tensor((7, 16))))
+                self.assertIs(fixture.calls[-1][1][1], fixture.batch.handle)
+
+    def test_host_sm_requires_scheduler_capacity(self):
+        with patch.dict(os.environ, {"EP_XPRESS_TRANSPORT": "host_sm"}):
+            with fake_adapter(scheduler_counts=None) as fixture:
+                dispatcher = fixture.module.HostEPDispatcher(runner_config())
+                with self.assertRaisesRegex(ValueError, "scheduler token counts"):
+                    dispatcher.dispatch(Tensor((2, 16)), fixture.topk(object(), object(), object()))
+                self.assertEqual(fixture.calls, [])
+
     def test_no_second_id_mapping_or_weight_application(self):
         with fake_adapter() as fixture:
             dispatcher = fixture.module.HostEPDispatcher(runner_config())

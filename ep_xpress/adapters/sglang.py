@@ -12,7 +12,12 @@ import torch
 import torch.distributed as dist
 
 from ep_xpress import Config, Context
-from ep_xpress.adapters.sglang_config import contiguous_expert_map, validate_runner_config
+from ep_xpress.adapters.sglang_config import (
+    contiguous_expert_map,
+    receive_capacity_from_scheduler,
+    validate_runner_config,
+)
+from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
@@ -67,6 +72,8 @@ class HostEPDispatcher(BaseDispatcher):
         if dist.get_rank(self._group) != parallel.moe_ep_rank:
             raise ValueError("EP-Xpress requires matching framework and metadata rank ordering")
         self._device = torch.device("cuda", torch.cuda.current_device())
+        self._world_size = size
+        transport = os.environ.get("EP_XPRESS_TRANSPORT", "host_ce")
         self._config = Config(
             hidden_size=moe_runner_config.hidden_size,
             topk=moe_runner_config.top_k,
@@ -74,6 +81,8 @@ class HostEPDispatcher(BaseDispatcher):
             chunk_bytes=int(os.environ.get("EP_XPRESS_CHUNK_BYTES", str(2 << 20))),
             slots=int(os.environ.get("EP_XPRESS_SLOTS", "2")),
             host_pool_budget_bytes=int(os.environ.get("EP_XPRESS_HOST_BUDGET_BYTES", str(512 << 20))),
+            transport=transport,
+            fatal_errors=transport == "host_sm",
         )
         self._expert_map = tuple(contiguous_expert_map(moe_runner_config.num_experts, size))
         self._context_key = (self._group, self._device, self._config, self._expert_map)
@@ -109,16 +118,29 @@ class HostEPDispatcher(BaseDispatcher):
         stream = torch.cuda.current_stream(self._device)
         tag = f"layer/{self._layer_id}/operation/{self._sequence}"
         try:
+            dispatch_options = {}
+            if self._config.transport == "host_sm":
+                # These CPU counts already exist in the scheduler. Reading the
+                # GPU valid count here would synchronize every MoE layer.
+                dispatch_options["recv_capacity"] = receive_capacity_from_scheduler(
+                    get_dp_global_num_tokens(),
+                    world_size=self._world_size,
+                    max_tokens_per_rank=self._config.max_tokens_per_rank,
+                )
             batch = self._context().dispatch_async(
                 hidden_states,
                 topk_output.topk_ids,
                 topk_output.topk_weights,
                 tag=tag,
                 stream=stream,
+                **dispatch_options,
             ).wait(stream=stream)
-            if batch.valid_count != batch.hidden.shape[0]:
+            rows = batch.hidden.shape[0]
+            if self._config.transport == "host_ce" and batch.valid_count != rows:
                 raise ValueError("The eager adapter requires unpadded dispatch output")
-            self._tickets.append(_Ticket(batch.handle, tag, batch.valid_count))
+            # host_sm returns fixed capacity. Padding carries IDs=-1 and zero
+            # weights; combine consumes only valid rows using its GPU handle.
+            self._tickets.append(_Ticket(batch.handle, tag, rows))
             self._sequence += 1
             return StandardDispatchOutput(
                 hidden_states=batch.hidden,
@@ -126,7 +148,7 @@ class HostEPDispatcher(BaseDispatcher):
                 topk_output=StandardTopKOutput(
                     topk_weights=batch.weights,
                     topk_ids=batch.local_ids,
-                    router_logits=batch.hidden.new_empty((batch.valid_count, 0), dtype=torch.float32),
+                    router_logits=batch.hidden.new_empty((rows, 0), dtype=torch.float32),
                 ),
             )
         except Exception:

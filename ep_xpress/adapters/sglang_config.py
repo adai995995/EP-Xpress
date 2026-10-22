@@ -53,3 +53,18 @@ def contiguous_expert_map(num_experts, world_size):
         raise ValueError("num_experts must be positive and divisible by world_size")
     local = num_experts // world_size
     return [expert // local for expert in range(num_experts)]
+
+
+def receive_capacity_from_scheduler(counts, *, world_size, max_tokens_per_rank):
+    """Bound rank-deduplicated rows with existing CPU forward metadata.
+
+    SGLang publishes padded per-DP-rank counts before the forward. Each source
+    token can appear at most once on a receiving rank, regardless of top-k.
+    No routing tensor or device count is copied to the host here.
+    """
+    if not isinstance(counts, (list, tuple)) or len(counts) != world_size:
+        raise ValueError("host_sm requires scheduler token counts for every EP rank")
+    if any(type(count) is not int or not 0 <= count <= max_tokens_per_rank
+           for count in counts):
+        raise ValueError("scheduler token counts exceed the configured per-rank capacity")
+    return sum(counts)

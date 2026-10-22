@@ -3,11 +3,11 @@
 An independent expert-parallel communication library for single-node MoE
 inference through host memory, without GPU peer access or NVLink payloads.
 
-**Status: experimental BF16 eager reference implementation.** The library
-implements real CUDA transfers and multi-process dispatch/combine. Its CPU
-metadata exchange, CPU packing, and polling are intended to establish a
-correct, measurable baseline. It is not an optimized replacement for existing
-production EP backends and does not yet support CUDA Graph capture.
+**Status: experimental BF16 eager implementation.** Two selectable transports
+share the dispatch/combine interface: `host_ce` uses CPU routing and copy
+engines; `host_sm` runs routing and mapped-host communication on the GPU.
+Neither transport supports CUDA Graph capture. End-to-end performance must be
+measured against the intended inference framework and workload.
 
 ## Implemented
 
@@ -15,20 +15,25 @@ production EP backends and does not yet support CUDA Graph capture.
   selected experts are on that rank. The router and expert GEMM stay outside
   the library.
 - Source-shared host payloads, CE D2H/H2D, and CPU gather into reusable pinned
-  receive packs. No remote GPU pointers, GPU IPC, peer copies, or RDMA.
+  receive packs in `host_ce`. The `host_sm` path uses GPU loads/stores to
+  registered shared host pages, with GPU routing, destination deduplication,
+  publication, acknowledgments, and inverse routing.
+- No remote GPU pointers, GPU IPC, peer copies, or RDMA in either transport.
 - Bounded per-producer dispatch/combine rings, configurable slot count,
   immutable published chunks, generation IDs, idempotent consumer ACKs,
   backpressure, and simultaneous send/receive progress.
 - Operation-scoped inverse-route handles, already-weighted rank partials,
   deterministic rank-order FP32 remote accumulation, and BF16 results.
-- A dedicated Gloo control group with a bounded timeout. Gloo carries
-  initialization and route metadata, never activation/result tensors.
+- A dedicated Gloo control group with a bounded timeout. In `host_ce` it
+  carries initialization and route metadata. In `host_sm` it is used for
+  setup and shutdown only; per-operation metadata remains on the GPU.
 - An experimental adapter patch for SGLang v0.5.21, kept separate from the core.
 
-The first implementation may export unused rows within a nonempty source
-chunk. Reported D2H bytes include those rows; ideal routing byte counts are not
-reported as actual transfer volume. A host copy is shared, but each destination
-still consumes its own H2D bandwidth.
+The `host_ce` reference may export unused rows within a nonempty source chunk.
+Reported CE D2H bytes include those rows; ideal routing byte counts are not
+reported as actual transfer volume. SM payload counters are not implemented.
+A host copy is shared, but each destination still consumes its own PCIe read
+bandwidth.
 
 ## Requirements and install
 
@@ -67,13 +72,46 @@ with Context(group=ep_group, expert_to_rank=expert_owners, config=config) as ep:
 
 `x` is contiguous BF16 `[T, H]`; IDs are integer `[T, K]`; weights are FP32
 `[T, K]`, all on the local device. `local_ids` uses `-1` for experts on other
-ranks. Original weights are retained and are not renormalized.
+ranks. Active routing weights are retained and are not renormalized.
+Input IDs also accept `-1` as a dropped expert slot. An all-`-1` row represents
+a padding or dropped token: dispatch omits it and combine returns a zero row
+at its original source position, preserving the input token count.
+Weights paired with input `-1` IDs are ignored and canonicalized to zero,
+including nonfinite padding values. Active weights must remain finite.
 
 `Pending.wait(stream)` can block the host while eager metadata and dynamic
-shapes are resolved. It then inserts an event dependency into the consumer
-stream. It is not a promise of CPU-free progress or Graph compatibility.
+shapes are resolved in `host_ce`. It then inserts an event dependency into the
+consumer stream. It is not a promise of CPU-free progress or Graph compatibility.
 Operation submission is bounded; each context serializes its background
 operations, while each operation progresses D2H and H2D independently.
+
+For GPU-initiated communication, select `transport="host_sm"` and provide a
+CPU-known bound for the number of received rows:
+
+```python
+config = Config(hidden_size=2048, topk=4, max_tokens_per_rank=4096,
+                transport="host_sm")
+with Context(group=ep_group, expert_to_rank=expert_owners, config=config) as ep:
+    batch = ep.dispatch_async(x, topk_ids, topk_weights,
+                              recv_capacity=global_token_bound).wait()
+    partial = expert_runner(batch.hidden, batch.local_ids, batch.weights)
+    output = ep.combine_async(partial, batch.handle).wait()
+    ep.check()  # Explicit validation boundary; synchronizes outside the hot path.
+```
+
+Here `batch.valid_count` stays on the GPU. Receive tensors have the requested
+capacity; unused rows have expert IDs `-1`, zero weights, and zero activations.
+The expert runner must support these masked rows. `wait()` inserts a CUDA event
+dependency without waiting for GPU routing on the CPU. Without an explicit
+bound, the context reserves `world_size * max_tokens_per_rank` rows, which can
+be wasteful for decode. An undersized bound is an error, never silent truncation.
+The SGLang adapter obtains its bound from existing scheduler metadata.
+
+The first SM implementation uses one CTA per rank and acknowledges every
+chunk header on every peer, including peers that do not consume its payload.
+This provides bounded progress and slot reuse, but limits parallelism and adds
+control traffic. It does not establish a throughput improvement over CE or
+NCCL. See [the protocol description](docs/architecture.md).
 
 Each handle can be combined once and belongs to its context. Zero-input ranks
 still receive work; zero-receive ranks still participate in combine. Healthy
@@ -99,13 +137,16 @@ python -m torch.distributed.run --standalone --nproc-per-node=2 \
   --module benchmarks.replay --iterations 2 --check-handles
 python -m torch.distributed.run --standalone --nproc-per-node=8 \
   --module benchmarks.replay --iterations 2 --check-handles
+python -m torch.distributed.run --standalone --nproc-per-node=8 \
+  --module benchmarks.replay --transport host_sm --iterations 2 --check-handles
 ```
 
 The replay exercises mixed and changing routes, duplicate destination ranks,
 local-only routing, hotspots, empty ranks, all-empty operations, slot wrap,
 independent outstanding handles, and exact numerical reference checks. Its
 synthetic expert function is **not a model performance benchmark**. Timing
-includes eager control overhead; no SGLang speedup is claimed.
+includes eager control overhead. See [full-model measurements](docs/model-performance.md)
+for the separate SGLang comparison and its limits.
 
 See [initial validation results](docs/validation.md) for completed two-rank and
 eight-rank checks and their limits. Failure propagation can be exercised with:
@@ -123,8 +164,8 @@ replace full-model validation.
 
 Prefill and decode share routing and combine semantics. Future implementations
 may select different kernels and progress strategies without changing those
-semantics. Current options deliberately reject unimplemented SM transport,
-CPU reduce, and Graph modes instead of silently falling back.
+semantics. Current options deliberately reject unimplemented CPU reduce and
+Graph modes instead of silently falling back.
 
 The host budget covers shared rings plus reusable private pinned packs across
 the EP group. Device receive buffers, route metadata, allocator caches, and

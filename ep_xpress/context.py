@@ -26,7 +26,11 @@ from .transport import exchange
 
 @dataclass
 class RouteHandle:
-    """A single dispatch's inverse map. It cannot be reused for another route."""
+    """A single dispatch's inverse map. It cannot be reused for another route.
+
+    received_count is the allocated row count. For host_sm this is a capacity;
+    the exact valid count stays on the GPU in DispatchBatch.valid_count.
+    """
     _context_id: str
     operation: int
     _plan: object = field(repr=False)
@@ -35,14 +39,29 @@ class RouteHandle:
     tag: object = None
     _consumed: bool = field(default=False, repr=False)
 
+    @property
+    def inverse_map(self):
+        """Device [capacity, 2] source-rank/token map for host_sm, else None.
+
+        Only rows below the dispatch batch's device valid_count are meaningful.
+        The map is operation-scoped and must not be changed by the caller.
+        """
+        return getattr(self._plan, "inverse", None)
+
 
 @dataclass
 class DispatchBatch:
+    """Expert inputs and their operation-scoped inverse handle.
+
+    host_ce returns exact-size tensors and an integer valid_count. host_sm
+    returns padded tensors and CUDA int32[1] valid_count; rows above that count
+    have expert IDs -1 and zero data/weights and must be ignored by experts.
+    """
     hidden: torch.Tensor
     local_ids: torch.Tensor
     weights: torch.Tensor
     handle: RouteHandle
-    valid_count: int
+    valid_count: object  # int for host_ce; CUDA int32[1] for host_sm
 
 
 class Pending:
@@ -82,8 +101,15 @@ class Context:
 
     All ranks must construct contexts and submit dispatch/combine in the same
     order. group must be Gloo: it carries bootstrap and route metadata only.
-    Activation and expert-result payloads always use the host-CE transport.
+    Activation and expert-result payloads use the configured host transport.
+    host_sm uses Gloo only during setup and shutdown; its routing stays on GPU.
     """
+
+    def __new__(cls, group, expert_to_rank, config, device=None, shared_directory=None):
+        if cls is Context and config.transport == "host_sm":
+            from .host_sm import HostSMContext
+            return object.__new__(HostSMContext)
+        return object.__new__(cls)
 
     def __init__(self, group, expert_to_rank, config: Config, device=None, shared_directory=None):
         if not dist.is_initialized():
@@ -287,7 +313,9 @@ class Context:
             self._abort(error)
             raise
 
-    def dispatch_async(self, x, topk_ids, topk_weights, tag=None, stream=None):
+    def dispatch_async(self, x, topk_ids, topk_weights, tag=None, stream=None, recv_capacity=None):
+        if recv_capacity is not None:
+            raise ValueError("recv_capacity is only supported by host_sm")
         return self._submit(self._dispatch, (x, topk_ids, topk_weights), stream, tag)
 
     def _dispatch(self, inputs, operation, tag, _handle):

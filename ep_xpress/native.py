@@ -36,7 +36,7 @@ def load(*, verbose: bool = False):
         if CUDA_HOME is None:
             raise RuntimeError("A CUDA toolkit is required to build EP-Xpress")
         source_dir = Path(__file__).resolve().parent / "csrc"
-        sources = [source_dir / "bindings.cpp", source_dir / "kernels.cu"]
+        sources = [source_dir / name for name in ("bindings.cpp", "kernels.cu", "host_sm.cu")]
         digest = hashlib.sha256()
         for source in sources:
             digest.update(source.read_bytes())
@@ -177,3 +177,67 @@ def finish_combine(remote: torch.Tensor, local: torch.Tensor) -> torch.Tensor:
     if remote.device != local.device or remote.shape != local.shape:
         raise ValueError("remote and local must have the same shape and device")
     return load().finish_combine(remote, local)
+
+
+def register_mapped_host(address: int, nbytes: int) -> int:
+    """Register shared host pages and return this GPU's mapped device address.
+
+    Every participating process must register its mappings. The caller retains
+    mappings and all device-pointer tensors until the transport stream drains.
+    Only bootstrap calls this function; registration is not a per-layer action.
+    """
+    return load().register_mapped_host(
+        _integer(address, "address", 1), _integer(nbytes, "nbytes", 1)
+    )
+
+
+def host_sm_arena_bytes(hidden: int, topk: int, slots: int, chunk_rows: int) -> int:
+    """Bytes for one producer's mapped queue; use topk=0 for combine queues."""
+    return load().host_sm_arena_bytes(
+        _integer(hidden, "hidden", 1), _integer(topk, "topk"),
+        _integer(slots, "slots", 1), _integer(chunk_rows, "chunk_rows", 1),
+    )
+
+
+def host_sm_dispatch(
+    x, ids, weights, expert_rank, expert_local, pointers, rank, epoch, slots,
+    chunk_rows, timeout_ms, output, output_ids, output_weights, inverse, count, status,
+    *, identity=0,
+) -> None:
+    """Enqueue GPU routing and mapped-host dispatch on the current CUDA stream.
+
+    All tensors stay on this GPU. Output tensors have a fixed upper-bound row
+    capacity; the kernel writes the exact row count to the device-only `count`.
+    Padding has zero payload/weights and -1 expert IDs. `status` is a sticky
+    int32[1] error word initially zero. The caller must check it before accepting
+    experimental results and destroy the context after any error. No host read,
+    collective, copy-engine payload transfer or peer access occurs here.
+
+    Native pointer tensors are trusted bootstrap data, not arbitrary user input.
+    Their arenas must have the exact size returned by host_sm_arena_bytes and
+    remain registered and alive through completion. Calls sharing arenas must be
+    serialized, with monotonically increasing positive epochs on every rank.
+    """
+    load().host_sm_dispatch(
+        x, ids, weights, expert_rank, expert_local, pointers, rank, epoch, slots,
+        chunk_rows, timeout_ms, output, output_ids, output_weights, inverse, count, status,
+        _integer(identity, "identity"),
+    )
+
+
+def host_sm_combine(
+    partial, inverse, count, pointers, rank, epoch, slots, chunk_rows, timeout_ms,
+    output, remote_accum, status, *, identity=0,
+) -> None:
+    """Enqueue inverse-routed mapped-host combine without a CPU count read.
+
+    Remote BF16 partials are staged in rank-indexed BF16 planes
+    [world, local_tokens, hidden]. The owning GPU sums ranks in ascending order
+    in FP32, rounds to BF16, and adds the local BF16 partial. `partial`
+    already includes routing weights. Arena and status lifetime rules are the
+    same as host_sm_dispatch; combine uses separate arenas with topk=0.
+    """
+    load().host_sm_combine(
+        partial, inverse, count, pointers, rank, epoch, slots, chunk_rows,
+        timeout_ms, output, remote_accum, status, _integer(identity, "identity"),
+    )

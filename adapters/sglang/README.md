@@ -50,6 +50,7 @@ export EP_XPRESS_MAX_TOKENS=16384
 export EP_XPRESS_CHUNK_BYTES=2097152
 export EP_XPRESS_SLOTS=2
 export EP_XPRESS_HOST_BUDGET_BYTES=536870912
+export EP_XPRESS_TRANSPORT=host_sm
 
 NCCL_P2P_DISABLE=1 NCCL_NVLS_ENABLE=0 NCCL_IB_DISABLE=1 \
 python -m sglang.launch_server \
@@ -62,15 +63,17 @@ python -m sglang.launch_server \
   --disable-custom-all-reduce
 ```
 
-The core EP payload path uses shared pinned host staging and CE copies, not
-NCCL. The NCCL settings constrain other framework collectives and do not
+`EP_XPRESS_TRANSPORT=host_sm` selects GPU kernels that read and write mapped
+pinned host staging. `host_ce` selects the original CPU-planned CE transport
+and remains the default when this variable is unset. Neither EP payload path
+calls NCCL. The NCCL settings constrain other framework collectives and do not
 physically disable NVLink. Keep those settings, GPU count, model, precision,
 expert runner and eager mode identical in the `--moe-a2a-backend none` baseline.
 Set the maximum tokens to cover the largest per-rank forward; the core fails
 explicitly if capacity is exceeded. These capacities are starting points,
-not measured optimal values. `EP_XPRESS_HOST_BUDGET_BYTES` limits shared
-transport rings plus reusable private receive packs across the EP group;
-device staging and framework allocations are additional.
+not measured optimal values. `EP_XPRESS_HOST_BUDGET_BYTES` limits the transport's
+pinned working set: mapped rings for `host_sm`, plus reusable private receive
+packs for `host_ce`. Device staging and framework allocations are additional.
 
 ## Data ownership and lifecycle
 
@@ -80,6 +83,19 @@ would remap the IDs a second time. Expert outputs are already weighted and
 locally summed; `combine_async(..., weights_applied=True)` only reduces across
 ranks. No top-k weight is applied a second time.
 
+For `host_sm`, the adapter sizes each receive tensor from the sum of SGLang's
+existing CPU scheduler token counts for that forward. Rank deduplication bounds
+each destination by this sum. It does not copy routes or receive counts to the
+CPU. The actual valid count and inverse map remain on the GPU. Standard/Triton
+receives the full capacity, with unused IDs set to `-1`, weights and activations
+set to zero; combine reads only the valid prefix using the GPU handle. Padding
+can add expert-runner overhead, so this interface alone does not establish a
+performance improvement. A missing or invalid scheduler bound fails explicitly.
+The adapter enables fatal CUDA errors for this backend: a kernel route, capacity,
+or timeout failure aborts the worker's CUDA context and surfaces at SGLang's
+normal output synchronization. This also rejects a failed final MoE layer without
+adding a per-layer CPU fence. Restart the worker group after such a failure.
+
 The patch classifies this backend as completing its own combine, so Qwen3's
 existing local-router forward skips the outer post-expert reduction. That
 SGLang predicate is historically called `is_deepep_class_backend`; EP-Xpress
@@ -88,7 +104,9 @@ uses its own factory, core library and Standard runner, not DeepEP kernels.
 The context and host pool are shared by compatible layers on a process.
 Per-operation immutable tickets retain the handle until the matching combine.
 The first adapter rejects a second dispatch before combine; it does not silently
-overwrite a handle. Zero-receive ranks skip GEMM but still execute combine.
+overwrite a handle. Zero-capacity ranks skip GEMM but still execute combine.
+`host_sm` ranks with nonzero capacity and zero valid rows retain masked padding
+through the expert runner; the adapter never reads the device count to skip it.
 
 For controlled worker shutdown, call
 `ep_xpress.adapters.sglang.close_contexts()` on every EP rank after forwards

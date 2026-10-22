@@ -1,6 +1,6 @@
 """Stable, exact token-to-rank routing with no tensor-library dependency.
 
-This is the control-plane reference implementation. It preserves the router's
+This is the control-plane reference implementation. It preserves active router
 weights, merges repeated destination ranks, and records the inverse mapping
 needed to return one weighted partial per destination rank and token.
 """
@@ -51,11 +51,14 @@ def build_routes(
 ) -> RoutePlan:
     """Build a deterministic dispatch and inverse-combine plan.
 
-    ``-1`` denotes a padded expert slot. Every real token must select at least
-    one expert, and an expert cannot appear twice for the same token. Local
-    expert IDs follow their order in ``expert_to_rank``. Empty source ranks and
-    ranks owning no experts are supported. Local transfers remain in the plan;
-    only ``dispatch_dest_masks`` excludes the source's own rank.
+    ``-1`` denotes a padded expert slot. A row containing only ``-1`` is a
+    dropped/padding token: it retains its source position, has no destinations,
+    and has no combine contributions. Weights of ``-1`` slots are ignored and
+    normalized to zero; only active slots require finite weights. An active
+    expert cannot appear twice for the same token. Local expert IDs follow their order in
+    ``expert_to_rank``. Empty source ranks and ranks owning no experts are
+    supported. Local transfers remain in the plan; only
+    ``dispatch_dest_masks`` excludes the source's own rank.
     """
     world_size = _integer(world_size, "world_size", 1, 63)
     topk = _integer(topk, "topk", 1, (1 << 31) - 1)
@@ -98,11 +101,15 @@ def build_routes(
                 for expert in ids
             ]
             active = [expert for expert in ids if expert != -1]
-            if not active:
-                raise ValueError("each token must select at least one expert")
             if len(set(active)) != len(active):
                 raise ValueError("a token cannot select the same expert twice")
-            for weight in weights:
+            token_weights = []
+            for slot, (expert, weight) in enumerate(zip(ids, weights)):
+                if expert == -1:
+                    # CUDA routers may mask the ID without initializing or
+                    # clearing the corresponding padded weight.
+                    token_weights.append(0.0)
+                    continue
                 try:
                     valid = (
                         not isinstance(weight, bool)
@@ -112,9 +119,13 @@ def build_routes(
                 except (OverflowError, TypeError, ValueError):
                     valid = False
                 if not valid:
-                    raise ValueError("router weights must be finite real numbers")
+                    raise ValueError(
+                        "active router weights must be finite real numbers "
+                        f"(rank={source}, token={token}, slot={slot}, expert={expert})"
+                    )
+                token_weights.append(weight)
             rank_ids.append(ids)
-            rank_weights.append(list(weights))
+            rank_weights.append(token_weights)
         clean_ids.append(rank_ids)
         clean_weights.append(rank_weights)
 

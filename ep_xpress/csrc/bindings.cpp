@@ -12,6 +12,16 @@ void add_partial_cuda(torch::Tensor accum, torch::Tensor partial,
                       torch::Tensor token_indices);
 torch::Tensor finish_combine_cuda(torch::Tensor remote, torch::Tensor local);
 
+int64_t host_sm_arena_bytes(int64_t hidden, int64_t topk, int64_t slots, int64_t chunk_rows);
+void host_sm_dispatch_cuda(torch::Tensor input, torch::Tensor ids, torch::Tensor weights,
+    torch::Tensor expert_rank, torch::Tensor expert_local, torch::Tensor pointers,
+    int64_t rank, int64_t epoch, int64_t slots, int64_t chunk_rows, int64_t timeout_ms,
+    torch::Tensor output, torch::Tensor output_ids, torch::Tensor output_weights,
+    torch::Tensor inverse, torch::Tensor count, torch::Tensor status, int64_t identity);
+void host_sm_combine_cuda(torch::Tensor partial, torch::Tensor inverse, torch::Tensor count,
+    torch::Tensor pointers, int64_t rank, int64_t epoch, int64_t slots, int64_t chunk_rows,
+    int64_t timeout_ms, torch::Tensor output, torch::Tensor remote, torch::Tensor status, int64_t identity);
+
 namespace {
 
 std::mutex registration_mutex;
@@ -25,7 +35,7 @@ void check_matrix(const torch::Tensor& tensor, const char* name,
               " must be a contiguous two-dimensional tensor");
 }
 
-void register_host(uintptr_t address, int64_t nbytes) {
+void register_host_flags(uintptr_t address, int64_t nbytes, unsigned int flags) {
   TORCH_CHECK(address != 0 && nbytes > 0,
               "host address and size must be positive");
   const auto size = static_cast<size_t>(nbytes);
@@ -43,8 +53,29 @@ void register_host(uintptr_t address, int64_t nbytes) {
                 "host range overlaps an existing registration");
   }
   C10_CUDA_CHECK(cudaHostRegister(reinterpret_cast<void*>(address), size,
-                                  cudaHostRegisterPortable));
+                                  flags));
   registrations.emplace(address, size);
+}
+
+void register_host(uintptr_t address, int64_t nbytes) {
+  register_host_flags(address, nbytes, cudaHostRegisterPortable);
+}
+
+uintptr_t register_mapped_host(uintptr_t address, int64_t nbytes) {
+  int device, can_map;
+  C10_CUDA_CHECK(cudaGetDevice(&device));
+  C10_CUDA_CHECK(cudaDeviceGetAttribute(&can_map, cudaDevAttrCanMapHostMemory, device));
+  TORCH_CHECK(can_map, "CUDA device does not support mapped host memory");
+  register_host_flags(address, nbytes, cudaHostRegisterPortable | cudaHostRegisterMapped);
+  void* mapped = nullptr;
+  const auto result = cudaHostGetDevicePointer(&mapped, reinterpret_cast<void*>(address), 0);
+  if (result != cudaSuccess) {
+    std::lock_guard<std::mutex> lock(registration_mutex);
+    cudaHostUnregister(reinterpret_cast<void*>(address));
+    registrations.erase(address);
+    C10_CUDA_CHECK(result);
+  }
+  return reinterpret_cast<uintptr_t>(mapped);
 }
 
 void unregister_host(uintptr_t address) {
@@ -110,6 +141,10 @@ torch::Tensor finish_combine(torch::Tensor remote, torch::Tensor local) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("register_host", &register_host);
+  module.def("register_mapped_host", &register_mapped_host);
+  module.def("host_sm_arena_bytes", &host_sm_arena_bytes);
+  module.def("host_sm_dispatch", &host_sm_dispatch_cuda);
+  module.def("host_sm_combine", &host_sm_combine_cuda);
   module.def("unregister_host", &unregister_host);
   module.def("copy_d2h_async", &copy_d2h_async);
   module.def("add_partial", &add_partial);
