@@ -1,0 +1,131 @@
+--- a/python/sglang/srt/layers/moe/utils.py
++++ b/python/sglang/srt/layers/moe/utils.py
+@@ -34,6 +34,7 @@
+ 
+ class MoeA2ABackend(Enum):
+     NONE = "none"
++    EP_XPRESS = "ep_xpress"
+     DEEPEP = "deepep"
+     MOONCAKE = "mooncake"
+     NIXL = "nixl"
+@@ -55,6 +56,9 @@
+             if value == member.value:
+                 return member
+         raise ValueError(f"No {cls.__name__} member for value {value}")
++
++    def is_ep_xpress(self):
++        return self == MoeA2ABackend.EP_XPRESS
+ 
+     def is_none(self):
+         return self == MoeA2ABackend.NONE
+@@ -633,10 +637,11 @@
+ 
+ 
+ def is_deepep_class_backend() -> bool:
+-    """Return whether A2A combine occurs inside a DeepEP-family dispatcher."""
++    """Return whether A2A combine occurs inside the token dispatcher."""
+     b = get_moe_a2a_backend()
+     return (
+-        b.is_deepep()
++        b.is_ep_xpress()
++        or b.is_deepep()
+         or b.is_deepep_v2()
+         or b.is_mooncake()
+         or b.is_mori()
+--- a/python/sglang/srt/arg_groups/fields/exec_.py
++++ b/python/sglang/srt/arg_groups/fields/exec_.py
+@@ -710,6 +710,7 @@
+     moe_a2a_backend: A[
+         Literal[
+             "none",
++            "ep_xpress",
+             "deepep",
+             "mooncake",
+             "nixl",
+@@ -726,6 +727,7 @@
+             help="Choose the backend for MoE A2A.",
+             choices=[
+                 "none",
++                "ep_xpress",
+                 "deepep",
+                 "mooncake",
+                 "nixl",
+--- a/python/sglang/srt/arg_groups/overrides.py
++++ b/python/sglang/srt/arg_groups/overrides.py
+@@ -1505,6 +1505,7 @@
+ # Every A2A backend that forces expert parallelism to span the TP group.
+ _A2A_EP_SPANNING_BACKENDS = frozenset(
+     {
++        "ep_xpress",
+         "megamoe",
+         "deepep",
+         "deepep_v2",
+@@ -1524,6 +1525,8 @@
+ def _a2a_backend_overrides(view: Any) -> dict:
+ 
+     moe_a2a_backend = view.moe_a2a_backend
++    if moe_a2a_backend == "ep_xpress" and view.enable_waterfill:
++        raise ValueError("EP-Xpress does not support Waterfill")
+     if view.enable_waterfill and moe_a2a_backend not in ("deepep", "megamoe"):
+         logger.warning(
+             "moe_a2a_backend is overridden to 'deepep' because Waterfill "
+--- a/python/sglang/srt/arg_groups/moe_hook.py
++++ b/python/sglang/srt/arg_groups/moe_hook.py
+@@ -252,6 +252,14 @@
+     run_post_process_pass(server_args, _a2a_fusion_adjustments)
+ 
+     a2a_backend = resolved_view(server_args).moe_a2a_backend
++    if a2a_backend == "ep_xpress":
++        from ep_xpress.adapters.sglang_config import validate_server_args
++
++        validate_server_args(resolved_view(server_args), model_config_of(server_args).hf_config)
++        graph_config = with_phase(cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED)
++        graph_config = with_phase(graph_config, Phase.PREFILL, backend=Backend.DISABLED)
++        declare_resolution(server_args, "_handle_a2a_moe", cuda_graph_config=graph_config)
++        logger.warning("EP-Xpress uses eager execution; prefill and decode CUDA graphs are disabled")
+     if cfg.enable_waterfill:
+         declare_resolution(
+             server_args, "_handle_a2a_moe", enforce_shared_experts_fusion=True
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -164,6 +164,12 @@
+     quant_method: FusedMoEMethodBase,
+ ) -> BaseDispatcher:
+     a2a_backend = get_moe_a2a_backend()
++    if a2a_backend.is_ep_xpress():
++        from ep_xpress.adapters.sglang import HostEPDispatcher
++
++        if not isinstance(quant_method, UnquantizedFusedMoEMethod):
++            raise ValueError("EP-Xpress currently supports unquantized BF16 experts only")
++        return HostEPDispatcher(moe_runner_config)
+     if a2a_backend.is_none() and is_npu():
+         return AscendTPDispatcher(moe_runner_config)
+     elif (
+@@ -406,6 +412,8 @@
+ 
+         assert intermediate_size % self.moe_tp_size == 0
+         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
++        if get_moe_a2a_backend().is_ep_xpress() and reduce_results:
++            raise ValueError("EP-Xpress combines inside its dispatcher; reduce_results must be False")
+         self.reduce_results = reduce_results
+         self.use_presharded_weights = use_presharded_weights
+ 
+--- a/python/sglang/srt/layers/moe/moe_runner/triton.py
++++ b/python/sglang/srt/layers/moe/moe_runner/triton.py
+@@ -180,6 +180,16 @@
+         return MoeRunnerBackend.TRITON
+ 
+ 
++@register_fused_func("ep_xpress", "triton")
++def fused_experts_ep_xpress_to_triton(dispatch_output, quant_info, runner_config):
++    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
++
++    # A rank with no received tokens must still execute the matching combine.
++    if dispatch_output.hidden_states.shape[0] == 0:
++        return StandardCombineInput(hidden_states=dispatch_output.hidden_states)
++    return fused_experts_none_to_triton(dispatch_output, quant_info, runner_config)
++
++
+ @register_fused_func("none", "triton")
+ def fused_experts_none_to_triton(
+     dispatch_output: StandardDispatchOutput,

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ep-xpress"
+version = "0.1.0"
+description = "Host-staged expert-parallel communication for single-node MoE inference"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["torch>=2.5"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["ep_xpress*"]
+
+[tool.setuptools.package-data]
+ep_xpress = ["csrc/*.cpp", "csrc/*.cu", "csrc/*.h", "csrc/*.cuh"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["cuda: requires CUDA and the CUDA toolkit", "distributed: requires multiple CUDA devices"]
