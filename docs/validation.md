@@ -22,6 +22,7 @@ GPU loads/stores to registered shared host memory, not peer-memory transport.
 | Capacity overflow, invalid active IDs/weights, mismatched tags and handles | Both ranks observed an error in each two-rank test |
 | Missing peer in a native operation | Device timeout returned control without hanging unrelated CUDA work |
 | Fatal error in an isolated CUDA process | Ordinary CUDA synchronization reported the failure without a status readback |
+| Host-CE functional regression with two ranks | Seven cases over two iterations and reverse-order handles passed |
 
 The seven routing cases include mixed traffic, uneven/empty ranks, local-only
 traffic, hotspots, all-empty operations, partial padding, and all-padding.
@@ -68,9 +69,12 @@ utilization.
 
 ## Full-model measurements and remaining scope
 
-Full SGLang startup and matched eager model runs are documented in
-[the model comparison](model-performance.md). Short generated-output checks
-do not replace a layer-wise numerical error study.
+Full SGLang startup and matched eager model runs with one, eight, and 32
+concurrent requests are documented in [the model comparison](model-performance.md).
+The sole performance baseline is SGLang's native NCCL backend. The current
+GPU-initiated implementation is slower in all three shapes. Four short
+generated-output checks matched token IDs but do not replace a layer-wise
+numerical error study.
 
 Remaining validation and implementation work:
 

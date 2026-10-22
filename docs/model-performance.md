@@ -27,28 +27,70 @@ These controls establish a comparison under eager execution. They do not
 represent the fastest available SGLang configuration or a CUDA Graph baseline.
 Identical inputs do not by themselves guarantee identical later expert routes.
 
-## CPU reference transport
+## Performance baseline
 
-The `host_ce` implementation is slower than this NCCL baseline. Its full-model
-cost includes CPU route readback/planning, Gloo object metadata exchange, CPU
-packing, and transport progress; it is a functional reference, not a measured
-performance improvement.
+The sole performance baseline is SGLang's default NCCL backend path,
+`--moe-a2a-backend none`. The candidate is EP-Xpress with
+`--moe-a2a-backend ep_xpress` and `EP_XPRESS_TRANSPORT=host_sm`.
+The library's `host_ce` implementation is retained for functional regression
+testing; it is not a performance comparator.
 
-| Concurrent requests | NCCL batch latency (ms) | host_ce batch latency (ms) | NCCL decode TPOT (ms) | host_ce decode TPOT (ms) |
-|---:|---:|---:|---:|---:|
-| 1 | 3065.4 | 11087.8 | 92.74 | 317.64 |
-| 8 | 2969.0 | 17292.8 | 88.98 | 378.22 |
-| 32 | 3421.1 | 33074.1 | 90.63 | 414.57 |
+## GPU-initiated results
 
-Batch latency is HTTP-client time until every request finishes. Decode TPOT
-uses the benchmark's steady-state token interval; it is not communication
-kernel time. TTFT also includes scheduling and prefill. These measurements
-alone do not establish PCIe bandwidth utilization or a communication fraction.
+Measured on 2026-10-23. The configuration, input-hash, hardware, source-base,
+and transport checks passed. The saved NCCL run was reused; the candidate run
+used EP-Xpress commit `9ad5e28`. There is no speedup over the NCCL baseline.
 
-Four short natural-language sanity prompts produced identical greedy text and
-token IDs between `host_ce` and NCCL. The maximum selected-token log-probability
-difference over 29 common-prefix tokens was 0.219. This limited check does not
-prove numerical equivalence; reduction order and BF16 rounding can differ.
+| Concurrent requests | NCCL batch latency (s) | EP-Xpress batch latency (s) | EP-Xpress / NCCL | NCCL output tokens/s | EP-Xpress output tokens/s |
+|---|---:|---:|---:|---:|---:|
+| 1 | 3.065 | 4.861 | 1.586 | 10.439 | 6.583 |
+| 8 | 2.969 | 10.759 | 3.624 | 86.226 | 23.794 |
+| 32 | 3.421 | 29.570 | 8.643 | 299.317 | 34.629 |
+
+Observed batch-latency ranges over the three repetitions were 3.054–3.083,
+2.956–2.970, and 3.400–3.454 seconds for NCCL; and 4.813–4.865,
+10.706–10.808, and 29.354–29.670 seconds for EP-Xpress. These are observed
+ranges, not confidence intervals.
+
+| Concurrent requests | NCCL mean TTFT (ms) | EP-Xpress mean TTFT (ms) | NCCL last TTFT (ms) | EP-Xpress last TTFT (ms) |
+|---|---:|---:|---:|---:|
+| 1 | 190.314 | 1858.477 | 190.314 | 1858.477 |
+| 8 | 209.710 | 5744.011 | 210.145 | 7585.583 |
+| 32 | 602.041 | 20324.784 | 629.398 | 26480.826 |
+
+| Concurrent requests | NCCL per-request TPOT (ms) | EP-Xpress per-request TPOT (ms) | NCCL steady-window TPOT (ms) | EP-Xpress steady-window TPOT (ms) |
+|---|---:|---:|---:|---:|
+| 1 | 92.741 | 96.358 | 92.741 | 96.358 |
+| 8 | 88.978 | 161.060 | 88.978 | 101.555 |
+| 32 | 91.001 | 301.412 | 90.628 | 101.342 |
+
+Batch latency is HTTP-client time until every request finishes. Mean TTFT is
+the mean across requests in each repetition; last TTFT is when the final
+request receives its first token. Per-request TPOT averages each request's
+time from its first to last token divided by the subsequent token count.
+Steady-window TPOT uses only the interval from the final first token to the
+first completed request, normalized by concurrent requests and tokens emitted
+in that window. It excludes the staggered-start period and should not replace
+per-request TPOT when assessing user latency. Each table reports the median
+of its respective per-repetition statistic.
+
+Most of the batch-latency gap occurs before the final request's first token;
+TTFT includes scheduling and prefill. These measurements alone do not isolate
+communication time, PCIe bandwidth utilization, or a communication fraction.
+
+The current transport launches one CUDA thread block per rank and phase,
+processes rows serially within that block, and interleaves bounded sends and
+receives. This establishes bounded progress and GPU-side routing, but does
+not establish link saturation. Parallel routing, multiple communication
+channels, and separate prefill/decode tuning are optimization candidates;
+their contribution to the observed gap still requires profiling.
+
+Generated outputs were checked separately against the NCCL baseline. All four
+short greedy prompts matched in text and token IDs (29 generated tokens).
+Chosen-token log probabilities over the common prefixes differed by up to
+0.219 (mean absolute difference 0.0147). This small check does not prove
+numerical equivalence or identical routes for the performance requests;
+reduction order and BF16 rounding can differ.
 
 Deployment addresses, credentials, model paths, and raw logs are deliberately
 excluded. Experiment records remain in the operator's private artifact store.
