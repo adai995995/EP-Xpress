@@ -72,6 +72,15 @@ and remains the default when this variable is unset. Neither EP payload path
 calls NCCL. The NCCL settings constrain other framework collectives and do not
 physically disable NVLink. Keep those settings, GPU count, model, precision,
 expert runner and eager mode identical in the `--moe-a2a-backend none` baseline.
+
+Configure SGLang's per-rank NUMA binding to match the GPU topology before worker
+startup. Host-SM setup allocates and initializes each producer's dispatch,
+combine and mailbox files in that worker, then waits for all producers before
+CUDA host registration. It follows the worker's existing NUMA memory policy;
+there is no rank-number-to-node assumption or per-layer NUMA operation. Verify
+resident page placement separately from CPU binding, especially when using a
+custom shared directory or tmpfs mount policy.
+
 `EP_XPRESS_CHANNELS` requests parallel host-SM channels. The group negotiates
 the common cooperative-launch capacity once at initialization. Multi-rank
 operation requires cooperative launch support; the single-device path alone

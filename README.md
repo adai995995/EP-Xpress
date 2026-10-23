@@ -119,6 +119,15 @@ bound, the context reserves `world_size * max_tokens_per_rank` rows, which can
 be wasteful for decode. An undersized bound is an error, never silent truncation.
 The SGLang adapter obtains its bound from existing scheduler metadata.
 
+Host-SM arenas are allocated and initialized by their payload producer at
+context setup, including rank-pair combine queues and decode mailboxes. Bind
+each worker's NUMA memory policy to its intended GPU-local node before creating
+the context. The library follows that existing policy; it does not infer a node
+from rank numbers or change process affinity. All producers finish allocation
+before any peer registers the shared pages. This initialization collective adds
+no synchronization to dispatch or combine. Verify physical placement with
+`/proc/<pid>/numa_maps`; CPU affinity alone is not proof of page placement.
+
 For sequential, fixed-shape decode, the SM context also supports explicit
 workspace reuse and receive/reduce fusion:
 

@@ -90,6 +90,27 @@ class _MappedArena:
             self.fd = None
 
 
+def _allocate_producer_arenas(root, rank, arena_sizes):
+    """Allocate and fault this producer's pages under its worker NUMA policy.
+
+    Call before any peer maps or registers these files. The application must
+    bind each worker's memory policy to its intended node before context setup;
+    CPU affinity alone does not establish a strict allocation policy.
+    """
+    for phase, size in arena_sizes.items():
+        fd = os.open(root / f"{phase}-{rank}.arena",
+                     os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600)
+        try:
+            os.ftruncate(fd, size)
+            # Reserve storage as the producer, not the coordinator. A rank-0
+            # fallocate would already place tmpfs pages before peer first touch.
+            os.posix_fallocate(fd, 0, size)
+            with mmap.mmap(fd, size) as data:
+                ctypes.memset(ctypes.addressof(ctypes.c_char.from_buffer(data)), 0, size)
+        finally:
+            os.close(fd)
+
+
 @dataclass(frozen=True)
 class _DeviceRoute:
     inverse: torch.Tensor
@@ -342,17 +363,6 @@ class HostSMContext(Context):
                 if available.f_bavail * available.f_frsize < self._pool_bytes + (1 << 20):
                     raise ValueError("insufficient shared-memory space")
                 self._root = Path(tempfile.mkdtemp(prefix="ep-xpress-sm-", dir=base))
-                for phase, size in self._arena_sizes.items():
-                    for peer in range(self.world_size):
-                        fd = os.open(self._root / f"{phase}-{peer}.arena",
-                                     os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
-                        try:
-                            os.ftruncate(fd, size)
-                            # Reserve backing storage now; avoid a later SIGBUS
-                            # when registering a sparse file on a full tmpfs.
-                            os.posix_fallocate(fd, 0, size)
-                        finally:
-                            os.close(fd)
                 root_message[0] = str(self._root)
             except Exception:
                 root_message[1] = "mapped queue allocation failed; check shared-memory capacity and permissions"
@@ -361,6 +371,19 @@ class HostSMContext(Context):
         if root_message[1]:
             raise RuntimeError(root_message[1])
         self._root = Path(root_message[0])
+        allocation_error = None
+        try:
+            # Dispatch, rank-pair combine and decode mailbox files are all
+            # indexed by payload producer, including queues with many readers.
+            _allocate_producer_arenas(self._root, self.rank, self._arena_sizes)
+        except Exception:
+            allocation_error = "producer queue allocation failed; check shared-memory capacity and permissions"
+        allocation_errors = [None] * self.world_size
+        dist.all_gather_object(allocation_errors, allocation_error, group=self.group)
+        if any(allocation_errors):
+            raise RuntimeError(next(error for error in allocation_errors if error))
+        # Bootstrap-only barrier above: every producer has reserved and touched
+        # its complete allocation before another rank can cudaHostRegister it.
         init_error = None
         try:
             with torch.cuda.device(self.device):
