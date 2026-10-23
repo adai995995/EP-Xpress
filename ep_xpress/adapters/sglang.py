@@ -100,6 +100,11 @@ class HostEPDispatcher(BaseDispatcher):
         # All EP ranks execute the same layer sequence in the supported path.
         if self._resolved_context is not None:
             return self._resolved_context
+        # Bootstrap itself allocates/registers memory and synchronizes once.
+        # Guard only this first resolution; normal calls use the cached context
+        # and the transport's existing per-submission capture check.
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("EP-Xpress currently requires eager execution")
         if self._context_key not in _contexts:
             _contexts[self._context_key] = Context(
                 group=self._group,
