@@ -45,6 +45,14 @@ cover bounded capture, dropped samples, immutable labels, repeated sessions,
 and a single bulk-readback fence at stop. Diagnostic phases include additional
 CTA synchronization; instrumented timings require an overhead control run.
 
+Eight-rank diagnostic replay also passed at 16 channels: H=2048 with 257-token
+multi-chunk mixed/empty/hotspot cases, and H=128 with 17 tokens, one slot, all
+seven routing cases, and a 20 ms delayed peer. Both used two iterations and
+reverse-order handle checks. Requested read/write bytes matched independent
+route reconstruction and balanced globally per operation. Full-model capture
+validated 64 rank reports and 233,472 CTA records; the measured overhead and
+phase results are documented in [the model comparison](model-performance.md).
+
 The distributed checks require the stated effective channel count, rather than
 silently accepting a single-channel fallback. All eight devices reported a
 safe cooperative limit of 32 channels. Bootstrap tests also exercise mixed

@@ -211,5 +211,162 @@ difference 0.0147). This small check does not prove numerical equivalence or
 identical routes for the performance requests; reduction order and BF16
 rounding can differ.
 
+## Combine phase diagnostics
+
+The optional instrumentation in revision `5bf0cfe` was measured with the same
+eight GPUs, model, BF16 kernels, EP/TP/DP=8, eager execution, two slots, 2 MiB
+chunk budget, and 16 communication channels. NVLink counter increments were
+zero, and the remaining framework NCCL connections used SHM without P2P, NET,
+or NVLS. The performance baseline remains SGLang's default NCCL backend from
+the preceding comparison.
+
+These diagnostic requests contain 512 input and **eight output tokens**, so
+their generation times must not replace the 32-output-token performance
+results above. Batch sizes are one and 32. Each shape uses identical input IDs
+in the order plain/plain/trace-off/trace-on/trace-on/trace-off/plain/plain;
+"on" enables native combine counters and "off" retains ordinary kernels.
+The single request is pinned to DP rank 0. Batch 32 verifies four requests per
+rank, although asynchronous admission can still produce different prefill
+batch splits. Both on trials transfer identical total requested combine
+payload bytes, with per-operation global writes equal to reads.
+
+Counters are allocated before the request and copied back after profiling
+stops. No CPU counter readback or additional collective runs between layers.
+All 64 rank captures passed completeness and mode checks. The 32 instrumented
+captures contributed 233,472 CTA records, which passed status, phase-closure,
+and wait-subset checks. All 64 Chrome traces resolved GPU operations to their
+local forwards.
+
+### Measurement definitions and perturbation
+
+For every combine operation, the analysis selects its longest-resident channel
+CTA, then sums that CTA's phase times across layers on each rank. Concurrent
+channel durations are never added as latency. This closely follows transport
+kernel residency but excludes counter stores, launch boundaries, and separate
+initialization/final-reduction kernels. It is not end-to-end critical-path time.
+
+Nine disjoint phases partition that CTA duration. A separate view classifies
+completed loop iterations with **no cursor or frame progress**. Ready-only,
+credit-only, both-missing, final-drain, and other idle categories are exclusive
+within this second view. They overlap the nine phases and cannot be added to
+the phase totals. A blocked producer that still receives useful data is not
+classified as idle. The categories describe snapshots, not an independently
+isolated causal cost of ready or ACK.
+
+| Diagnostic request | Plain generation median (ms) | Trace, counters off (ms) | Trace, counters on (ms) |
+|---|---:|---:|---:|
+| Batch 1 | 966.341 | 1110.190 | 1118.335 |
+| Batch 32 | 2469.697 | 2597.372 | 2552.491 |
+
+For batch 1, the counters-on generation median is 0.73% above counters-off;
+Chrome-measured combine transport is about 0.71% higher in prefill and 6.76%
+higher in decode. Small-message phase proportions are therefore approximate.
+The trace-off generation median is 14.89% above the pooled plain median, but
+plain repeats also drift from about 934 to 1001 ms. These are observed differences,
+not isolated overhead estimates. Batch 32's
+negative on/off difference is **not** evidence of a speedup or negative
+instrumentation overhead: one on trial has a different prefill batch split.
+The other on trial and both off trials have two EXTEND steps per rank, but two
+repeats still do not establish a precise perturbation bound.
+
+### Single request: receiving payload versus control
+
+Rank 0 owns the request and receives the combined partials. Across its 48
+prefill combines, the selected-CTA total is 44.69--44.85 ms. The following
+numbers are the range across the two instrumented repeats, rounded:
+
+| Rank-0 phase | Prefill accumulated time (ms) | Fraction of selected-CTA time |
+|---|---:|---:|
+| Host payload reads | 38.37--38.52 | 85.9% |
+| ACK publication, including fence | 2.26 | 5.0% |
+| Local routing/copy | 1.38--1.39 | 3.1% |
+| Peer polling | 1.03 | 2.3% |
+| Receive metadata/selection | 0.97--0.98 | 2.2% |
+| Remaining stages | 0.67--0.69 | about 1.5% |
+
+Rank 0 has no complete no-progress iterations in these captures. Its requested
+prefill payload reads total 443.734 MiB across channels and layers. The measured
+read phase includes GPU instructions, host-memory service, and CTA barriers;
+it is not pure PCIe wire time and does not prove link saturation. Publication
+fences also account for completion effects that may outlast payload stores.
+
+Across eight decode forwards, rank 0's selected-CTA combine total is about
+37.09 ms. Payload reads account for 26.2%, ACK publication 25.8%, peer polling
+20.2%, and receive metadata/selection 13.0%. Control work matters much more for
+small messages. In the ordinary trace, combine transport totals about 35.32 ms,
+or 4.41 ms per decode forward across all 48 layers.
+
+The other seven ranks are locally IDLE but still execute experts and combine.
+Their apparent combine waiting is much larger: about 85% of their selected-CTA
+residency has no progress. This does not add 85% to request latency. Explicit
+operation identities align their work with rank 0: coarse start spreads are
+about 0.50 ms per prefill combine and 0.72 ms per decode combine. Early ranks
+can wait while the request-owning rank is still completing earlier work. In
+prefill they also spend about 40.5--41.4 ms per rank draining the final ACKs,
+overlapping the receiver's payload processing. Summing these waits would
+double-count concurrent activity.
+
+### Batch 32: stalled progress dominates kernel residency
+
+The two diagnostic trials produce different prefill splits; local IDLE
+forwards are retained separately. Within each trial the table reports the
+**median of per-rank fractions**, so column entries need not sum to 100%.
+
+| Phase within active prefill combines | First on trial | Second on trial |
+|---|---:|---:|
+| Host payload reads | 17.1% | 11.4% |
+| Host payload writes | 7.2% | 6.2% |
+| Peer polling | 60.6% | 67.6% |
+| ACK publication | 2.5% | 2.2% |
+| Other control | 9.8% | 11.0% |
+| Remaining routing/metadata/publication phases | about 2.9% | about 2.3% |
+
+The overlapping no-progress view is:
+
+| No-progress category | First on trial | Second on trial |
+|---|---:|---:|
+| Ready missing, credit available | 16.4% | 17.2% |
+| Credit missing, ready available | 0.13% | 0.14% |
+| Both ready and credit missing | 43.7% | 46.3% |
+| Final drain | 0.12% | 0.25% |
+| **All no-progress categories, median per rank** | **62.3%** | **70.5%** |
+
+The total is computed per rank before taking its median, not by adding category
+medians. Selected-CTA prefill totals have rank medians of 962 and 1179 ms. The
+ordinary traces show combine transport medians of 1143 and 1232 ms; initialization
+and final reduction together cost only about 2.65 ms per rank over prefill.
+Final reduction arithmetic is not the large component in this implementation.
+
+Decode shows a different stall pattern: 70.1--73.0% no-progress residency, mostly
+ready-only wait (68.0--71.8%), with no credit-only or both-missing idle iterations.
+Its coarse rank-start spread is around 0.61 ms per combine. Prefill's start-spread
+median is 0.49--0.54 ms, much shorter than its roughly 12--20 ms median active
+combine kernels. This motivates investigating progress inside the transport
+protocol; the traces do not isolate arrival skew's causal contribution or
+exclude its amplification by subsequent backpressure. These spreads use the shared exported Chrome time
+base and matching operation identities, with unquantified clock-alignment
+uncertainty; raw GPU globaltimer values are never subtracted across devices.
+
+### Consequences for the next optimization
+
+Deduplication and source-shared payloads primarily reduce dispatch traffic.
+Combine returns distinct already-weighted partials from each participating
+expert rank; those results cannot be deduplicated as identical activations.
+Lower byte counts do not compensate automatically for inefficient host reads,
+frequent small control transactions, or stalled queues.
+
+The present producer reuses a slot only after every peer has acknowledged it,
+including peers that did not select its payload. A CTA processes ready peers
+in sequence. These are concrete places to test destination-aware reclamation
+and more independent receive progress, while preserving safe shared-slot
+lifetime. For small decode messages, reducing empty-channel/control work and
+understanding rank arrival skew are separate priorities. For single-request
+prefill, the host-read phase dominates measured selected-CTA residency.
+
+The data establishes these mechanisms and their observed residency; it does
+not assign all both-missing waits to ACK latency, establish achieved physical
+PCIe bandwidth, or predict the speedup of removing a wait. An optimization must
+be validated again against the same default NCCL full-model baseline.
+
 Deployment addresses, credentials, model paths, and raw logs are deliberately
 excluded. Experiment records remain in the operator's private artifact store.
