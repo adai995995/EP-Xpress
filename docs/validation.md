@@ -11,13 +11,19 @@ GPU loads/stores to registered shared host memory, not peer-memory transport.
 
 | Check | Result |
 |---|---|
-| Full suite including both native CUDA transports | 61 passed, 43 subtests passed; one optional source-patch test skipped remotely |
+| Full suite including both native CUDA transports | 79 passed, 43 subtests passed; one optional source-patch test skipped remotely |
 | Local adapter tests with the pinned SGLang source available | All 11 passed, including patch application |
-| Two ranks, H=128, up to 17 tokens per rank, 1 KiB chunks, two slots | Seven cases over two iterations passed |
-| Eight ranks with the same small shape and two slots | Seven cases over three iterations passed |
+| Native four-channel partition tails, 1/3/4/5/17 tokens and one/two slots | Passed, including padding, int32 IDs, valid counts, and a shorter subsequent operation |
+| Native three-channel grid and rejection above the safe cooperative capacity | Passed; invalid launch leaves CUDA usable |
+| Late error in the final channel | Sticky error and zero valid count observed |
+| Two ranks, H=128, one token per rank, four channels | Seven cases and independent reverse-order handles passed over two iterations |
+| Eight ranks, H=128, up to 17 tokens per rank, 1 KiB chunks, four channels, two slots | Seven cases over three iterations passed |
 | Deliberately delay rank 7 by 20 ms before each phase | Eight-rank results remained exact; no overwrite/deadlock observed |
-| Eight ranks, H=2048, up to 257 tokens per rank, 64 KiB chunks | Mixed, uneven/empty and hotspot cases passed over two iterations |
-| Two ranks, one slot, delayed receiver and repeated multi-chunk traffic | All seven cases passed over two iterations |
+| Eight ranks, H=2048, up to 257 tokens per rank, 64 KiB chunks, four channels | Mixed, uneven/empty and hotspot cases passed over two iterations with int32 IDs |
+| Two ranks, one slot, four channels, delayed receiver and repeated multi-chunk traffic | All seven cases passed over two iterations |
+| Two ranks, 1,025 tokens, 2 MiB chunks and three channels | Mixed, uneven/empty and hotspot cases plus reverse-order handles passed |
+| Eight ranks, 16 channels, H=2048, up to 257 tokens per rank | Mixed, uneven/empty and hotspot cases plus reverse-order handles passed over two iterations |
+| Eight ranks, 16 channels, one token per rank, one slot, rank 7 delayed 20 ms | All seven cases and reverse-order handles passed over two iterations |
 | Live dispatch handles combined in reverse order; reject a consumed handle | Passed |
 | Capacity overflow, invalid active IDs/weights, mismatched tags and handles | Both ranks observed an error in each two-rank test |
 | Missing peer in a native operation | Device timeout returned control without hanging unrelated CUDA work |
@@ -29,6 +35,13 @@ traffic, hotspots, all-empty operations, partial padding, and all-padding.
 The replay checks device inverse maps, exact BF16 activations and final output,
 and zero-filled receive padding. Artificially delayed runs validate progress,
 not communication performance. SM byte counters are not yet implemented.
+
+The distributed checks require the stated effective channel count, rather than
+silently accepting a single-channel fallback. All eight devices reported a
+safe cooperative limit of 32 channels. Bootstrap tests also exercise mixed
+device limits, unsupported cooperative launch, actual allocation budgets, and
+per-channel abort flags. Multi-handle tests use different lengths, routes,
+weights, and payloads before combining in reverse order.
 
 ## Host-CE reference validation
 
@@ -72,9 +85,9 @@ utilization.
 Full SGLang startup and matched eager model runs with one, eight, and 32
 concurrent requests are documented in [the model comparison](model-performance.md).
 The sole performance baseline is SGLang's native NCCL backend. The current
-GPU-initiated implementation is slower in all three shapes. Four short
-generated-output checks matched token IDs but do not replace a layer-wise
-numerical error study.
+GPU-initiated implementation remains slower in all three shapes, at both four
+and 16 channels. Both settings passed four short generated-output checks with
+matching token IDs, but these do not replace a layer-wise numerical error study.
 
 Remaining validation and implementation work:
 

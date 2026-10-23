@@ -74,6 +74,8 @@ expert runner and eager mode identical in the `--moe-a2a-backend none` baseline.
 the common cooperative-launch capacity once at initialization; unsupported
 devices use one channel. The payload chunk budget is split across channels,
 with row rounding and lane metadata included in the actual host-pool check.
+Four- and 16-channel model measurements and their prefill/decode tradeoffs are
+reported in [the performance comparison](../../docs/model-performance.md).
 Set the maximum tokens to cover the largest per-rank forward; the core fails
 explicitly if capacity is exceeded. These capacities are starting points,
 not measured optimal values. `EP_XPRESS_HOST_BUDGET_BYTES` limits the transport's

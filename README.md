@@ -26,8 +26,9 @@ measured against the intended inference framework and workload.
   deterministic rank-order FP32 remote accumulation, and BF16 results.
 - A dedicated Gloo control group with a bounded timeout. In `host_ce` it
   carries initialization and route metadata. In `host_sm` it is used for
-  setup and shutdown only; routing IDs, weights, and receive counts stay on
-  the GPU. Operation identity and capacity bounds are supplied by the caller.
+  setup and shutdown only. GPUs process routing IDs and weights and transfer
+  them through host queues without CPU route planning; receive counts remain
+  device-resident. The caller supplies operation identity and capacity bounds.
 - An experimental adapter patch for SGLang v0.5.21, kept separate from the core.
 
 The `host_ce` reference may export unused rows within a nonempty source chunk.
