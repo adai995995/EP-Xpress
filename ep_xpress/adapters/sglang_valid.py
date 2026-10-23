@@ -34,46 +34,131 @@ def _align_small(Ids, Count, Sorted, Experts, Padded, CAP: tl.constexpr,
 
 
 @triton.jit
-def _count_expert(Ids, Count, Counts, TOPK: tl.constexpr, BLOCK: tl.constexpr):
-    expert = tl.program_id(0)
-    n = tl.load(Count) * TOPK
-    offset = tl.arange(0, BLOCK)
-    total = tl.full((), 0, tl.int32)
-    for start in range(0, n, BLOCK):
-        rows = start + offset
+def _route_tile_counts(Ids, Count, Counts, CAP: tl.constexpr,
+                       TOPK: tl.constexpr, E: tl.constexpr,
+                       EP: tl.constexpr, HP: tl.constexpr,
+                       BLOCK: tl.constexpr):
+    tile = tl.program_id(0)
+    n = tl.minimum(tl.maximum(tl.load(Count), 0), CAP) * TOPK
+    if tile * BLOCK < n:
+        rows = tile * BLOCK + tl.arange(0, BLOCK)
         ids = tl.load(Ids + rows, rows < n, other=-1)
-        total += tl.sum((ids == expert).to(tl.int32), axis=0)
-    tl.store(Counts + expert, total)
+        # Check the original dtype before narrowing: an out-of-range int64 id
+        # must not wrap into a valid local expert. The extra histogram bin
+        # absorbs invalid ids and the final partial tile.
+        valid = (rows < n) & (ids >= 0) & (ids < E)
+        bins = tl.where(valid, ids, E).to(tl.int32)
+        counts = tl.histogram(bins, HP)
+        es = tl.arange(0, HP)
+        tl.store(Counts + tile * EP + es, counts, es < E)
 
 
 @triton.jit
-def _scatter_expert(Ids, Count, Counts, Sorted, Experts, Padded,
-                    CAP: tl.constexpr, TOPK: tl.constexpr, E: tl.constexpr,
-                    EP: tl.constexpr, BM: tl.constexpr, BLOCK: tl.constexpr):
-    expert = tl.program_id(0)
+def _route_tile_prefix(Count, Counts, Offsets, Padded,
+                       CAP: tl.constexpr, TOPK: tl.constexpr,
+                       E: tl.constexpr, EP: tl.constexpr, BM: tl.constexpr,
+                       BLOCK: tl.constexpr, TILES: tl.constexpr,
+                       PREFIX_TILES: tl.constexpr):
+    n = tl.minimum(tl.maximum(tl.load(Count), 0), CAP) * TOPK
+    active_tiles = tl.cdiv(n, BLOCK)
+    tiles = tl.arange(0, PREFIX_TILES)
     es = tl.arange(0, EP)
-    counts = tl.load(Counts + es, es < E, other=0)
-    padded = tl.cdiv(counts, BM) * BM
-    start = tl.sum(tl.where(es < expert, padded, 0), axis=0)
-    own_count = tl.sum(tl.where(es == expert, counts, 0), axis=0)
-    own_padded = tl.cdiv(own_count, BM) * BM
-    if expert == 0:
-        tl.store(Padded, tl.sum(padded, axis=0))
-    n = tl.load(Count) * TOPK
+    if TILES <= PREFIX_TILES:
+        counts = tl.load(
+            Counts + tiles[:, None] * EP + es[None, :],
+            (tiles[:, None] < active_tiles) & (es[None, :] < E), other=0,
+        )
+        totals = tl.sum(counts, axis=0)
+        padded = tl.cdiv(totals, BM) * BM
+        starts = tl.cumsum(padded, axis=0) - padded
+        prefixes = tl.cumsum(counts, axis=0) - counts
+        # Also write row zero for an empty batch. The last metadata row holds
+        # each expert's unpadded end; neither row requires a CPU count read.
+        tl.store(
+            Offsets + tiles[:, None] * EP + es[None, :],
+            starts[None, :] + prefixes,
+            (tiles[:, None] < tl.maximum(active_tiles, 1)) & (es[None, :] < E),
+        )
+    else:
+        # Bound the per-CTA scan tensor for larger scheduler capacities. This
+        # loops over the small tile histogram, never over the routing table.
+        totals = tl.zeros((EP,), tl.int32)
+        for base in range(0, active_tiles, PREFIX_TILES):
+            counts = tl.load(
+                Counts + (base + tiles[:, None]) * EP + es[None, :],
+                (base + tiles[:, None] < active_tiles) & (es[None, :] < E), other=0,
+            )
+            totals += tl.sum(counts, axis=0)
+        padded = tl.cdiv(totals, BM) * BM
+        starts = tl.cumsum(padded, axis=0) - padded
+        tl.store(Offsets + es, starts, es < E)
+        cursor = starts
+        for base in range(0, active_tiles, PREFIX_TILES):
+            counts = tl.load(
+                Counts + (base + tiles[:, None]) * EP + es[None, :],
+                (base + tiles[:, None] < active_tiles) & (es[None, :] < E), other=0,
+            )
+            prefixes = tl.cumsum(counts, axis=0) - counts
+            tl.store(
+                Offsets + (base + tiles[:, None]) * EP + es[None, :],
+                cursor[None, :] + prefixes,
+                (base + tiles[:, None] < active_tiles) & (es[None, :] < E),
+            )
+            cursor += tl.sum(counts, axis=0)
+    tl.store(Offsets + TILES * EP + es, starts + totals, es < E)
+    tl.store(Padded, tl.sum(padded, axis=0))
+
+
+@triton.jit
+def _route_maximum(a, b):
+    return tl.maximum(a, b)
+
+
+@triton.jit
+def _scatter_route_tiles(Ids, Count, Offsets, Sorted, Experts,
+                         CAP: tl.constexpr, TOPK: tl.constexpr,
+                         E: tl.constexpr, EP: tl.constexpr, BM: tl.constexpr,
+                         BLOCK: tl.constexpr, TILES: tl.constexpr):
+    tile = tl.program_id(0)
     offsets = tl.arange(0, BLOCK)
-    cursor = tl.full((), 0, tl.int32)
-    for base in range(0, n, BLOCK):
-        rows = base + offsets
-        ids = tl.load(Ids + rows, rows < n, other=-1)
-        match = ids == expert
-        positions = tl.cumsum(match.to(tl.int32), axis=0) - 1
-        tl.store(Sorted + start + cursor + positions, rows, match)
-        cursor += tl.sum(match.to(tl.int32), axis=0)
-    tail = tl.arange(0, BM)
-    tl.store(Sorted + start + own_count + tail, CAP * TOPK, tail < own_padded - own_count)
-    for block in range(0, tl.cdiv(own_padded, BM), BLOCK):
-        indices = block + offsets
-        tl.store(Experts + start // BM + indices, expert, indices < own_padded // BM)
+    if tile < TILES:
+        n = tl.minimum(tl.maximum(tl.load(Count), 0), CAP) * TOPK
+        if tile * BLOCK < n:
+            rows = tile * BLOCK + offsets
+            ids = tl.load(Ids + rows, rows < n, other=-1)
+            valid = (rows < n) & (ids >= 0) & (ids < E)
+            local_ids = tl.where(valid, ids, E)
+            if E * BLOCK < 2147483647:
+                local_ids = local_ids.to(tl.int32)
+            else:
+                local_ids = local_ids.to(tl.int64)
+            # Including the source position in the key makes ties stable.
+            # Sorting only 256 routes avoids an [all routes, experts] match
+            # tensor and lets independent input tiles scatter concurrently.
+            keys = tl.sort(local_ids * BLOCK + offsets, descending=False)
+            sorted_experts = keys // BLOCK
+            source_rows = tile * BLOCK + keys % BLOCK
+            previous = tl.gather(sorted_experts, tl.maximum(offsets - 1, 0), axis=0)
+            run_start = tl.where((offsets == 0) | (sorted_experts != previous), offsets, 0)
+            run_start = tl.associative_scan(run_start, 0, _route_maximum)
+            valid_sorted = sorted_experts < E
+            tile_start = tl.load(
+                Offsets + tile * EP + sorted_experts, valid_sorted, other=0,
+            )
+            positions = tile_start + offsets - run_start
+            tl.store(Sorted + positions, source_rows, valid_sorted)
+    else:
+        # Expert padding occupies disjoint positions from all valid scatters.
+        expert = tile - TILES
+        start = tl.load(Offsets + expert)
+        end = tl.load(Offsets + TILES * EP + expert)
+        count = end - start
+        own_padded = tl.cdiv(count, BM) * BM
+        tail = tl.arange(0, BM)
+        tl.store(Sorted + end + tail, CAP * TOPK, tail < own_padded - count)
+        for block in range(0, tl.cdiv(own_padded, BM), BLOCK):
+            indices = block + offsets
+            tl.store(Experts + start // BM + indices, expert, indices < own_padded // BM)
 
 
 def align_valid_routes(topk_ids, valid_count, block_size, num_experts):
@@ -92,11 +177,26 @@ def align_valid_routes(topk_ids, valid_count, block_size, num_experts):
             num_warps=4,
         )
     else:
-        counts = torch.empty((num_experts,), dtype=torch.int32, device=topk_ids.device)
-        _count_expert[(num_experts,)](topk_ids, valid_count, counts, topk, 1024)
-        _scatter_expert[(num_experts,)](
-            topk_ids, valid_count, counts, sorted_ids, expert_ids, padded,
-            capacity, topk, num_experts, triton.next_power_of_2(num_experts), block_size, 1024,
+        route_block = 256
+        tiles = triton.cdiv(numel, route_block)
+        expert_block = triton.next_power_of_2(num_experts)
+        prefix_tiles = min(triton.next_power_of_2(tiles), max(1, 8192 // expert_block))
+        counts = torch.empty((tiles, expert_block), dtype=torch.int32, device=topk_ids.device)
+        offsets = torch.empty((tiles + 1, expert_block), dtype=torch.int32, device=topk_ids.device)
+        _route_tile_counts[(tiles,)](
+            topk_ids, valid_count, counts, capacity, topk, num_experts,
+            expert_block, triton.next_power_of_2(num_experts + 1), route_block,
+            num_warps=4,
+        )
+        _route_tile_prefix[(1,)](
+            valid_count, counts, offsets, padded, capacity, topk,
+            num_experts, expert_block, block_size, route_block, tiles, prefix_tiles,
+            num_warps=8 if prefix_tiles * expert_block >= 4096 else 4,
+        )
+        _scatter_route_tiles[(tiles + num_experts,)](
+            topk_ids, valid_count, offsets, sorted_ids, expert_ids,
+            capacity, topk, num_experts, expert_block, block_size, route_block, tiles,
+            num_warps=4,
         )
     return sorted_ids, expert_ids, padded
 

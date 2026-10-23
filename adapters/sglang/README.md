@@ -169,6 +169,14 @@ SGLang GEMMs retain their tuning and BF16 intermediates. The original CUDA SiLU
 arithmetic reads the count and local int64 IDs directly, avoiding the old ID
 conversion and skipping unused rows. Local reduction skips nonlocal slots and
 uses FP32 top-k accumulation; weights remain applied once in the down GEMM.
+Large count-aware routing alignment uses 256-route tile histograms, a bounded
+prefix scan of the histogram table, and stable tile scatter. Each valid route
+ID is read twice across all experts, rather than twice for each expert. The
+expert order, source-row order within each expert, block alignment and padding
+sentinel are preserved. The small alignment path is unchanged. This adds one
+kernel launch to large alignment and temporary tile metadata; it does not read
+the GPU valid count on the CPU or change the transport protocol.
+
 The count-aware path supports gated SiLU without activation modifiers or fused
 interleaved SiLU weights, and ordinary route-major GEMMs without TMA.
 
