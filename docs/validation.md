@@ -1,5 +1,22 @@
 # Validation
 
+## Prepared transport revision
+
+Runtime `282437b` moves static native checks to initialization and defaults
+protocol diagnostics to off. The CUDA extension compiled in full-model
+SGLang startup. Focused local checks passed for the diagnostics configuration,
+reuse of SGLang's global receive-capacity bound, device-resident receive counts,
+and adapter handle/error handling. Python syntax and whitespace checks passed.
+The broader historical native and fault-injection suites below were not rerun
+for this change; their timeout/identity results do not describe the new default
+with protocol diagnostics disabled.
+
+Full-model channel-sweep results, transport evidence and output-sanity limits
+are recorded in the
+[prepared transport comparison](model-performance.md#prepared-transport-and-channel-count-experiment).
+All four configurations completed batches 1 and 32 with three timed repetitions
+per shape; each matched all 29 tokens in four short output-sanity prompts.
+
 ## Rank-pair combine revision
 
 The pair-queue CUDA extension compiled successfully. Thirty-one focused
@@ -139,8 +156,9 @@ Full SGLang startup and matched eager model runs with one, eight, and 32
 concurrent requests are documented in [the model comparison](model-performance.md).
 The sole performance baseline is SGLang's native NCCL backend. The earlier
 four- and 16-channel implementations were slower at all three shapes. The
-latest rank-pair revision is close to NCCL at batch 1 and remains 16.6% slower
-at batch 32; batch 8 was not remeasured. Short generated-output checks match
+latest prepared-transport sweep observes roughly 2% lower latency at batch 1;
+its best tested configuration remains 5.0% slower at batch 32. Batch 8 was not
+remeasured. Short generated-output checks match
 token IDs, but do not replace a layer-wise numerical error study.
 
 Remaining validation and implementation work:

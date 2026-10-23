@@ -29,7 +29,7 @@ measured against the intended inference framework and workload.
   carries initialization and route metadata. In `host_sm` it is used for
   setup and shutdown only. GPUs process routing IDs and weights and transfer
   them through host queues without CPU route planning; receive counts remain
-  device-resident. The caller supplies operation identity and capacity bounds.
+  device-resident. The caller preserves operation order and supplies capacity bounds.
 - An experimental adapter patch for SGLang v0.5.21, kept separate from the core.
 
 The `host_ce` reference may export unused rows within a nonempty source chunk.

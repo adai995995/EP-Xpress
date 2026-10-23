@@ -4,8 +4,8 @@ These experiments run the complete Qwen3-30B-A3B-Instruct-2507 model through
 SGLang v0.5.21. They are distinct from the synthetic expert function in the
 standalone transport replay.
 
-The latest rank-pair queue and submission-path results are in
-[Rank-pair combine and critical-path cleanup](#rank-pair-combine-and-critical-path-cleanup).
+The latest submission-path cleanup and channel sweep are in
+[Prepared transport and channel-count experiment](#prepared-transport-and-channel-count-experiment).
 Earlier sections describe earlier runtime revisions and their measurements.
 
 ## Matched configuration
@@ -490,3 +490,177 @@ revision, so older communication-time fractions must not be assigned to it.
 
 Deployment addresses, credentials, model paths, and raw logs are deliberately
 excluded. Experiment records remain in the operator's private artifact store.
+
+## Prepared transport and channel-count experiment
+
+Runtime `282437b` moves fixed native validation into `PreparedHostSM`
+construction. The object retains placement and queue tensors and caches their
+addresses, strides, dimensions and cooperative launch capacity. The adapter
+reuses SGLang's already-computed global DP buffer length. No SGLang source
+patch change is needed for that getter in the pinned revision.
+
+Protocol diagnostics default to off. Normal submission does not hash tags,
+and the kernels skip mapped-host abort/timeout polling, operation fingerprints,
+duplicate-expert checks and finite-weight diagnostics. Dynamic tensor/index
+bounds, ready/ACK, epochs, required barriers and stream lifetime dependencies
+remain. The SGLang fatal-error path skips dispatch's error-only finalization
+kernel. These changes were made together, so a model result cannot isolate the
+benefit of each check or launch removed.
+
+The experiment uses a fresh default NCCL baseline and the same eight GPUs,
+BF16 model, TP/EP/DP=8, eager execution, 512 input/32 output tokens, eight
+16-token warmup batches, and three timed repetitions per shape. Both sides
+disable GPU P2P and NVLink transports. Timing is unprofiled full-model HTTP
+latency. Protocol diagnostics are explicitly disabled in candidate runs.
+
+In the pinned SGLang implementation, the default backend's MoE input gather
+depends on DP padding. Eager prefill and the uneven one-request decode use
+`SUM_LEN`: each rank zeros a global buffer, writes its own segment and uses
+AllReduce to assemble the input. Balanced 32-request decode uses `MAX_LEN`
+and AllGather. With this run's `boundary_reduction=rs+rsv`, the output boundary
+uses `reduce_scatterv`, implemented by grouped NCCL Reduce calls to each root.
+It would be inaccurate to call every phase AllGather plus a single native
+NCCL ReduceScatter. EP-Xpress replaces this MoE boundary with local routing,
+targeted dispatch, local experts and directed combine. This code-path account
+does not determine either backend's physical PCIe byte count.
+
+### Full-model results
+
+All four candidates use the same runtime `282437b`. The fresh baseline was
+measured before the serial candidate sweep. The following values are in
+milliseconds; brackets show the minimum and maximum of three repetitions.
+The change column compares full-batch completion latency with default NCCL.
+
+| Backend / channels / chunk | Concurrent requests | Completion median [min, max] | Change vs NCCL | Mean TTFT | Mean per-request TPOT |
+|---|---:|---:|---:|---:|---:|
+| Default NCCL | 1 | 3114.857 [3062.530, 3127.222] | — | 194.775 | 94.193 |
+| EP-Xpress / 8 / 2 MiB | 1 | 3039.172 [3002.523, 3045.518] | -2.43% | 191.185 | 91.867 |
+| EP-Xpress / 16 / 2 MiB | 1 | 3043.810 [3040.791, 3063.358] | -2.28% | 193.269 | 92.002 |
+| EP-Xpress / 32 / 2 MiB | 1 | 3056.821 [3001.140, 3057.351] | -1.86% | 192.205 | 92.374 |
+| EP-Xpress / 32 / 4 MiB | 1 | 3045.453 [3042.591, 3058.332] | -2.23% | 191.061 | 92.074 |
+| Default NCCL | 32 | 3439.637 [3402.790, 3456.911] | — | 546.432 | 93.723 |
+| EP-Xpress / 8 / 2 MiB | 32 | 4100.810 [4037.064, 4159.558] | +19.22% | 964.735 | 101.206 |
+| EP-Xpress / 16 / 2 MiB | 32 | 3839.446 [3838.758, 3857.310] | +11.62% | 810.555 | 97.788 |
+| EP-Xpress / 32 / 2 MiB | 32 | 3758.110 [3755.210, 3783.087] | +9.26% | 680.794 | 99.699 |
+| EP-Xpress / 32 / 4 MiB | 32 | 3611.143 [3603.167, 3671.255] | +4.99% | 568.159 | 98.127 |
+
+TTFT and per-request TPOT are first averaged over requests within a repetition,
+then reported as the median of three repetitions. Per-request TPOT measures
+the first-to-last streamed-token interval divided by subsequent token count.
+It is not isolated GPU decode time, and its median need not add to the
+completion-latency median with the TTFT median.
+
+C32/4-MiB is the best tested 32-request configuration, 5.95% faster than the
+cleaned-up C16/2-MiB candidate but still 4.99% slower than default NCCL. At
+fixed 2 MiB, increasing C16 to C32 reduces completion time by 2.12% and mean
+TTFT by 16.01%; per-request TPOT increases by 1.95%. Increasing the chunk
+budget from 2 to 4 MiB at C32 reduces completion time by another 3.91%.
+This supports tuning parallelism together with frame granularity; it does
+not show that more CTAs alone solve the remaining overhead. The single-request
+changes are small, and these three repetitions are insufficient to establish
+a robust improvement across runs or hardware.
+
+All candidate comparisons passed configuration, input-hash, source, hardware
+and transport validation with no warnings or errors. Every rank used the
+requested effective channel count. NCCL connection logs show SHM only
+(120 baseline records, 60 per candidate), with no P2P, NET or NVLS records;
+NVLink payload counters remain unchanged on all eight GPUs in every run.
+Connection counts are not traffic measurements. The candidate's EP payload
+uses mapped host memory directly. The four short sanity prompts match text
+and all 29 output token IDs for every candidate; maximum common-prefix
+log-probability difference is 0.218722. This is limited output sanity, not
+layer-wise numerical equivalence. All full-model runs completed without
+reported runtime errors; no new kernel-phase profile was collected.
+
+To reproduce the best tested 32-request candidate's transport settings, use
+`EP_XPRESS_TRANSPORT=host_sm`, `EP_XPRESS_CHANNELS=32`,
+`EP_XPRESS_CHUNK_BYTES=4194304`, `EP_XPRESS_SLOTS=2` and
+`EP_XPRESS_DIAGNOSTICS=0`, together with the matched model and host-only
+transport configuration above. This is a measured configuration for this
+hardware/workload, not a new portable default.
+
+### Interpreting additional CTAs
+
+The channel parameter controls both phases and partitions the payload budget:
+
+| Channels | Chunk budget | Dispatch CTAs/GPU | Combine CTAs/GPU | Dispatch rows/slot | Combine rows/pair/slot | Total mapped host allocation |
+|---|---:|---:|---:|---:|---:|---:|
+| 8 | 2 MiB | 8 | 64 | 64 | 8 | 70,254,592 B |
+| 16 | 2 MiB | 16 | 128 | 32 | 4 | 72,876,032 B |
+| 32 | 2 MiB | 32 | 256 | 16 | 2 | 77,594,624 B |
+| 32 | 4 MiB | 32 | 256 | 32 | 4 | 145,752,064 B |
+
+These are configured layouts for EP8, H=2048 and top-k=8, including two slots,
+headers and page rounding. Allocation counts unique shared host storage across
+all eight ranks and both phases, not each process's mappings of that storage.
+All eight ranks used these effective channel counts in the completed runs.
+CTAs are blocks, not reserved SMs. The fixed-2-MiB sweep changes both
+parallelism and message granularity; it is not a pure CTA-count ablation.
+C32/4-MiB retains C16/2-MiB's row granularity but doubles mapped allocation.
+The cooperative grid must fit the kernel's active-block capacity across the
+device, which is why bootstrap checks occupancy instead of treating the CTA
+count as unlimited ([CUDA execution API](https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_api/group__CUDA__EXEC.html)).
+
+### Why fewer payload bytes need not make this implementation faster
+
+Rank deduplication is useful but does not imply an order-of-magnitude traffic
+advantage. As a hypothetical uniform, distinct top-k example for 128 experts
+on eight ranks, the probability that one rank receives a token is
+`q = 1 - C(112, 8) / C(128, 8) = 0.66742`. A token reaches an expected 5.339
+ranks, including 4.672 remote ranks. That is about 33.3% fewer remote destination
+payloads than delivery to all seven remote ranks. Real model routes need not
+be uniform; these numbers are an analytical example, not measured routing.
+
+For a token with `d > 0` remote destinations and a BF16 row size `S=4096 B`,
+source-shared dispatch writes `S` bytes to host memory and destinations read
+`d*S`; combine writes and reads `d` distinct partials, adding `2*d*S`. Thus
+logical payload traffic across all participating GPUs, summing their host
+payload writes and reads for this token, is `(1 + 3*d)*S`, roughly 61.5
+kB/token/layer in the uniform example. This describes the current algorithm,
+not a universal lower bound. It excludes headers, fences, padding and local GPU traffic;
+it is neither a physical PCIe counter nor a measured NCCL byte comparison.
+
+There are concrete costs beyond payload traffic:
+
+- Every combine peer CTA scans its channel's inverse-route range independently.
+  For a remote-peer CTA, a scan examines up to 256 rows but sends at most the
+  per-pair slot limit. The self/local CTA bypasses host memory and has a
+  256-row limit.
+  When more rows match, it resumes after the last emitted match, rereading the
+  already-scanned tail in the next iteration. With four-row slots and a long,
+  roughly uniform range, a 256-row scan can find about 32 matches and emit only
+  four. This repeats work beyond the initial scan by all eight peer CTAs.
+- More channels create more terminal frames and control lanes even for empty
+  partitions. With one global decode token, at most one channel in each
+  participating rank has a payload; increasing channels does not divide that
+  single token into additional useful transfers.
+- Each small frame still publishes ready, receives ACK and fences memory.
+  At fixed total budget, C16 to C32 halves combine payload from 16 to 8 KiB per
+  full slot. More parallel blocks can therefore coexist with more control
+  operations per payload byte.
+- Dispatch still traverses peers within a channel and waits for all peers to
+  acknowledge each shared chunk header. Its reclamation policy is different
+  from the independent pair queues now used by combine.
+- The adapter gives the Triton expert runner a tensor sized to the global
+  receive-capacity bound. Received rows are compacted, but unused rows remain
+  padding with expert IDs of -1 and zero weights. The runner still sizes
+  temporary buffers and some route/reduction work from that tensor shape and
+  top-k. This does not mean every padded row executes an expert GEMM; it means
+  communication deduplication has not also removed all capacity-sized expert
+  preparation and output work.
+
+The next algorithmic priorities are to build GPU row-index lists by return
+owner once and consume those lists directly, reclaim dispatch payloads using
+only their actual readers, and choose different active channel counts for
+prefill and decode. Building return lists while dispatch creates inverse rows
+could avoid a separate route-planning pass without adding CPU route readbacks.
+Separate dispatch/combine channel settings would also distinguish the needs
+of the two phases. The expert adapter/runner could consume a GPU valid count
+or compact layout without introducing a CPU count readback. Another candidate
+is assigning separate send/receive warp groups inside a block: the current
+block interleaves send and receive phases,
+and double buffering alone does not establish simultaneous payload movement
+in both directions. Such a change must preserve independent progress and
+publication/slot-lifetime ordering. Buffer reuse and fewer eager launches
+remain useful, but older profiles found initialization/final reduction small relative to transport;
+that historical result does not identify the current revision's bottleneck.

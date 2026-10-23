@@ -18,8 +18,10 @@ The EP-Xpress core has no SGLang dependency.
 
 These restrictions belong to this first adapter, not the core EP interface.
 Patch application and mocked contract tests do not establish end-to-end model
-correctness or performance. Run the standalone CUDA suite before model tests;
-then compare outputs and throughput against the same eager SGLang configuration.
+correctness or performance. Compare outputs and throughput against the same
+eager SGLang configuration. For tuning an already validated path, prioritize
+that full-model comparison; use focused standalone checks when an interface
+or protocol change introduces a concrete correctness or progress risk.
 
 ## Install
 
@@ -71,10 +73,12 @@ calls NCCL. The NCCL settings constrain other framework collectives and do not
 physically disable NVLink. Keep those settings, GPU count, model, precision,
 expert runner and eager mode identical in the `--moe-a2a-backend none` baseline.
 `EP_XPRESS_CHANNELS` requests parallel host-SM channels. The group negotiates
-the common cooperative-launch capacity once at initialization; unsupported
-devices use one channel. The payload chunk budget is split across channels,
+the common cooperative-launch capacity once at initialization. Multi-rank
+operation requires cooperative launch support; the single-device path alone
+supports a noncooperative single-block fallback. The payload budget is split
+across channels,
 with row rounding and lane metadata included in the actual host-pool check.
-Four- and 16-channel model measurements and their prefill/decode tradeoffs are
+Model measurements and channel-count/prefill/decode tradeoffs are
 reported in [the performance comparison](../../docs/model-performance.md).
 Set the maximum tokens to cover the largest per-rank forward; the core fails
 explicitly if capacity is exceeded. These capacities are starting points,

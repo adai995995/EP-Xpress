@@ -128,9 +128,9 @@ semantics, not mapped-host atomic read-modify-write operations. The
 implementation follows CUDA's mapped-memory access constraints:
 [CUDA memory documentation](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/understanding-memory.html).
 
-Each frame also carries a stable fingerprint of its phase, optional API tag,
-and, for combine, originating dispatch operation. A receiver checks this
-operation identity on the first frame from each peer and channel, including
+With diagnostics enabled, each frame also carries a stable fingerprint of its
+phase, optional API tag and, for combine, originating dispatch operation. A
+receiver checks this identity on the first frame from each peer and channel, including
 when that first frame is an empty operation's terminal. Generation and
 sequence checks still apply to every frame. The identity is constant within
 the operation, so later frames do not repeat the host fingerprint read. This
