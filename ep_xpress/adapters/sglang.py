@@ -180,8 +180,6 @@ class HostEPDispatcher(BaseDispatcher):
         if not isinstance(combine_input, StandardCombineInput):
             raise TypeError("EP-Xpress requires StandardCombineInput")
         ticket = self._tickets[0]
-        if tuple(combine_input.hidden_states.shape) != (ticket.rows, self._config.hidden_size):
-            raise ValueError("Expert output must be a locally combined [R, H] tensor")
         stream = torch.cuda.current_stream(self._device)
         try:
             output = self._context().combine_async(
