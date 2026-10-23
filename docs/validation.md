@@ -21,7 +21,11 @@ Three focused local Config/adapter cases, Python syntax, and whitespace checks
 also pass. The GPU check enables protocol diagnostics; full-model timing uses
 the normal diagnostics-disabled setting. The broader historical suites were
 not rerun. These checks establish the changed protocol and storage contract;
-performance measurements are reported separately.
+two full-model candidates completed batches 1 and 32 with three repetitions
+each. Matched inputs, settings, hardware, source and host-only transport checks
+pass. All four short output checks match 29 token IDs against default NCCL; see
+the [decode experiment](model-performance.md#decode-workspace-and-fused-receive-experiment)
+for measured performance and numerical/attribution limits.
 
 ## GPU owner lists, selective dispatch, and count-aware experts
 

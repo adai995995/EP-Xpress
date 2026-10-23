@@ -4,8 +4,8 @@ These experiments run the complete Qwen3-30B-A3B-Instruct-2507 model through
 SGLang v0.5.21. They are distinct from the synthetic expert function in the
 standalone transport replay.
 
-The latest owner-list, active-channel, selective-dispatch and GPU-count results
-are in [Owner-list and sparse-work experiment](#owner-list-and-sparse-work-experiment).
+The latest workspace, fused decode and independent-frame results are in
+[Decode workspace and fused receive experiment](#decode-workspace-and-fused-receive-experiment).
 Earlier sections describe earlier runtime revisions and their measurements.
 
 ## Matched configuration
@@ -757,3 +757,108 @@ large count-aware alignment still uses one CTA per expert and scans valid IDs
 per expert; tile-parallel alignment is a remaining implementation opportunity,
 not part of the tested runtime. Dense frame destination unions can also include
 all peers, so actual-reader ACKs need not remove a reader in every frame.
+
+
+## Decode workspace and fused receive experiment
+
+Runtime `4356b6f`, with source snapshot `5c208da`, adds three changes:
+
+1. The SGLang adapter caches exact-shape communication workspaces per layer,
+   with up to four entries. Reuse avoids repeated communication tensor
+   allocations; expert GEMM workspaces are outside this change.
+2. Bounded decode writes direct-address host mailboxes and fuses receive with
+   deterministic reduction. Combine uses one kernel instead of clear,
+   communication and finalize kernels, without a remote device scratch tensor.
+   Actual contributors publish and acknowledge each returned token; this
+   combine path needs no unrelated-pair terminal frames. Dispatch still uses
+   its terminal handshake and required stream/publication dependencies remain.
+3. `combine_frame_rows` configures pair-queue frame capacity independently of
+   allocated channel count. The first candidate uses 16 rows instead of the
+   previous 4, while retaining 32 allocated channels and a 4-MiB dispatch budget.
+
+The full model, eight GPUs, BF16, TP/DP/EP8, Triton experts, eager execution and
+host-only restrictions are unchanged. A fresh default-NCCL baseline and the
+candidate each run batches 1 and 32 with 512 input and 32 output tokens, eight
+16-token warmup batches and three timed repetitions. Adaptive channels and the
+GPU-count expert path stay enabled; decode mailbox capacity is 64. No profiler
+is active during timing.
+
+### Sixteen-row combine frames
+
+Times are milliseconds. Brackets show the three-repeat range, not confidence
+intervals. TPOT below is the median of each batch's mean per-request TPOT.
+
+| Backend | Concurrent requests | Completion median [min, max] | Change vs NCCL | Mean TTFT | Per-request TPOT |
+|---|---:|---:|---:|---:|---:|
+| Default NCCL | 1 | 3096.493 [3064.832, 3134.372] | — | 193.482 | 93.643 |
+| EP-Xpress, fused decode, 16 rows | 1 | 2833.628 [2806.105, 2860.894] | -8.49% | 183.971 | 85.470 |
+| Default NCCL | 32 | 3408.966 [3395.272, 3440.669] | — | 461.489 | 94.841 |
+| EP-Xpress, fused decode, 16 rows | 32 | 3551.251 [3308.553, 3557.894] | +4.17% | 705.898 | 91.681 |
+
+The single-request end-to-end result improves. At batch 32, per-request TPOT
+falls by 3.33%, but a longer first-token window offsets that reduction. Last
+TTFT is 558.294 ms for NCCL and 810.862 ms for the candidate; the candidate's
+three values range from 569.152 to 813.846 ms. These HTTP metrics include
+arrival, scheduling and split prefills; they do not isolate a frame-size cost.
+Steady-window TPOT after the last first token falls from 92.332 to 89.432 ms.
+This candidate does not demonstrate a batch-32 completion speedup.
+
+Configuration, input hashes, source and hardware checks pass without warnings
+or errors. NCCL logs contain SHM connections only: 120 for the baseline and
+60 for remaining framework collectives in the candidate; P2P, NET and NVLS
+records are zero. NVLink payload counters stay unchanged on all eight GPUs.
+EP payloads use mapped host memory. These checks do not measure PCIe bandwidth.
+Four short greedy output checks match text and all 29 token IDs; maximum
+common-prefix log-probability difference is 0.218722. The focused native
+mailbox test separately matches the old combine path bit for bit. Neither
+check establishes equivalence for every full-model route or input.
+
+Server logs show different prefill partitions. In the two slower 16-row
+candidate repetitions, every rank runs two nonempty prefills, commonly 2+2
+requests; the faster repetition includes four ranks accepting all four of
+their requests together. NCCL also runs two nonempty prefills on every rank
+in two repetitions, commonly 1+3. Split composition differs, but the presence
+of an extra prefill alone cannot explain the candidate regression. A subsequent
+environment-only four-row comparison keeps both decode optimizations enabled.
+
+
+### Four-row frame follow-up
+
+A second EP-only run keeps the exact same source snapshot and all settings,
+changing only `EP_XPRESS_COMBINE_FRAME_ROWS=16` to `4`. Both decode optimizations
+remain enabled; the comparator is the fresh NCCL baseline above.
+
+| Backend | Concurrent requests | Completion median [min, max] | Change vs NCCL | Mean TTFT | Per-request TPOT |
+|---|---:|---:|---:|---:|---:|
+| EP-Xpress, fused decode, 4 rows | 1 | 2850.916 [2845.297, 2868.363] | -7.93% | 185.098 | 85.990 |
+| EP-Xpress, fused decode, 4 rows | 32 | 3345.226 [3337.085, 3379.145] | -1.87% | 587.434 | 88.933 |
+
+The observed batch-32 completion improvement is modest. Last TTFT remains
+7.39% above NCCL (599.550 vs 558.294 ms), while steady-window decode TPOT is
+4.00% lower (88.637 vs 92.332 ms). Per-request TPOT is 6.23% lower, but this
+metric also reflects differences in the individual first-token times. The
+single-request steady-window TPOT reduction is 8.17%.
+
+All three four-row repetitions have the same prefill split: one rank runs
+1+3 requests and the others accept four together. This differs from both the
+baseline and the 16-row run. Consequently the full difference between the two
+EP runs cannot be assigned to frame size; three repetitions are also not a
+broad workload study. The 16-row setting is not supported as a general default
+by these results. The measured four-row configuration is retained for this
+workload, with independent frame sizing available for further tuning.
+
+The adapter's fallback frame setting is therefore returned to `0`, preserving
+the original budget-derived size unless explicitly overridden. At the tested
+32 channels, eight ranks, H=2048 and 4-MiB chunk budget, that resolves to the
+same four rows. This post-experiment default-only change does not alter either
+run's explicit environment setting or CUDA implementation; it was checked
+locally, without repeating the model runs.
+
+Source, configuration, hardware, input and transport validation again passes
+without warnings or errors. NVLink payload increments stay zero; remaining
+NCCL traffic uses SHM only. Output sanity again matches all four texts and 29
+tokens, with the same maximum log-probability delta. Both experiments complete
+all requested repetitions without reported runtime errors. No phase profiling
+or independent workspace-versus-fusion ablation was collected. These results
+support the combined changes on the tested host-only eager workload, not a
+claim of maximum PCIe utilization or performance on consumer GPUs.

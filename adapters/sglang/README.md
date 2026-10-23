@@ -104,12 +104,13 @@ and general combine frame sizing:
 | `EP_XPRESS_DECODE_WORKSPACE` | `1` | Cache communication tensors for eligible decode operations; `0` uses independent tensors per call. |
 | `EP_XPRESS_FUSED_DECODE` | `1` | Use mailbox receive/reduce fusion for eligible decode; `0` retains pair queues. |
 | `EP_XPRESS_DECODE_MAX_TOKENS` | `64` | Reserve this many mailbox token slots per source rank and use it as the adapter's global-capacity eligibility bound. `0` disables both small-decode selections. |
-| `EP_XPRESS_COMBINE_FRAME_ROWS` | `16` | Fix rows per pair-queue frame independently of allocated channels. `0` restores the original split of the chunk budget across channels and peers. |
+| `EP_XPRESS_COMBINE_FRAME_ROWS` | `0` | Fix rows per pair-queue frame independently of allocated channels. `0` restores the original split of the chunk budget across channels and peers. |
 
 The two switches accept `0` or `1`; both size settings accept integers from
 `0` through `256`. Core `Config.decode_max_tokens` and
-`Config.combine_frame_rows` default to `0`; the adapter explicitly supplies
-the values above. Workspace reuse and fusion can be ablated separately.
+`Config.combine_frame_rows` default to `0`. The adapter enables a 64-token
+mailbox by default and retains budget-derived pair frames unless overridden.
+Workspace reuse and fusion can be ablated separately.
 
 Eligibility is identical on all ranks: no rank may be extending, and the
 global scheduler capacity must lie between zero and `DECODE_MAX_TOKENS`,

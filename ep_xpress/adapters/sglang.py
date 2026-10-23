@@ -112,7 +112,7 @@ class HostEPDispatcher(BaseDispatcher):
             transport=transport,
             fatal_errors=transport == "host_sm",
             diagnostics=diagnostics == "1",
-            combine_frame_rows=(int(os.environ.get("EP_XPRESS_COMBINE_FRAME_ROWS", "16"))
+            combine_frame_rows=(int(os.environ.get("EP_XPRESS_COMBINE_FRAME_ROWS", "0"))
                                 if transport == "host_sm" else 0),
             decode_max_tokens=(int(os.environ.get("EP_XPRESS_DECODE_MAX_TOKENS", "64"))
                                if transport == "host_sm" else 0),
