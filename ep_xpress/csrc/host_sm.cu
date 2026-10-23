@@ -1,5 +1,5 @@
 // GPU-initiated mapped-host transport. No host atomics, peer pointers or CE
-// payload copies. One CTA makes send and receive progress on each device.
+// payload copies. Each all-resident channel CTA progresses both directions.
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
@@ -9,6 +9,10 @@
 #include <cstdint>
 #include <cmath>
 #include <limits>
+#include <algorithm>
+#include <map>
+#include <mutex>
+#include <cub/block/block_scan.cuh>
 
 namespace {
 constexpr int kThreads = 256;
@@ -58,272 +62,409 @@ __device__ __forceinline__ uint64_t* control(char* p, int word) {
   return reinterpret_cast<uint64_t*>(p) + word;
 }
 
-// status: 0 success, 1 invalid route/inverse, 2 receive capacity exceeded,
-// 3 timeout, 4 a peer aborted, 5 operation identity mismatch. A failed arena is poisoned until destruction.
+// Queue payload uses separate arrays for masks, tokens, IDs, weights and X.
+// The existing row-stride allocation bounds these arrays, including alignment.
+__host__ __device__ int64_t ids_offset(int rows) {
+  return (kSlotHeader + int64_t(rows) * 12 + 7) / 8 * 8;
+}
+__host__ __device__ int64_t weights_offset(int rows, int topk) {
+  return ids_offset(rows) + int64_t(rows) * topk * 8;
+}
+__host__ __device__ int64_t payload_offset(int rows, int topk) {
+  return weights_offset(rows, topk) + int64_t(rows) * topk * 4;
+}
+
+struct TransportArgs {
+  const at::BFloat16* input;
+  const void* ids;
+  const float* weights;
+  const int32_t* expert_rank;
+  const int32_t* expert_local;
+  const int64_t* pointers;
+  const int64_t* input_inverse;
+  const int32_t* input_count;
+  at::BFloat16* output;
+  int64_t* output_ids;
+  float* output_weights;
+  int64_t* output_inverse;
+  int32_t* output_count;
+  at::BFloat16* remote;
+  int32_t* status;
+  int experts, world, rank, slots, chunk_rows, channels;
+  int input_rows, hidden, topk, capacity;
+  int64_t slot_stride, channel_stride;
+  uint64_t epoch, timeout_ns, identity;
+};
+
+// These atomics address this GPU's VRAM only. Host synchronization words retain
+// exactly one GPU writer per producer/channel or consumer/channel.
+__device__ __forceinline__ void fail(int32_t* status, int code) {
+  atomicCAS(status, 0, code);
+}
+
+// Separate ordinary grids keep initialization and final reduction from being
+// serialized through the small persistent communication grid.
 template <bool Combine>
-__global__ void transport_kernel(
-    const at::BFloat16* input, const int64_t* ids, const float* weights,
-    const int32_t* expert_rank, const int32_t* expert_local, int experts,
-    const int64_t* pointers, int world, int rank, uint64_t epoch, int slots,
-    int chunk_rows, int64_t row_stride, int64_t slot_stride, uint64_t timeout_ns,
-    int input_rows, int hidden, int topk, int capacity,
-    const int64_t* input_inverse, const int32_t* input_count,
-    at::BFloat16* output, int64_t* output_ids, float* output_weights,
-    int64_t* output_inverse, int32_t* output_count, at::BFloat16* remote,
-    int32_t* status, uint64_t identity) {
-  __shared__ int cursor, count, error, send_rows, action, selected, token;
-  __shared__ int producer_done, peer_done[kMaxRanks], peer_chunk[kMaxRanks];
-  __shared__ int sent_chunks, source_rows, row_index;
-  __shared__ uint64_t mask, start;
-  const int tid = threadIdx.x;
-  char* own = reinterpret_cast<char*>(pointers[rank]);
-  const int payload_offset = 16 + (Combine ? 0 : topk * 12);
+__global__ void host_sm_init_kernel(TransportArgs a) {
+  int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = int64_t(gridDim.x) * blockDim.x;
+  if (!Combine && i == 0) *a.output_count = 0;
+  for (int64_t j = i; j < int64_t(a.capacity) * a.hidden; j += stride)
+    a.output[j] = at::BFloat16(0.0f);
+  if (Combine) {
+    for (int64_t j = i; j < int64_t(a.world) * a.capacity * a.hidden; j += stride)
+      a.remote[j] = at::BFloat16(0.0f);
+  } else {
+    for (int64_t j = i; j < int64_t(a.capacity) * a.topk; j += stride) {
+      a.output_ids[j] = -1;
+      a.output_weights[j] = 0.0f;
+    }
+    for (int64_t j = i; j < int64_t(a.capacity) * 2; j += stride)
+      a.output_inverse[j] = -1;
+  }
+}
+
+template <bool Combine>
+__global__ void host_sm_finalize_kernel(TransportArgs a) {
+  int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = int64_t(gridDim.x) * blockDim.x;
+  if (!Combine) {
+    if (i == 0 && *a.status) *a.output_count = 0;
+  } else if (!*a.status) {
+    for (int64_t j = i; j < int64_t(a.capacity) * a.hidden; j += stride) {
+      float sum = 0.0f;
+      for (int peer = 0; peer < a.world; ++peer)
+        if (peer != a.rank) sum += float(a.remote[int64_t(peer) * a.capacity * a.hidden + j]);
+      const at::BFloat16 rounded(sum);
+      a.output[j] = at::BFloat16(float(rounded) + float(a.output[j]));
+    }
+  }
+}
+
+// status: 0 success, 1 invalid route/inverse, 2 receive capacity exceeded,
+// 3 timeout, 4 peer abort, 5 operation identity mismatch. An error is sticky.
+// More than one channel requires a cooperative, all-resident launch. Separate
+// producer-only and receiver-only blocks would not provide this liveness.
+template <bool Combine, typename Id>
+__global__ void host_sm_transport_kernel(TransportArgs a) {
+  using Scan = cub::BlockScan<uint64_t, kThreads>;
+  __shared__ typename Scan::TempStorage scan_storage;
+  __shared__ int cursor, end, error, producer_done, sent_chunks;
+  __shared__ int peer_done[kMaxRanks], peer_chunk[kMaxRanks], received_rows[kMaxRanks];
+  __shared__ int local_rows[kThreads], remote_rows[kThreads], selected_rows[kThreads];
+  __shared__ int tokens[kThreads], selected_tokens[kThreads];
+  __shared__ uint64_t masks[kThreads];
+  __shared__ int num_local, num_remote, num_selected, output_base, complete;
+  __shared__ uint64_t previous, start;
+  const int tid = threadIdx.x, channel = blockIdx.x;
+  char* own = reinterpret_cast<char*>(a.pointers[a.rank]) + channel * a.channel_stride;
+  const Id* ids = static_cast<const Id*>(a.ids);
+  const int wire_topk = Combine ? 0 : a.topk;
+  const int64_t id_offset = ids_offset(a.chunk_rows);
+  const int64_t weight_offset = weights_offset(a.chunk_rows, wire_topk);
+  const int64_t x_offset = payload_offset(a.chunk_rows, wire_topk);
   if (tid == 0) {
-    cursor = count = send_rows = producer_done = sent_chunks = 0;
-    error = *status;
-    source_rows = Combine ? *input_count : input_rows;
-    if (source_rows < 0 || source_rows > input_rows) error = 1;
+    int n = Combine ? *a.input_count : a.input_rows;
+    if (n < 0 || n > a.input_rows) { fail(a.status, 1); n = 0; }
+    cursor = int(int64_t(n) * channel / a.channels);
+    end = int(int64_t(n) * (channel + 1) / a.channels);
+    producer_done = sent_chunks = 0;
     start = ticks_ns();
   }
-  for (int r = tid; r < world; r += blockDim.x) {
-    peer_done[r] = r == rank;
-    peer_chunk[r] = 0;
-  }
-  // Capacity padding is intentionally visible to framework expert kernels.
-  for (int64_t i = tid; i < int64_t(capacity) * hidden; i += blockDim.x) {
-    output[i] = at::BFloat16(0.0f);
-    if (Combine)
-      for (int peer = 0; peer < world; ++peer)
-        remote[int64_t(peer) * capacity * hidden + i] = at::BFloat16(0.0f);
-  }
-  if (!Combine) {
-    for (int64_t i = tid; i < int64_t(capacity) * topk; i += blockDim.x) {
-      output_ids[i] = -1;
-      output_weights[i] = 0.0f;
-    }
-    for (int64_t i = tid; i < int64_t(capacity) * 2; i += blockDim.x)
-      output_inverse[i] = -1;
+  for (int peer = tid; peer < a.world; peer += blockDim.x) {
+    peer_done[peer] = peer == a.rank;
+    peer_chunk[peer] = 0;
   }
   __syncthreads();
   while (true) {
-    // Never wait inside the producer: if a slot is occupied, drain receivers.
-    char* send_slot = own + kArenaHeader + (sent_chunks % slots) * slot_stride;
-    if (tid == 0) {
-      action = !producer_done && !error;
-      if (action) {
-        uint64_t previous = acquire(control(send_slot, 0));
-        for (int r = 0; r < world; ++r)
-          if (r != rank && acquire(control(send_slot, 1 + r)) != previous)
-            action = 0;
-      }
-      send_rows = 0;
+    // Check different peers concurrently; never spin on a blocked producer.
+    if (tid < a.world) {
+      auto* p = reinterpret_cast<uint64_t*>(a.pointers[tid] + channel * a.channel_stride);
+      if (acquire(p) || acquire(p + 1)) fail(a.status, 4);
     }
     __syncthreads();
-    if (action) {
-      while (cursor < source_rows && send_rows < chunk_rows && !error) {
-        if (tid == 0) {
-          row_index = cursor++;
-          mask = 0;
-          token = row_index;
-          if (Combine) {
-            const int64_t destination = input_inverse[row_index * 2];
-            const int64_t index = input_inverse[row_index * 2 + 1];
-            if (destination < 0 || destination >= world || index < 0 || index > INT32_MAX)
-              error = 1;
-            else { mask = uint64_t(1) << destination; token = int(index); }
-          } else {
-            for (int k = 0; k < topk; ++k) {
-              const int64_t expert = ids[int64_t(row_index) * topk + k];
-              const float weight = weights[int64_t(row_index) * topk + k];
-              if (expert == -1) continue;
-              if (expert < 0 || expert >= experts || !isfinite(weight)) { error = 1; break; }
-              const int destination = expert_rank[expert];
-              if (destination < 0 || destination >= world || expert_local[expert] < 0) {
-                error = 1; break;
-              }
-              for (int j = 0; j < k; ++j)
-                if (ids[int64_t(row_index) * topk + j] == expert) error = 1;
-              mask |= uint64_t(1) << destination;
+    if (tid == 0) error = atomicAdd(a.status, 0);
+    __syncthreads();
+    if (error) break;
+    char* send_slot = own + kArenaHeader + (sent_chunks % a.slots) * a.slot_stride;
+    if (tid == 0) previous = producer_done ? 0 : acquire(control(send_slot, 0));
+    __syncthreads();
+    bool blocked = !producer_done && tid < a.world && tid != a.rank &&
+                   acquire(control(send_slot, 1 + tid)) != previous;
+    const int any_blocked = __syncthreads_or(blocked);
+    if (!producer_done && !any_blocked) {
+      const int batch = min(kThreads, min(a.chunk_rows, end - cursor));
+      uint64_t mask = 0;
+      int token = cursor + tid;
+      if (tid < batch) {
+        const int row = cursor + tid;
+        if (Combine) {
+          const int64_t destination = a.input_inverse[int64_t(row) * 2];
+          const int64_t index = a.input_inverse[int64_t(row) * 2 + 1];
+          if (destination < 0 || destination >= a.world || index < 0 || index > INT32_MAX)
+            fail(a.status, 1);
+          else {
+            mask = uint64_t(1) << destination;
+            token = int(index);
+            if (destination == a.rank && token >= a.capacity) fail(a.status, 2);
+          }
+        } else {
+          for (int k = 0; k < a.topk; ++k) {
+            const int64_t expert = ids[int64_t(row) * a.topk + k];
+            if (expert == -1) continue;
+            if (expert < 0 || expert >= a.experts || !isfinite(a.weights[int64_t(row) * a.topk + k])) {
+              fail(a.status, 1); continue;
             }
-            // An all--1 scheduler padding row has no destinations.
+            const int destination = a.expert_rank[expert];
+            if (destination < 0 || destination >= a.world || a.expert_local[expert] < 0) {
+              fail(a.status, 1); continue;
+            }
+            for (int j = 0; j < k; ++j)
+              if (ids[int64_t(row) * a.topk + j] == expert) fail(a.status, 1);
+            mask |= uint64_t(1) << destination;
           }
-          selected = -1;
-          if (!error && (mask & (uint64_t(1) << rank))) {
-            selected = Combine ? token : count++;
-            if (selected >= capacity) error = 2;
+        }
+      }
+      masks[tid] = mask;
+      tokens[tid] = token;
+      const bool local = (mask & (uint64_t(1) << a.rank)) != 0;
+      const bool remote = (mask & ~(uint64_t(1) << a.rank)) != 0;
+      const uint64_t flags = uint64_t(local) | (uint64_t(remote) << 32);
+      uint64_t prefix, aggregate;
+      Scan(scan_storage).ExclusiveSum(flags, prefix, aggregate);
+      if (local) local_rows[uint32_t(prefix)] = tid;
+      if (remote) remote_rows[uint32_t(prefix >> 32)] = tid;
+      if (tid == 0) {
+        num_local = uint32_t(aggregate);
+        num_remote = uint32_t(aggregate >> 32);
+        output_base = Combine || !num_local ? 0 : atomicAdd(a.output_count, num_local);
+        if (!Combine && int64_t(output_base) + num_local > a.capacity) fail(a.status, 2);
+        error = atomicAdd(a.status, 0);
+      }
+      __syncthreads();
+      if (!error) {
+        // Flatten rows and hidden words: no per-token CTA barrier or scalar
+        // host-metadata dependency stands between successive payload rows.
+        for (int64_t i = tid; i < int64_t(num_local) * (a.hidden / 2); i += blockDim.x) {
+          int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
+          const int source = local_rows[row];
+          const int target = Combine ? tokens[source] : output_base + row;
+          reinterpret_cast<uint32_t*>(a.output + int64_t(target) * a.hidden)[h] =
+              reinterpret_cast<const uint32_t*>(a.input + int64_t(cursor + source) * a.hidden)[h];
+        }
+        if (!Combine) {
+          for (int i = tid; i < num_local * a.topk; i += blockDim.x) {
+            const int row = i / a.topk, k = i % a.topk;
+            const int source = cursor + local_rows[row];
+            const int64_t expert = ids[int64_t(source) * a.topk + k];
+            const int64_t out = int64_t(output_base + row) * a.topk + k;
+            a.output_ids[out] = expert >= 0 && a.expert_rank[expert] == a.rank ? a.expert_local[expert] : -1;
+            a.output_weights[out] = expert >= 0 ? a.weights[int64_t(source) * a.topk + k] : 0.0f;
           }
+          if (tid < num_local) {
+            a.output_inverse[int64_t(output_base + tid) * 2] = a.rank;
+            a.output_inverse[int64_t(output_base + tid) * 2 + 1] = cursor + local_rows[tid];
+          }
+        }
+        if (tid < num_remote) {
+          int source = remote_rows[tid];
+          host_store64(send_slot + kSlotHeader + tid * 8, masks[source] & ~(uint64_t(1) << a.rank));
+          host_store32(send_slot + kSlotHeader + int64_t(a.chunk_rows) * 8 + tid * 4, tokens[source]);
+        }
+        if (!Combine) {
+          for (int i = tid; i < num_remote * a.topk; i += blockDim.x) {
+            int row = i / a.topk, k = i % a.topk;
+            int source = cursor + remote_rows[row];
+            int64_t expert = ids[int64_t(source) * a.topk + k];
+            host_store64(send_slot + id_offset + int64_t(i) * 8, uint64_t(expert));
+            host_store32(send_slot + weight_offset + int64_t(i) * 4,
+                         __float_as_uint(expert >= 0 ? a.weights[int64_t(source) * a.topk + k] : 0.0f));
+          }
+        }
+        for (int64_t i = tid; i < int64_t(num_remote) * (a.hidden / 2); i += blockDim.x) {
+          int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
+          const uint32_t word = reinterpret_cast<const uint32_t*>(
+              a.input + int64_t(cursor + remote_rows[row]) * a.hidden)[h];
+          host_store32(send_slot + x_offset + i * 4, word);
+        }
+        __syncthreads();
+        if (tid == 0) cursor += batch;
+        __syncthreads();
+        if (num_remote || cursor == end) {
+          if (tid == 0) {
+            host_store32(send_slot + kRowsOffset, num_remote ? num_remote : uint32_t(-1));
+            host_store64(send_slot + kIdentityOffset, a.identity);
+          }
+          __threadfence_system();
+          __syncthreads();
+          if (tid == 0) {
+            release(control(send_slot, 0), (a.epoch << 32) | uint64_t(sent_chunks + 1));
+            ++sent_chunks;
+            if (!num_remote) producer_done = 1;
+          }
+        }
+      }
+    }
+    __syncthreads();
+    // Poll peers concurrently, then process each available chunk in parallel
+    // tiles. ACK is published only after every thread has finished all reads.
+    if (tid < a.world) {
+      int rows = 0;
+      if (!peer_done[tid]) {
+        char* peer = reinterpret_cast<char*>(a.pointers[tid]) + channel * a.channel_stride;
+        char* slot = peer + kArenaHeader + (peer_chunk[tid] % a.slots) * a.slot_stride;
+        uint64_t expected = (a.epoch << 32) | uint64_t(peer_chunk[tid] + 1);
+        if (acquire(control(slot, 0)) == expected) {
+          rows = int32_t(host_load32(slot + kRowsOffset));
+          if (host_load64(slot + kIdentityOffset) != a.identity) fail(a.status, 5);
+          if (rows < -1 || rows == 0 || rows > a.chunk_rows) fail(a.status, 1);
+        }
+      }
+      received_rows[tid] = rows;
+    }
+    __syncthreads();
+    if (tid == 0) error = atomicAdd(a.status, 0);
+    __syncthreads();
+    if (error) break;
+    for (int peer = 0; peer < a.world; ++peer) {
+      const int rows = received_rows[peer];
+      if (!rows) continue;
+      char* peer_base = reinterpret_cast<char*>(a.pointers[peer]) + channel * a.channel_stride;
+      char* slot = peer_base + kArenaHeader + (peer_chunk[peer] % a.slots) * a.slot_stride;
+      for (int tile = 0; tile < rows; tile += kThreads) {
+        const int wire_row = tile + tid;
+        bool selected = false;
+        int token = 0;
+        if (wire_row < rows) {
+          uint64_t mask = host_load64(slot + kSlotHeader + int64_t(wire_row) * 8);
+          token = int(host_load32(slot + kSlotHeader + int64_t(a.chunk_rows) * 8 + wire_row * 4));
+          selected = (mask & (uint64_t(1) << a.rank)) != 0;
+          if (selected && (token < 0 || (Combine && token >= a.capacity))) fail(a.status, 2);
+        }
+        uint64_t prefix, aggregate;
+        Scan(scan_storage).ExclusiveSum(uint64_t(selected), prefix, aggregate);
+        if (selected) {
+          selected_rows[prefix] = wire_row;
+          selected_tokens[prefix] = token;
+        }
+        if (tid == 0) {
+          num_selected = int(aggregate);
+          output_base = Combine || !num_selected ? 0 : atomicAdd(a.output_count, num_selected);
+          if (!Combine && int64_t(output_base) + num_selected > a.capacity) fail(a.status, 2);
+          error = atomicAdd(a.status, 0);
         }
         __syncthreads();
         if (error) break;
-        if (selected >= 0) {
-          for (int h = tid; h < hidden; h += blockDim.x)
-            output[int64_t(selected) * hidden + h] = input[int64_t(row_index) * hidden + h];
-          if (!Combine) {
-            for (int k = tid; k < topk; k += blockDim.x) {
-              const int64_t expert = ids[int64_t(row_index) * topk + k];
-              output_ids[int64_t(selected) * topk + k] =
-                  expert >= 0 && expert_rank[expert] == rank ? expert_local[expert] : -1;
-              output_weights[int64_t(selected) * topk + k] =
-                  expert >= 0 ? weights[int64_t(row_index) * topk + k] : 0.0f;
-            }
-            if (tid == 0) {
-              output_inverse[selected * 2] = rank;
-              output_inverse[selected * 2 + 1] = token;
-            }
-          }
+        for (int64_t i = tid; i < int64_t(num_selected) * (a.hidden / 2); i += blockDim.x) {
+          int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
+          const int source = selected_rows[row];
+          const uint32_t packed = host_load32(slot + x_offset +
+              (int64_t(source) * (a.hidden / 2) + h) * 4);
+          if (Combine) {
+            auto* dst = reinterpret_cast<uint32_t*>(
+                a.remote + (int64_t(peer) * a.capacity + selected_tokens[row]) * a.hidden);
+            dst[h] = packed;
+          } else reinterpret_cast<uint32_t*>(a.output + int64_t(output_base + row) * a.hidden)[h] = packed;
         }
-        if (mask & ~(uint64_t(1) << rank)) {
-          char* row = send_slot + kSlotHeader + send_rows * row_stride;
-          if (tid == 0) {
-            host_store64(row, mask & ~(uint64_t(1) << rank));
-            host_store32(row + 8, uint32_t(token));
+        if (!Combine) {
+          for (int i = tid; i < num_selected * a.topk; i += blockDim.x) {
+            const int row = i / a.topk, k = i % a.topk;
+            const int64_t wire = int64_t(selected_rows[row]) * a.topk + k;
+            const int64_t expert = int64_t(host_load64(slot + id_offset + wire * 8));
+            const int64_t out = int64_t(output_base + row) * a.topk + k;
+            a.output_ids[out] = expert >= 0 && expert < a.experts && a.expert_rank[expert] == a.rank ? a.expert_local[expert] : -1;
+            a.output_weights[out] = __uint_as_float(host_load32(slot + weight_offset + wire * 4));
           }
-          if (!Combine) {
-            for (int k = tid; k < topk; k += blockDim.x) {
-              host_store64(row + 16 + k * 8, uint64_t(ids[int64_t(row_index) * topk + k]));
-              host_store32(row + 16 + topk * 8 + k * 4,
-                           __float_as_uint(ids[int64_t(row_index) * topk + k] >= 0 ?
-                               weights[int64_t(row_index) * topk + k] : 0.0f));
-            }
+          if (tid < num_selected) {
+            a.output_inverse[int64_t(output_base + tid) * 2] = peer;
+            a.output_inverse[int64_t(output_base + tid) * 2 + 1] = selected_tokens[tid];
           }
-          const auto* src = reinterpret_cast<const uint32_t*>(input + int64_t(row_index) * hidden);
-          for (int h = tid; h < hidden / 2; h += blockDim.x)
-            host_store32(row + payload_offset + h * 4, src[h]);
-          __syncthreads();
-          if (tid == 0) ++send_rows;
         }
         __syncthreads();
       }
-      if (!error) {
-        if (tid == 0) {
-          host_store32(send_slot + kRowsOffset, send_rows ? send_rows : uint32_t(-1));
-          host_store64(send_slot + kIdentityOffset, identity);
-        }
-        // Each writing thread fences its own stores, then publication by thread
-        // zero releases the entire CTA's payload to every system observer.
-        __threadfence_system();
-        __syncthreads();
-        if (tid == 0) {
-          release(control(send_slot, 0), (epoch << 32) | uint64_t(sent_chunks + 1));
-          ++sent_chunks;
-          if (!send_rows) producer_done = 1;
-        }
-      }
-    }
-    __syncthreads();
-    for (int peer = 0; peer < world; ++peer) {
-      char* peer_base = reinterpret_cast<char*>(pointers[peer]);
-      char* recv_slot = peer_base + kArenaHeader + (peer_chunk[peer] % slots) * slot_stride;
+      __threadfence_system();
+      __syncthreads();
       if (tid == 0) {
-        action = 0;
-        if (!peer_done[peer] && !error) {
-          uint64_t expected = (epoch << 32) | uint64_t(peer_chunk[peer] + 1);
-          if (acquire(control(recv_slot, 0)) == expected) {
-            action = int32_t(host_load32(recv_slot + kRowsOffset));
-            if (host_load64(recv_slot + kIdentityOffset) != identity) error = 5;
-            if (action < -1 || action > chunk_rows || action == 0) error = 1;
-          }
-        }
+        release(control(slot, 1 + a.rank), (a.epoch << 32) | uint64_t(peer_chunk[peer] + 1));
+        ++peer_chunk[peer];
+        if (rows == -1) peer_done[peer] = 1;
       }
       __syncthreads();
-      if (action && !error) {
-        for (int r = 0; r < action; ++r) {
-          char* row = recv_slot + kSlotHeader + r * row_stride;
-          if (tid == 0) {
-            mask = host_load64(row);
-            token = int(host_load32(row + 8));
-            selected = -1;
-            if (mask & (uint64_t(1) << rank)) {
-              selected = Combine ? token : count++;
-              if (token < 0 || selected >= capacity) error = 2;
-            }
-          }
-          __syncthreads();
-          if (error) break;
-          if (selected >= 0) {
-            auto* dst = reinterpret_cast<uint32_t*>(output + int64_t(selected) * hidden);
-            for (int h = tid; h < hidden / 2; h += blockDim.x) {
-              const uint32_t packed = host_load32(row + payload_offset + h * 4);
-              if (Combine) {
-                auto* plane = reinterpret_cast<uint32_t*>(
-                    remote + (int64_t(peer) * capacity + selected) * hidden);
-                plane[h] = packed;
-              } else dst[h] = packed;
-            }
-            if (!Combine) {
-              for (int k = tid; k < topk; k += blockDim.x) {
-                const int64_t expert = int64_t(host_load64(row + 16 + k * 8));
-                output_ids[int64_t(selected) * topk + k] =
-                    expert >= 0 && expert < experts && expert_rank[expert] == rank ? expert_local[expert] : -1;
-                output_weights[int64_t(selected) * topk + k] =
-                    __uint_as_float(host_load32(row + 16 + topk * 8 + k * 4));
-              }
-              if (tid == 0) {
-                output_inverse[selected * 2] = peer;
-                output_inverse[selected * 2 + 1] = token;
-              }
-            }
-          }
-          __syncthreads();
-        }
-        __threadfence_system();
-        __syncthreads();
-        if (tid == 0) {
-          release(control(recv_slot, 1 + rank), (epoch << 32) | uint64_t(peer_chunk[peer] + 1));
-          ++peer_chunk[peer];
-          if (action == -1) peer_done[peer] = 1;
-        }
-      }
-      __syncthreads();
+      if (error) break;
     }
+    const int unfinished_peers = __syncthreads_or(tid < a.world && !peer_done[tid]);
+    bool unacked = false;
+    if (producer_done && !unfinished_peers) {
+      for (int i = tid; i < a.slots * a.world; i += blockDim.x) {
+        int peer = i % a.world;
+        if (peer == a.rank) continue;
+        char* slot = own + kArenaHeader + (i / a.world) * a.slot_stride;
+        if (acquire(control(slot, 1 + peer)) != acquire(control(slot, 0))) unacked = true;
+      }
+    }
+    const int outstanding = __syncthreads_or(unacked);
     if (tid == 0) {
-      bool complete = producer_done;
-      for (int peer = 0; peer < world; ++peer) {
-        if (!peer_done[peer]) complete = false;
-        if ((acquire(reinterpret_cast<uint64_t*>(pointers[peer])) != 0 ||
-             acquire(reinterpret_cast<uint64_t*>(pointers[peer]) + 1) != 0) && !error) error = 4;
-      }
-      // Drain ACKs even for our final frame before returning or the next epoch
-      // could overwrite a frame that a delayed peer has not consumed yet.
-      if (complete) {
-        for (int s = 0; s < slots; ++s) {
-          char* slot = own + kArenaHeader + s * slot_stride;
-          uint64_t ready = acquire(control(slot, 0));
-          for (int peer = 0; peer < world; ++peer)
-            if (peer != rank && acquire(control(slot, 1 + peer)) != ready) complete = false;
-        }
-      }
-      if (ticks_ns() - start > timeout_ns && !complete && !error) error = 3;
-      if (error) release(reinterpret_cast<uint64_t*>(own), uint64_t(error));
-      action = complete || error;
+      complete = producer_done && !unfinished_peers && !outstanding;
+      if (!complete && ticks_ns() - start > a.timeout_ns) fail(a.status, 3);
+      error = atomicAdd(a.status, 0);
     }
     __syncthreads();
-    if (action) break;
+    if (complete || error) break;
     __nanosleep(64);
   }
-  if (Combine && !error) {
-    for (int64_t i = tid; i < int64_t(capacity) * hidden; i += blockDim.x) {
-      float sum = 0.0f;
-      for (int peer = 0; peer < world; ++peer)
-        if (peer != rank) sum += float(remote[int64_t(peer) * capacity * hidden + i]);
-      const at::BFloat16 rounded = at::BFloat16(sum);
-      output[i] = at::BFloat16(float(rounded) + float(output[i]));
-    }
-  }
-  // A failed operation returns no valid rows. It must be checked by the caller
-  // before accepting a result; the sticky status and arena abort forbid reuse.
-  if (tid == 0) {
-    if (!Combine) *output_count = error ? 0 : count;
-    *status = error;
-    // The framework may accept a final layer result without another dispatch.
-    // An opt-in, bootstrap-only header flag makes transport errors fatal so an
-    // existing output synchronization reports them, without a healthy-path
-    // host fence or another kernel launch. Such failures require worker restart.
-    if (error && host_load64(own + 16)) {
+  if (tid == 0 && error) {
+    release(reinterpret_cast<uint64_t*>(own), uint64_t(error));
+    if (host_load64(own + 16)) {
       __threadfence_system();
       asm volatile("trap;");
     }
   }
+}
+
+int64_t channel_bytes(int64_t hidden, int64_t topk, int64_t slots, int64_t rows) {
+  const int64_t row = align_up(16 + topk * 12 + hidden * 2, 16);
+  return align_up(kArenaHeader + slots * align_up(kSlotHeader + rows * row, 128), 4096);
+}
+
+int max_channels_current_device() {
+  // Capability is fixed for this extension/device. Validate direct native
+  // calls without repeating attribute and occupancy queries on every layer.
+  static std::mutex mutex;
+  static std::map<int, int> capacities;
+  int device, cooperative, sms;
+  C10_CUDA_CHECK(cudaGetDevice(&device));
+  std::lock_guard<std::mutex> lock(mutex);
+  const auto cached = capacities.find(device);
+  if (cached != capacities.end()) return cached->second;
+  C10_CUDA_CHECK(cudaDeviceGetAttribute(&cooperative, cudaDevAttrCooperativeLaunch, device));
+  if (!cooperative) { capacities.emplace(device, 0); return 0; }
+  C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+  int a, b, c;
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&a, host_sm_transport_kernel<false, int32_t>, kThreads, 0));
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, host_sm_transport_kernel<false, int64_t>, kThreads, 0));
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&c, host_sm_transport_kernel<true, int64_t>, kThreads, 0));
+  const int capacity = std::min(32, sms * std::min({a, b, c}));
+  capacities.emplace(device, capacity);
+  return capacity;
+}
+
+template <bool Combine, typename Id>
+void launch_transport(TransportArgs args, cudaStream_t stream) {
+  const int64_t elements = int64_t(args.capacity) * args.hidden * (Combine ? args.world : 1);
+  const int blocks = int(std::max<int64_t>(1, std::min<int64_t>(4096, (elements + kThreads - 1) / kThreads)));
+  host_sm_init_kernel<Combine><<<blocks, kThreads, 0, stream>>>(args);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  if (args.channels == 1) {
+    host_sm_transport_kernel<Combine, Id><<<1, kThreads, 0, stream>>>(args);
+  } else {
+    void* parameters[] = {&args};
+    C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
+        reinterpret_cast<const void*>(host_sm_transport_kernel<Combine, Id>),
+        dim3(args.channels), dim3(kThreads), parameters, 0, stream));
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  host_sm_finalize_kernel<Combine><<<Combine ? blocks : 1, kThreads, 0, stream>>>(args);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void tensor_check(const torch::Tensor& value, at::ScalarType dtype, int dimensions,
@@ -333,7 +474,7 @@ void tensor_check(const torch::Tensor& value, at::ScalarType dtype, int dimensio
 }
 void common_check(torch::Tensor input, torch::Tensor pointers, int64_t rank,
                   int64_t epoch, int64_t slots, int64_t chunk_rows, int64_t timeout_ms,
-                  torch::Tensor output, torch::Tensor status) {
+                  torch::Tensor output, torch::Tensor status, int64_t channels) {
   TORCH_CHECK(input.is_cuda() && input.scalar_type() == at::kBFloat16 && input.dim() == 2 && input.is_contiguous(),
               "input must be contiguous CUDA BF16 [rows, hidden]");
   TORCH_CHECK(input.size(1) > 0 && input.size(1) % 2 == 0 && input.size(1) <= INT32_MAX && input.size(0) <= INT32_MAX,
@@ -353,24 +494,35 @@ void common_check(torch::Tensor input, torch::Tensor pointers, int64_t rank,
       c10::cuda::getCurrentCUDAStream(input.get_device()).stream(), &capture));
   TORCH_CHECK(capture == cudaStreamCaptureStatusNone,
               "host_sm does not support CUDA Graph capture or replay");
+  TORCH_CHECK(channels >= 1 && channels <= 32, "invalid channel count");
+  TORCH_CHECK(channels == 1 || channels <= max_channels_current_device(),
+              "requested channels require cooperative all-resident launch support and capacity");
 }
 }  // namespace
 
-int64_t host_sm_arena_bytes(int64_t hidden, int64_t topk, int64_t slots, int64_t chunk_rows) {
+int64_t host_sm_max_channels() {
+  return max_channels_current_device();
+}
+
+int64_t host_sm_arena_bytes(int64_t hidden, int64_t topk, int64_t slots,
+                            int64_t chunk_rows, int64_t channels) {
   TORCH_CHECK(hidden > 0 && hidden <= INT32_MAX && hidden % 2 == 0 && topk >= 0 && topk <= 256 &&
-              slots > 0 && slots <= 64 && chunk_rows > 0 && chunk_rows <= 65536, "invalid arena dimensions");
-  const int64_t row = align_up(16 + topk * 12 + hidden * 2, 16);
-  return align_up(kArenaHeader + slots * align_up(kSlotHeader + chunk_rows * row, 128), 4096);
+              slots > 0 && slots <= 64 && chunk_rows > 0 && chunk_rows <= 65536 &&
+              channels > 0 && channels <= 32, "invalid arena dimensions or channels");
+  return channels * channel_bytes(hidden, topk, slots, chunk_rows);
 }
 
 void host_sm_dispatch_cuda(torch::Tensor input, torch::Tensor ids, torch::Tensor weights,
     torch::Tensor expert_rank, torch::Tensor expert_local, torch::Tensor pointers,
     int64_t rank, int64_t epoch, int64_t slots, int64_t chunk_rows, int64_t timeout_ms,
     torch::Tensor output, torch::Tensor output_ids, torch::Tensor output_weights,
-    torch::Tensor inverse, torch::Tensor count, torch::Tensor status, int64_t identity) {
-  common_check(input, pointers, rank, epoch, slots, chunk_rows, timeout_ms, output, status);
+    torch::Tensor inverse, torch::Tensor count, torch::Tensor status, int64_t identity,
+    int64_t channels) {
+  common_check(input, pointers, rank, epoch, slots, chunk_rows, timeout_ms, output, status, channels);
   const auto device = input.device();
-  tensor_check(ids, at::kLong, 2, device, "ids");
+  TORCH_CHECK(ids.scalar_type() == at::kLong || ids.scalar_type() == at::kInt,
+              "ids must have int32 or int64 dtype");
+  tensor_check(ids, ids.scalar_type(), 2, device, "ids");
   tensor_check(weights, at::kFloat, 2, device, "weights");
   TORCH_CHECK(ids.sizes() == weights.sizes() && ids.size(0) == input.size(0) && ids.size(1) > 0 && ids.size(1) <= 256, "invalid routing shape");
   tensor_check(expert_rank, at::kInt, 1, device, "expert rank");
@@ -384,23 +536,36 @@ void host_sm_dispatch_cuda(torch::Tensor input, torch::Tensor ids, torch::Tensor
   tensor_check(count, at::kInt, 1, device, "count");
   TORCH_CHECK(count.numel() == 1, "count must contain one element");
   const c10::cuda::CUDAGuard guard(device);
-  const int64_t row = align_up(16 + ids.size(1) * 12 + input.size(1) * 2, 16);
+  TransportArgs a{};
+  a.input = input.data_ptr<at::BFloat16>();
+  a.ids = ids.data_ptr();
+  a.weights = weights.data_ptr<float>();
+  a.expert_rank = expert_rank.data_ptr<int32_t>();
+  a.expert_local = expert_local.data_ptr<int32_t>();
+  a.pointers = pointers.data_ptr<int64_t>();
+  a.output = output.data_ptr<at::BFloat16>();
+  a.output_ids = output_ids.data_ptr<int64_t>();
+  a.output_weights = output_weights.data_ptr<float>();
+  a.output_inverse = inverse.data_ptr<int64_t>();
+  a.output_count = count.data_ptr<int32_t>();
+  a.status = status.data_ptr<int32_t>();
+  a.experts = expert_rank.numel(); a.world = pointers.numel(); a.rank = rank;
+  a.slots = slots; a.chunk_rows = chunk_rows; a.channels = channels;
+  a.input_rows = input.size(0); a.hidden = input.size(1); a.topk = ids.size(1); a.capacity = output.size(0);
+  const int64_t row = align_up(16 + a.topk * 12 + int64_t(a.hidden) * 2, 16);
+  a.slot_stride = align_up(kSlotHeader + chunk_rows * row, 128);
+  a.channel_stride = channel_bytes(a.hidden, a.topk, slots, chunk_rows);
+  a.epoch = epoch; a.timeout_ns = uint64_t(timeout_ms) * 1000000; a.identity = identity;
   const auto stream = c10::cuda::getCurrentCUDAStream(input.get_device());
-  transport_kernel<false><<<1, kThreads, 0, stream.stream()>>>(
-      input.data_ptr<at::BFloat16>(), ids.data_ptr<int64_t>(), weights.data_ptr<float>(),
-      expert_rank.data_ptr<int32_t>(), expert_local.data_ptr<int32_t>(), expert_rank.numel(),
-      pointers.data_ptr<int64_t>(), pointers.numel(), rank, epoch, slots, chunk_rows, row,
-      align_up(kSlotHeader + chunk_rows * row, 128), uint64_t(timeout_ms) * 1000000,
-      input.size(0), input.size(1), ids.size(1), output.size(0), nullptr, nullptr,
-      output.data_ptr<at::BFloat16>(), output_ids.data_ptr<int64_t>(), output_weights.data_ptr<float>(),
-      inverse.data_ptr<int64_t>(), count.data_ptr<int32_t>(), nullptr, status.data_ptr<int32_t>(), uint64_t(identity));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t>(a, stream.stream());
+  else launch_transport<false, int64_t>(a, stream.stream());
 }
 
 void host_sm_combine_cuda(torch::Tensor partial, torch::Tensor inverse, torch::Tensor count,
     torch::Tensor pointers, int64_t rank, int64_t epoch, int64_t slots, int64_t chunk_rows,
-    int64_t timeout_ms, torch::Tensor output, torch::Tensor remote, torch::Tensor status, int64_t identity) {
-  common_check(partial, pointers, rank, epoch, slots, chunk_rows, timeout_ms, output, status);
+    int64_t timeout_ms, torch::Tensor output, torch::Tensor remote, torch::Tensor status,
+    int64_t identity, int64_t channels) {
+  common_check(partial, pointers, rank, epoch, slots, chunk_rows, timeout_ms, output, status, channels);
   tensor_check(inverse, at::kLong, 2, partial.device(), "inverse");
   TORCH_CHECK(inverse.size(0) == partial.size(0) && inverse.size(1) == 2, "invalid inverse shape");
   tensor_check(count, at::kInt, 1, partial.device(), "count");
@@ -409,14 +574,21 @@ void host_sm_combine_cuda(torch::Tensor partial, torch::Tensor inverse, torch::T
   TORCH_CHECK(remote.size(0) == pointers.numel() && remote.size(1) == output.size(0) &&
               remote.size(2) == output.size(1), "invalid accumulation shape");
   const c10::cuda::CUDAGuard guard(partial.device());
-  const int64_t row = align_up(16 + partial.size(1) * 2, 16);
+  TransportArgs a{};
+  a.input = partial.data_ptr<at::BFloat16>();
+  a.input_inverse = inverse.data_ptr<int64_t>();
+  a.input_count = count.data_ptr<int32_t>();
+  a.pointers = pointers.data_ptr<int64_t>();
+  a.output = output.data_ptr<at::BFloat16>();
+  a.remote = remote.data_ptr<at::BFloat16>();
+  a.status = status.data_ptr<int32_t>();
+  a.world = pointers.numel(); a.rank = rank;
+  a.slots = slots; a.chunk_rows = chunk_rows; a.channels = channels;
+  a.input_rows = partial.size(0); a.hidden = partial.size(1); a.topk = 0; a.capacity = output.size(0);
+  const int64_t row = align_up(16 + int64_t(a.hidden) * 2, 16);
+  a.slot_stride = align_up(kSlotHeader + chunk_rows * row, 128);
+  a.channel_stride = channel_bytes(a.hidden, 0, slots, chunk_rows);
+  a.epoch = epoch; a.timeout_ns = uint64_t(timeout_ms) * 1000000; a.identity = identity;
   const auto stream = c10::cuda::getCurrentCUDAStream(partial.get_device());
-  transport_kernel<true><<<1, kThreads, 0, stream.stream()>>>(
-      partial.data_ptr<at::BFloat16>(), nullptr, nullptr, nullptr, nullptr, 0,
-      pointers.data_ptr<int64_t>(), pointers.numel(), rank, epoch, slots, chunk_rows, row,
-      align_up(kSlotHeader + chunk_rows * row, 128), uint64_t(timeout_ms) * 1000000,
-      partial.size(0), partial.size(1), 0, output.size(0), inverse.data_ptr<int64_t>(), count.data_ptr<int32_t>(),
-      output.data_ptr<at::BFloat16>(), nullptr, nullptr, nullptr, nullptr,
-      remote.data_ptr<at::BFloat16>(), status.data_ptr<int32_t>(), uint64_t(identity));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  launch_transport<true, int64_t>(a, stream.stream());
 }

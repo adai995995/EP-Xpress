@@ -49,6 +49,7 @@ Example launch after setting `MODEL_PATH` to a supported BF16 checkpoint:
 export EP_XPRESS_MAX_TOKENS=16384
 export EP_XPRESS_CHUNK_BYTES=2097152
 export EP_XPRESS_SLOTS=2
+export EP_XPRESS_CHANNELS=4
 export EP_XPRESS_HOST_BUDGET_BYTES=536870912
 export EP_XPRESS_TRANSPORT=host_sm
 
@@ -69,6 +70,10 @@ and remains the default when this variable is unset. Neither EP payload path
 calls NCCL. The NCCL settings constrain other framework collectives and do not
 physically disable NVLink. Keep those settings, GPU count, model, precision,
 expert runner and eager mode identical in the `--moe-a2a-backend none` baseline.
+`EP_XPRESS_CHANNELS` requests parallel host-SM channels. The group negotiates
+the common cooperative-launch capacity once at initialization; unsupported
+devices use one channel. The payload chunk budget is split across channels,
+with row rounding and lane metadata included in the actual host-pool check.
 Set the maximum tokens to cover the largest per-rank forward; the core fails
 explicitly if capacity is exceeded. These capacities are starting points,
 not measured optimal values. `EP_XPRESS_HOST_BUDGET_BYTES` limits the transport's

@@ -29,7 +29,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.pinned_working_set_bytes(8), cfg.pool_bytes(8))
         for changes in ({"hidden_size": 127}, {"topk": 257}, {"slots": 65},
                         {"chunk_bytes": 256 * 65537}, {"timeout_seconds": 3601},
-                        {"fatal_errors": 1}):
+                        {"fatal_errors": 1}, {"channels": 0}, {"channels": True},
+                        {"channels": 33}):
             args = dict(hidden_size=128, topk=4, max_tokens_per_rank=32, transport="host_sm")
             args.update(changes)
             with self.assertRaises(ValueError):
@@ -37,6 +38,18 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(Config(128, 4, 32, transport="host_sm", fatal_errors=True).fatal_errors)
         with self.assertRaises(ValueError):
             Config(128, 4, 32, fatal_errors=True)
+
+    def test_channel_budget_splits_payload_and_counts_lane_headers(self):
+        cfg = Config(128, 4, 32, transport="host_sm", chunk_bytes=7 * 256)
+        self.assertEqual(cfg.channels, 4)
+        self.assertEqual(cfg.channel_chunk_rows(), 2)
+        self.assertEqual(cfg.channel_chunk_rows(1), 7)
+        self.assertEqual(cfg.channel_chunk_rows(3), 3)
+        one_lane = Config(128, 4, 32, transport="host_sm", chunk_bytes=2 * 256, channels=1)
+        self.assertEqual(cfg.mapped_arena_bytes(4), 4 * one_lane.mapped_arena_bytes(4))
+        ce_one = Config(128, 4, 32, channels=1)
+        ce_four = Config(128, 4, 32, channels=4)
+        self.assertEqual(ce_one.pinned_working_set_bytes(8), ce_four.pinned_working_set_bytes(8))
 
 
 if __name__ == "__main__":

@@ -26,7 +26,8 @@ measured against the intended inference framework and workload.
   deterministic rank-order FP32 remote accumulation, and BF16 results.
 - A dedicated Gloo control group with a bounded timeout. In `host_ce` it
   carries initialization and route metadata. In `host_sm` it is used for
-  setup and shutdown only; per-operation metadata remains on the GPU.
+  setup and shutdown only; routing IDs, weights, and receive counts stay on
+  the GPU. Operation identity and capacity bounds are supplied by the caller.
 - An experimental adapter patch for SGLang v0.5.21, kept separate from the core.
 
 The `host_ce` reference may export unused rows within a nonempty source chunk.
@@ -90,7 +91,7 @@ CPU-known bound for the number of received rows:
 
 ```python
 config = Config(hidden_size=2048, topk=4, max_tokens_per_rank=4096,
-                transport="host_sm")
+                transport="host_sm", channels=4)
 with Context(group=ep_group, expert_to_rank=expert_owners, config=config) as ep:
     batch = ep.dispatch_async(x, topk_ids, topk_weights,
                               recv_capacity=global_token_bound).wait()
@@ -107,11 +108,17 @@ bound, the context reserves `world_size * max_tokens_per_rank` rows, which can
 be wasteful for decode. An undersized bound is an error, never silent truncation.
 The SGLang adapter obtains its bound from existing scheduler metadata.
 
-The first SM implementation uses one CTA per rank and acknowledges every
-chunk header on every peer, including peers that do not consume its payload.
-This provides bounded progress and slot reuse, but limits parallelism and adds
-control traffic. It does not establish a throughput improvement over CE or
-NCCL. See [the protocol description](docs/architecture.md).
+The SM backend batches routing and metadata access and assigns one CUDA block
+to each independent communication channel. `channels` defaults to four; the
+context negotiates a safe common limit during initialization and exposes it as
+`ep.effective_channels`. Multiple channels require cooperative launch support
+on every GPU. The group caps the requested count at the common occupancy
+limit, falling back to one channel when cooperative launch is unavailable.
+This changes parallelism, not the selected transport. Each channel
+interleaves sends and receives, and every peer still acknowledges every chunk
+header. These control costs remain measurable. The sole performance baseline
+is SGLang's default NCCL backend; see [the protocol description](docs/architecture.md)
+and [full-model results](docs/model-performance.md).
 
 Each handle can be combined once and belongs to its context. Zero-input ranks
 still receive work; zero-receive ranks still participate in combine. Healthy
@@ -132,13 +139,14 @@ On a CUDA development machine, first run native operator tests, then the
 independent distributed replay:
 
 ```sh
-python -m pytest tests/test_native_cuda.py -q
+python -m pytest tests/test_native_cuda.py tests/test_host_sm_native_cuda.py -q
 python -m torch.distributed.run --standalone --nproc-per-node=2 \
   --module benchmarks.replay --iterations 2 --check-handles
 python -m torch.distributed.run --standalone --nproc-per-node=8 \
   --module benchmarks.replay --iterations 2 --check-handles
 python -m torch.distributed.run --standalone --nproc-per-node=8 \
-  --module benchmarks.replay --transport host_sm --iterations 2 --check-handles
+  --module benchmarks.replay --transport host_sm --channels 4 --require-channels 4 \
+  --iterations 2 --check-handles
 ```
 
 The replay exercises mixed and changing routes, duplicate destination ranks,

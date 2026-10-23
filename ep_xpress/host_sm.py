@@ -41,7 +41,13 @@ _ERRORS = {
 class _MappedArena:
     """One private shared-file mapping; registration is managed by the context."""
 
-    def __init__(self, path, size):
+    def __init__(self, path, size, channels=1):
+        if isinstance(channels, bool) or not isinstance(channels, int) or not 1 <= channels <= 32:
+            raise ValueError("mapped queue channels must be in [1, 32]")
+        if size % channels or (size // channels) % 4096:
+            raise ValueError("mapped queue channel extents must be page aligned")
+        self.channels = channels
+        self.channel_stride = size // channels
         self.data = None
         self.fd = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
         try:
@@ -58,12 +64,21 @@ class _MappedArena:
     def abort_code(self):
         # The first naturally aligned word is written only by the owning GPU.
         # This is an asynchronous error observation, not a completion fence.
-        gpu_error, cpu_abort = struct.unpack_from("=QQ", self.data, 0)
-        return gpu_error or (4 if cpu_abort else 0)
+        for channel in range(self.channels):
+            gpu_error, cpu_abort = struct.unpack_from("=QQ", self.data, channel * self.channel_stride)
+            if gpu_error or cpu_abort:
+                return gpu_error or 4
+        return 0
 
     def request_abort(self):
         # A separate CPU-owned word avoids CPU/GPU competing stores.
-        struct.pack_into("=Q", self.data, 8, 1)
+        for channel in range(self.channels):
+            struct.pack_into("=Q", self.data, channel * self.channel_stride + 8, 1)
+
+    def set_fatal_errors(self):
+        """Set the immutable bootstrap flag in every lane before GPU use."""
+        for channel in range(self.channels):
+            struct.pack_into("=Q", self.data, channel * self.channel_stride + 16, 1)
 
     def close(self):
         if self.data is not None:
@@ -127,7 +142,7 @@ class _DevicePending(Pending):
     def metrics(self):
         # Byte counters require device instrumentation. Do not report inferred
         # values as measured PCIe traffic or reuse host_ce progress statistics.
-        return {"transport": "host_sm"}
+        return {"transport": "host_sm", "channels": self._context.effective_channels}
 
 
 class HostSMContext(Context):
@@ -159,18 +174,11 @@ class HostSMContext(Context):
         if chosen.type != "cuda":
             raise ValueError("device must be CUDA")
         self.device = torch.device("cuda", torch.cuda.current_device() if chosen.index is None else chosen.index)
-        if config.pinned_working_set_bytes(self.world_size) > config.host_pool_budget_bytes:
-            raise ValueError("mapped host queues exceed host_pool_budget_bytes")
         if self.world_size * config.max_tokens_per_rank > (1 << 31) - 1:
             raise ValueError("total receive capacity must fit int32")
         with torch.cuda.device(self.device):
             native.load()
-            self._arena_sizes = {phase: native.host_sm_arena_bytes(
-                config.hidden_size, topk, config.slots, config.chunk_rows)
-                for phase, topk in (("dispatch", config.topk), ("combine", 0))}
-            if any(self._arena_sizes[phase] != config.mapped_arena_bytes(topk)
-                   for phase, topk in (("dispatch", config.topk), ("combine", 0))):
-                raise RuntimeError("mapped queue allocation ABI mismatch")
+            self._channel_capacity = native.host_sm_max_channels()
         members = dist.get_process_group_ranks(group) if group is not None else list(range(dist.get_world_size()))
         self.group = dist.new_group(ranks=members, backend="gloo",
                                     timeout=timedelta(seconds=config.timeout_seconds),
@@ -200,19 +208,35 @@ class HostSMContext(Context):
 
     def _bootstrap(self, shared_directory):
         signature = (socket.gethostname(), asdict(self.config), self.expert_to_rank,
-                     str(torch.cuda.get_device_properties(self.device).uuid))
+                     str(torch.cuda.get_device_properties(self.device).uuid), self._channel_capacity)
         signatures = [None] * self.world_size
         dist.all_gather_object(signatures, signature, group=self.group)
         if any(item[:3] != signature[:3] for item in signatures):
             raise ValueError("EP ranks must share one host, configuration and expert placement")
         if len({item[3] for item in signatures}) != self.world_size:
             raise ValueError("each EP rank must use a distinct CUDA device")
+        # A cooperative grid must fit every device. This is bootstrap metadata,
+        # never a per-layer collective. A device lacking cooperative launch uses
+        # the explicitly reported single-lane path across the entire group.
+        self.effective_channels = min(self.config.channels, *(max(1, item[4]) for item in signatures))
+        self._channel_chunk_rows = self.config.channel_chunk_rows(self.effective_channels)
+        with torch.cuda.device(self.device):
+            self._arena_sizes = {phase: native.host_sm_arena_bytes(
+                self.config.hidden_size, topk, self.config.slots, self._channel_chunk_rows,
+                channels=self.effective_channels)
+                for phase, topk in (("dispatch", self.config.topk), ("combine", 0))}
+        if any(self._arena_sizes[phase] != self.config.mapped_arena_bytes(topk, self.effective_channels)
+               for phase, topk in (("dispatch", self.config.topk), ("combine", 0))):
+            raise RuntimeError("mapped queue allocation ABI mismatch")
+        self._pool_bytes = sum(self._arena_sizes.values()) * self.world_size
+        if self._pool_bytes > self.config.host_pool_budget_bytes:
+            raise ValueError("negotiated mapped host queues exceed host_pool_budget_bytes")
         root_message = [None, None]
         if self.rank == 0:
             try:
                 base = Path(shared_directory) if shared_directory else Path("/dev/shm")
                 available = os.statvfs(base)
-                if available.f_bavail * available.f_frsize < self.config.pool_bytes(self.world_size) + (1 << 20):
+                if available.f_bavail * available.f_frsize < self._pool_bytes + (1 << 20):
                     raise ValueError("insufficient shared-memory space")
                 self._root = Path(tempfile.mkdtemp(prefix="ep-xpress-sm-", dir=base))
                 for phase, size in self._arena_sizes.items():
@@ -242,13 +266,14 @@ class HostSMContext(Context):
                     for phase, size in self._arena_sizes.items():
                         pointers = []
                         for peer in range(self.world_size):
-                            arena = _MappedArena(self._root / f"{phase}-{peer}.arena", size)
+                            arena = _MappedArena(self._root / f"{phase}-{peer}.arena", size,
+                                                 channels=self.effective_channels)
                             self._arenas[phase].append(arena)
                             if peer == self.rank and self.config.fatal_errors:
                                 # Bootstrap-only flag: native errors also trap,
                                 # surfacing at the framework's existing CUDA
                                 # output fence even after the final MoE layer.
-                                struct.pack_into("=Q", arena.data, 16, 1)
+                                arena.set_fatal_errors()
                             pointers.append(native.register_mapped_host(arena.address, size))
                             self._registered.append(arena.address)
                         self._pointers[phase] = torch.tensor(pointers, dtype=torch.int64, device=self.device)
@@ -367,7 +392,7 @@ class HostSMContext(Context):
                 for tensor in (x, topk_ids, topk_weights):
                     tensor.record_stream(self._work_stream)
                 with torch.cuda.stream(self._work_stream), torch.no_grad():
-                    ids = topk_ids.to(dtype=torch.int64).contiguous()
+                    ids = topk_ids.contiguous()
                     weights = topk_weights.contiguous()
                     hidden = torch.empty((capacity, self.config.hidden_size), dtype=torch.bfloat16, device=self.device)
                     local_ids = torch.empty((capacity, self.config.topk), dtype=torch.int64, device=self.device)
@@ -376,9 +401,10 @@ class HostSMContext(Context):
                     count = torch.empty(1, dtype=torch.int32, device=self.device)
                     native.host_sm_dispatch(
                         x, ids, weights, self._expert_rank, self._expert_local, self._pointers["dispatch"],
-                        self.rank, epoch, self.config.slots, self.config.chunk_rows,
+                        self.rank, epoch, self.config.slots, self._channel_chunk_rows,
                         max(1, math.ceil(self.config.timeout_seconds * 1000)),
-                        hidden, local_ids, weights_out, inverse, count, self._status, identity=identity)
+                        hidden, local_ids, weights_out, inverse, count, self._status, identity=identity,
+                        channels=self.effective_channels)
                     handle = RouteHandle(self._id, self._counter, _DeviceRoute(inverse, count),
                                          x.shape[0], capacity, tag)
                     return self._finish(DispatchBatch(hidden, local_ids, weights_out, handle, count))
@@ -413,9 +439,9 @@ class HostSMContext(Context):
                                          dtype=torch.bfloat16, device=self.device)
                     native.host_sm_combine(
                         partial, handle._plan.inverse, handle._plan.count, self._pointers["combine"],
-                        self.rank, epoch, self.config.slots, self.config.chunk_rows,
+                        self.rank, epoch, self.config.slots, self._channel_chunk_rows,
                         max(1, math.ceil(self.config.timeout_seconds * 1000)), output, remote, self._status,
-                        identity=identity)
+                        identity=identity, channels=self.effective_channels)
                     handle._consumed = True
                     return self._finish(output)
             except BaseException as error:

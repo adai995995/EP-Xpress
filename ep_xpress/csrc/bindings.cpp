@@ -12,15 +12,16 @@ void add_partial_cuda(torch::Tensor accum, torch::Tensor partial,
                       torch::Tensor token_indices);
 torch::Tensor finish_combine_cuda(torch::Tensor remote, torch::Tensor local);
 
-int64_t host_sm_arena_bytes(int64_t hidden, int64_t topk, int64_t slots, int64_t chunk_rows);
+int64_t host_sm_max_channels();
+int64_t host_sm_arena_bytes(int64_t hidden, int64_t topk, int64_t slots, int64_t chunk_rows, int64_t channels);
 void host_sm_dispatch_cuda(torch::Tensor input, torch::Tensor ids, torch::Tensor weights,
     torch::Tensor expert_rank, torch::Tensor expert_local, torch::Tensor pointers,
     int64_t rank, int64_t epoch, int64_t slots, int64_t chunk_rows, int64_t timeout_ms,
     torch::Tensor output, torch::Tensor output_ids, torch::Tensor output_weights,
-    torch::Tensor inverse, torch::Tensor count, torch::Tensor status, int64_t identity);
+    torch::Tensor inverse, torch::Tensor count, torch::Tensor status, int64_t identity, int64_t channels);
 void host_sm_combine_cuda(torch::Tensor partial, torch::Tensor inverse, torch::Tensor count,
     torch::Tensor pointers, int64_t rank, int64_t epoch, int64_t slots, int64_t chunk_rows,
-    int64_t timeout_ms, torch::Tensor output, torch::Tensor remote, torch::Tensor status, int64_t identity);
+    int64_t timeout_ms, torch::Tensor output, torch::Tensor remote, torch::Tensor status, int64_t identity, int64_t channels);
 
 namespace {
 
@@ -142,6 +143,7 @@ torch::Tensor finish_combine(torch::Tensor remote, torch::Tensor local) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("register_host", &register_host);
   module.def("register_mapped_host", &register_mapped_host);
+  module.def("host_sm_max_channels", &host_sm_max_channels);
   module.def("host_sm_arena_bytes", &host_sm_arena_bytes);
   module.def("host_sm_dispatch", &host_sm_dispatch_cuda);
   module.def("host_sm_combine", &host_sm_combine_cuda);

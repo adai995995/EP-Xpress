@@ -2,11 +2,13 @@
 
 import os
 import struct
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
 from ep_xpress import Config, Context
 from ep_xpress.host_sm import HostSMContext, _MappedArena, _operation_identity
@@ -61,3 +63,54 @@ def test_operation_identity_is_stable_but_detects_handle_and_phase_mismatch():
     assert expected != _operation_identity("combine", tag, 8)
     assert expected != _operation_identity("dispatch", tag, 7)
     assert 0 <= expected < 1 << 63
+
+
+def test_multilane_abort_and_fatal_flags_cover_every_queue(tmp_path):
+    path = tmp_path / "queue.arena"
+    path.write_bytes(bytes(4 * 4096))
+    path.chmod(0o600)
+    arena = _MappedArena(path, 4 * 4096, channels=4)
+    try:
+        arena.set_fatal_errors()
+        assert all(struct.unpack_from("=Q", arena.data, lane * 4096 + 16)[0] == 1
+                   for lane in range(4))
+        struct.pack_into("=Q", arena.data, 3 * 4096, 3)
+        assert arena.abort_code() == 3
+        arena.request_abort()
+        assert all(struct.unpack_from("=Q", arena.data, lane * 4096 + 8)[0] == 1
+                   for lane in range(4))
+        assert struct.unpack_from("=Q", arena.data, 3 * 4096)[0] == 3
+    finally:
+        arena.close()
+
+
+@pytest.mark.parametrize("capacities, expected", [([16, 8, 16], 4), ([16, 0, 16], 1), ([16, 2, 8], 2)])
+def test_bootstrap_negotiates_group_min_then_checks_actual_budget(capacities, expected):
+    context = object.__new__(HostSMContext)
+    context.rank = 0
+    context.world_size = len(capacities)
+    context.config = Config(128, 2, 32, transport="host_sm", chunk_bytes=7 * 256,
+                            host_pool_budget_bytes=1)
+    context.expert_to_rank = tuple(range(context.world_size))
+    context.device = torch.device("cuda", 0)
+    context.group = object()
+    context._channel_capacity = capacities[0]
+
+    def gather(result, signature, group):
+        result[:] = [(*signature[:3], f"gpu-{rank}", cap) for rank, cap in enumerate(capacities)]
+
+    def arena_size(hidden, topk, slots, chunk_rows, channels):
+        assert chunk_rows == context.config.channel_chunk_rows(expected)
+        assert channels == expected
+        return context.config.mapped_arena_bytes(topk, channels)
+
+    with patch("ep_xpress.host_sm.dist.all_gather_object", side_effect=gather), \
+            patch("ep_xpress.host_sm.torch.cuda.get_device_properties", return_value=SimpleNamespace(uuid="gpu-0")), \
+            patch("ep_xpress.host_sm.torch.cuda.device", side_effect=lambda _: nullcontext()), \
+            patch("ep_xpress.host_sm.native.host_sm_arena_bytes", side_effect=arena_size), \
+            patch("ep_xpress.host_sm.dist.broadcast_object_list") as broadcast:
+        with pytest.raises(ValueError, match="negotiated mapped host queues exceed"):
+            context._bootstrap(None)
+    assert context.effective_channels == expected
+    assert context._pool_bytes == sum(context.config.mapped_arena_bytes(k, expected) for k in (2, 0)) * len(capacities)
+    broadcast.assert_not_called()  # No storage is created after a budget failure.

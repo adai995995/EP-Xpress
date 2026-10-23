@@ -191,23 +191,38 @@ def register_mapped_host(address: int, nbytes: int) -> int:
     )
 
 
-def host_sm_arena_bytes(hidden: int, topk: int, slots: int, chunk_rows: int) -> int:
-    """Bytes for one producer's mapped queue; use topk=0 for combine queues."""
+def host_sm_max_channels() -> int:
+    """Cooperative transport occupancy on the current GPU; zero means unavailable.
+
+    Context construction agrees on the minimum capability across the group and
+    uses one noncooperative lane when any participant lacks cooperative launch.
+    """
+    return load().host_sm_max_channels()
+
+
+def host_sm_arena_bytes(hidden: int, topk: int, slots: int, chunk_rows: int, channels: int = 1) -> int:
+    """Bytes for all lanes of one producer; topk=0 selects combine storage.
+
+    chunk_rows is the per-lane capacity, not the producer's total payload budget.
+    Each lane has its own page-aligned arena and independent queue control.
+    """
     return load().host_sm_arena_bytes(
         _integer(hidden, "hidden", 1), _integer(topk, "topk"),
         _integer(slots, "slots", 1), _integer(chunk_rows, "chunk_rows", 1),
+        _integer(channels, "channels", 1),
     )
 
 
 def host_sm_dispatch(
     x, ids, weights, expert_rank, expert_local, pointers, rank, epoch, slots,
     chunk_rows, timeout_ms, output, output_ids, output_weights, inverse, count, status,
-    *, identity=0,
+    *, identity=0, channels=1,
 ) -> None:
     """Enqueue GPU routing and mapped-host dispatch on the current CUDA stream.
 
     All tensors stay on this GPU. Output tensors have a fixed upper-bound row
     capacity; the kernel writes the exact row count to the device-only `count`.
+    Input expert IDs may be int32 or int64; output IDs remain int64.
     Padding has zero payload/weights and -1 expert IDs. `status` is a sticky
     int32[1] error word initially zero. The caller must check it before accepting
     experimental results and destroy the context after any error. No host read,
@@ -217,17 +232,19 @@ def host_sm_dispatch(
     Their arenas must have the exact size returned by host_sm_arena_bytes and
     remain registered and alive through completion. Calls sharing arenas must be
     serialized, with monotonically increasing positive epochs on every rank.
+    All ranks must use the same channels and per-lane chunk_rows. More than one
+    lane requires a cooperatively resident grid supported by every GPU.
     """
     load().host_sm_dispatch(
         x, ids, weights, expert_rank, expert_local, pointers, rank, epoch, slots,
         chunk_rows, timeout_ms, output, output_ids, output_weights, inverse, count, status,
-        _integer(identity, "identity"),
+        _integer(identity, "identity"), _integer(channels, "channels", 1),
     )
 
 
 def host_sm_combine(
     partial, inverse, count, pointers, rank, epoch, slots, chunk_rows, timeout_ms,
-    output, remote_accum, status, *, identity=0,
+    output, remote_accum, status, *, identity=0, channels=1,
 ) -> None:
     """Enqueue inverse-routed mapped-host combine without a CPU count read.
 
@@ -240,4 +257,5 @@ def host_sm_combine(
     load().host_sm_combine(
         partial, inverse, count, pointers, rank, epoch, slots, chunk_rows,
         timeout_ms, output, remote_accum, status, _integer(identity, "identity"),
+        _integer(channels, "channels", 1),
     )

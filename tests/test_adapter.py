@@ -66,6 +66,7 @@ def fake_adapter(rows=3, scheduler_counts=(2, 1)):
     class Context:
         def __init__(self, **kwargs):
             calls.append(("init", kwargs))
+            self.effective_channels = kwargs["config"].channels
 
         def dispatch_async(self, *args, **kwargs):
             calls.append(("dispatch", args, kwargs))
@@ -168,12 +169,13 @@ class AdapterContractTest(unittest.TestCase):
             def __ne__(self, other):
                 raise AssertionError("device count must not be inspected")
 
-        with patch.dict(os.environ, {"EP_XPRESS_TRANSPORT": "host_sm"}):
+        with patch.dict(os.environ, {"EP_XPRESS_TRANSPORT": "host_sm", "EP_XPRESS_CHANNELS": "3"}):
             with fake_adapter(rows=7, scheduler_counts=[2, 5]) as fixture:
                 fixture.batch.valid_count = DeviceCount()
                 dispatcher = fixture.module.HostEPDispatcher(runner_config())
                 output = dispatcher.dispatch(Tensor((2, 16)), fixture.topk(object(), object(), object()))
                 self.assertTrue(fixture.calls[0][1]["config"].fatal_errors)
+                self.assertEqual(fixture.calls[0][1]["config"].channels, 3)
                 self.assertEqual(fixture.calls[-1][2]["recv_capacity"], 7)
                 self.assertEqual(output.topk_output.router_logits.shape, (7, 0))
                 self.assertEqual(output.hidden_states.shape, (7, 16))

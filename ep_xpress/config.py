@@ -20,6 +20,7 @@ class Config:
     combine_backend: str = "gpu"
     graph_mode: str = "eager"
     fatal_errors: bool = False
+    channels: int = 4  # host_sm lanes; ignored by host_ce
 
     def __post_init__(self):
         if not isinstance(self.fatal_errors, bool):
@@ -27,10 +28,12 @@ class Config:
         if self.fatal_errors and self.transport != "host_sm":
             raise ValueError("fatal_errors is only supported by host_sm")
         for name in ("hidden_size", "topk", "max_tokens_per_rank", "chunk_bytes",
-                     "slots", "host_pool_budget_bytes", "max_pending_operations"):
+                     "slots", "host_pool_budget_bytes", "max_pending_operations", "channels"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.channels > 32:
+            raise ValueError("channels must be at most 32")
         if self.chunk_bytes < self.hidden_size * 2:
             raise ValueError("chunk_bytes must fit at least one BF16 row")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
@@ -66,15 +69,21 @@ class Config:
             return world_size * (self.mapped_arena_bytes(self.topk) + self.mapped_arena_bytes(0))
         return 2 * world_size * self.slots * self.slot_bytes
 
-    def mapped_arena_bytes(self, topk):
+    def channel_chunk_rows(self, channels=None):
+        """Split the producer's payload budget across negotiated GPU lanes."""
+        channels = self.channels if channels is None else channels
+        return max(1, (self.chunk_rows + channels - 1) // channels)
+
+    def mapped_arena_bytes(self, topk, channels=None):
         """Mapped queue allocation including per-row metadata and control words.
 
         Kept in agreement with the native ABI and checked during bootstrap.
         Dispatch uses configured topk; combine uses zero routing-weight slots.
         """
+        channels = self.channels if channels is None else channels
         row_bytes = ((16 + topk * 12 + self.hidden_size * 2 + 15) // 16) * 16
-        slot_bytes = ((640 + self.chunk_rows * row_bytes + 127) // 128) * 128
-        return ((128 + self.slots * slot_bytes + 4095) // 4096) * 4096
+        slot_bytes = ((640 + self.channel_chunk_rows(channels) * row_bytes + 127) // 128) * 128
+        return channels * ((128 + self.slots * slot_bytes + 4095) // 4096) * 4096
 
     def pinned_working_set_bytes(self, world_size):
         """Shared rings plus all ranks' reusable private receive packs."""

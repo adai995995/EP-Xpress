@@ -13,7 +13,7 @@ import time
 import torch
 import torch.distributed as dist
 
-from ep_xpress import Config, Context
+from ep_xpress import Config, Context, native
 
 
 def input_count(rank, world, tokens, case, iteration):
@@ -25,10 +25,22 @@ def input_count(rank, world, tokens, case, iteration):
     return count
 
 
-def inputs(rank, world, tokens, hidden, case, iteration, device):
+def inputs(rank, world, tokens, hidden, case, iteration, device, id_dtype=torch.int64):
     count = input_count(rank, world, tokens, case, iteration)
     x = ((torch.arange(count * hidden, device=device).reshape(count, hidden) + 7 * rank)
          .remainder(29).float() / 128).to(torch.bfloat16)
+    # The background repeats after 29 rows. Exact BF16 source/token markers
+    # prevent a misplaced payload from passing just because that pattern repeats.
+    token_index = torch.arange(count, device=device)
+    markers = (
+        torch.full_like(token_index, rank),
+        token_index.remainder(128),
+        token_index.div(128, rounding_mode="floor").remainder(128),
+        token_index.div(128 * 128, rounding_mode="floor").remainder(128),
+        torch.full_like(token_index, iteration % 128),
+    )
+    for column, marker in enumerate(markers[:hidden]):
+        x[:, column] = (marker.float() / 128).to(torch.bfloat16)
     rows = []
     for token in range(count):
         row = []
@@ -42,7 +54,7 @@ def inputs(rank, world, tokens, hidden, case, iteration, device):
         elif case == "padding" and (token + rank) % 2 == 0:
             row[-1] = -1
         rows.append(row)
-    ids = torch.tensor(rows, dtype=torch.int64, device=device).reshape(count, 4)
+    ids = torch.tensor(rows, dtype=id_dtype, device=device).reshape(count, 4)
     weights = torch.tensor([0.5, 0.25, 0.125, 0.125], dtype=torch.float32,
                            device=device).expand(count, 4).contiguous()
     if case in ("padding", "all_padding"):
@@ -115,7 +127,8 @@ def check_received(batch, rank, world, args, case, iteration, device):
 
 def check_expected_error(context, rank, world, args, device):
     """One deliberately failed operation; a failed context must be discarded."""
-    x, ids, weights = inputs(rank, world, args.tokens, args.hidden, "mixed", 0, device)
+    x, ids, weights = inputs(rank, world, args.tokens, args.hidden, "mixed", 0, device,
+                            id_dtype=getattr(torch, args.id_dtype))
     capacity = world * args.tokens
     chosen_batch = None
     if args.expect_error == "mismatch-handle":
@@ -155,6 +168,20 @@ def check_expected_error(context, rank, world, args, device):
         raise AssertionError(f"device failure was not observed on all ranks: {flags}")
 
 
+def channel_configuration(context, world, args):
+    effective = context.effective_channels if args.transport == "host_sm" else 1
+    capacities = []
+    if args.transport == "host_sm":
+        capacities = [None] * world
+        dist.all_gather_object(capacities, native.host_sm_max_channels())
+    if args.require_channels is not None and effective != args.require_channels:
+        raise AssertionError(
+            f"test requires {args.require_channels} active channels, got {effective}; "
+            f"cooperative capacities are {capacities}")
+    return {"requested_channels": args.channels, "effective_channels": effective,
+            "cooperative_channel_capacities": capacities}
+
+
 def run(args):
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -164,23 +191,27 @@ def run(args):
     dist.init_process_group("gloo", timeout=timedelta(seconds=args.timeout))
     config = Config(hidden_size=args.hidden, topk=4, max_tokens_per_rank=args.tokens,
                     chunk_bytes=args.chunk_bytes, slots=args.slots,
-                    timeout_seconds=args.timeout, transport=args.transport)
+                    timeout_seconds=args.timeout, transport=args.transport, channels=args.channels)
     totals = []
     cases = args.cases.split(",")
     if args.expect_error:
         with Context(dist.group.WORLD, [owner for owner in range(world) for _ in range(4)],
                      config, device=device) as context:
+            channel_info = channel_configuration(context, world, args)
             check_expected_error(context, rank, world, args, device)
         if rank == 0:
             print(json.dumps({"status": "passed", "transport": args.transport,
-                              "expected_error": args.expect_error}), flush=True)
+                              "expected_error": args.expect_error,
+                              "routing_id_dtype": args.id_dtype, **channel_info}), flush=True)
         dist.destroy_process_group()
         return
     with Context(dist.group.WORLD, [owner for owner in range(world) for _ in range(4)],
                  config, device=device) as context:
+        channel_info = channel_configuration(context, world, args)
         for iteration in range(args.iterations):
             for case in cases:
-                x, ids, weights = inputs(rank, world, args.tokens, args.hidden, case, iteration, device)
+                x, ids, weights = inputs(rank, world, args.tokens, args.hidden, case, iteration, device,
+                                        id_dtype=getattr(torch, args.id_dtype))
                 torch.cuda.synchronize()
                 dist.barrier()
                 start = time.perf_counter()
@@ -241,14 +272,26 @@ def run(args):
 
         # Keep two dispatch handles alive and combine them in reverse order.
         if args.check_handles:
-            x, ids, weights = inputs(rank, world, args.tokens, args.hidden, "mixed", 0, device)
-            first = context.dispatch_async(x, ids, weights, tag="first")
-            second = context.dispatch_async(x, ids, weights, tag="second")
+            first_x, first_ids, first_weights = inputs(
+                rank, world, args.tokens, args.hidden, "mixed", 0, device,
+                id_dtype=getattr(torch, args.id_dtype))
+            second_x, second_ids, second_weights = inputs(
+                rank, world, max(0, args.tokens - 1), args.hidden, "mixed", 1, device,
+                id_dtype=getattr(torch, args.id_dtype))
+            second_weights = second_weights * 0.5
+            first = context.dispatch_async(first_x, first_ids, first_weights, tag="first")
+            second = context.dispatch_async(second_x, second_ids, second_weights, tag="second")
             first_batch, second_batch = first.wait(), second.wait()
-            for batch in (second_batch, first_batch):
+            # Distinct shapes, routes, weights and payloads expose accidental
+            # reuse of the later dispatch's inverse map or valid-count storage.
+            for batch, x, ids, weights in (
+                (second_batch, second_x, second_ids, second_weights),
+                (first_batch, first_x, first_ids, first_weights),
+            ):
                 output = context.combine_async(expert_partial(batch, rank), batch.handle).wait()
                 if args.transport == "host_sm":
                     context.check_errors()
+                assert output.shape == x.shape
                 torch.testing.assert_close(output, reference(x, ids, weights, rank, world), rtol=0, atol=0)
             if args.transport == "host_sm":
                 # host_sm propagates submission failures to peer GPUs; reject
@@ -267,6 +310,8 @@ def run(args):
                           "tokens_per_rank": args.tokens, "slots": args.slots,
                           "chunk_bytes": args.chunk_bytes, "graph": "eager",
                           "precision": "bf16", "transport": args.transport,
+                          **channel_info,
+                          "routing_id_dtype": args.id_dtype,
                           "artificial_delay_rank": args.delay_rank,
                           "artificial_delay_ms_per_phase": args.delay_ms,
                           "results": totals}, indent=2), flush=True)
@@ -284,6 +329,10 @@ def main():
     parser.add_argument("--cases", default="mixed,empty,local,hotspot,all_empty,padding,all_padding")
     parser.add_argument("--check-handles", action="store_true")
     parser.add_argument("--transport", choices=("host_ce", "host_sm"), default="host_ce")
+    parser.add_argument("--channels", type=int, default=1)
+    parser.add_argument("--require-channels", type=int,
+                        help="Fail if bootstrap falls back to a different active channel count")
+    parser.add_argument("--id-dtype", choices=("int32", "int64"), default="int64")
     parser.add_argument("--expect-error", choices=(
         "capacity", "invalid-id", "nonfinite-weight", "mismatch-tag", "mismatch-handle"))
     parser.add_argument("--delay-rank", type=int, default=-1,
@@ -297,6 +346,10 @@ def main():
         parser.error("unknown replay case")
     if args.expect_error and (args.transport != "host_sm" or args.tokens < 1):
         parser.error("--expect-error requires host_sm and at least one input token")
+    if args.channels < 1 or (args.transport != "host_sm" and args.channels != 1):
+        parser.error("--channels must be positive; multiple channels require host_sm")
+    if args.require_channels is not None and not 1 <= args.require_channels <= args.channels:
+        parser.error("--require-channels must be positive and no greater than --channels")
     if args.expect_error in ("mismatch-tag", "mismatch-handle") and int(os.environ.get("WORLD_SIZE", "1")) < 2:
         parser.error("mismatched operations require at least two EP ranks")
     if args.delay_ms < 0 or args.delay_ms >= args.timeout * 1000:

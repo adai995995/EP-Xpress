@@ -7,7 +7,7 @@ and KV cache. EP-Xpress owns communication layouts, host storage, data movement,
 completion, inverse routing, and cross-rank reduction. The core uses PyTorch
 Tensor and distributed bootstrap but never imports SGLang.
 
-`Config` defines capacity, chunk size, ring depth, memory budget, and timeout.
+`Config` defines capacity, chunk size, channel count, ring depth, memory budget, and timeout.
 `Context` owns persistent arenas and one CUDA device. `RouteHandle` identifies
 one dispatch and its inverse mapping. `Pending` retains completion state.
 Compatible layers reuse the same context; live handles remain independent.
@@ -70,12 +70,37 @@ obtains its own device addresses. These addresses refer to CPU memory, not
 peer GPU allocations. Expert placement is uploaded once. Gloo is used for
 bootstrap and collective healthy teardown, not for dispatch/combine metadata.
 
-Each operation launches one CUDA CTA per rank. It validates GPU top-k IDs,
-constructs a destination rank mask, and exports each remote activation row
-once into a shared chunk. Selected experts on the same rank share that row.
-The chunk contains source token indices, routing metadata, and BF16 payloads.
-The local-rank contribution bypasses host memory. Receivers inspect headers,
-read only selected payload rows, and compact them into local GPU buffers.
+Each rank partitions its input among independent communication channels, with
+one CUDA CTA per channel. Within a batch, threads validate GPU top-k IDs and
+construct destination masks in parallel. A block prefix calculation compacts
+selected rows, followed by flattened copies across all threads. Each remote
+activation is exported once; selected experts on the same rank share that row.
+Host chunks store mask, token-index, expert-ID, weight, and payload arrays
+separately so receivers can fetch metadata in batches instead of making one
+thread read a small host record and synchronize the CTA for every token.
+The local-rank contribution bypasses host memory. Receivers compact selected
+rows into GPU output buffers using device-memory reservations. Output row
+order can vary across channels; the saved inverse map preserves token identity.
+Input expert IDs may be int32 or int64 without an intermediate cast kernel.
+
+Parallel initialization kernels clear output padding and combine scratch.
+After communication, a parallel combine kernel performs deterministic
+rank-order reduction. These kernels are stream ordered, so communication
+blocks do not also serialize full-buffer initialization and final reduction.
+
+The channel count is agreed during bootstrap using the minimum safe kernel
+occupancy across the group. More than one channel uses a single-device
+cooperative launch, ensuring the whole bounded grid can run; independent
+persistent channels must not rely on ordinary block scheduling for progress.
+Devices without cooperative launch use one ordinary block. There is no
+multi-device cooperative launch, GPU peer memory, TMA, or per-layer CPU
+capability exchange. See [CUDA cooperative launch requirements](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cooperative-groups.html).
+
+`chunk_bytes` is divided across channels, rounding up to whole rows. Each lane
+has its own page-aligned arena and ring slots. Actual negotiated allocation,
+including rounding and metadata, is checked against the host-memory budget.
+Producer work batches contain at most 256 rows per published frame, even when
+a channel has room for more; the configured chunk size is an upper bound.
 
 The caller supplies a CPU-known receive capacity, such as the sum of scheduler
 token counts. The exact received row count stays in a CUDA tensor, together
@@ -85,8 +110,8 @@ this padded shape and must mask these IDs. No device count is read by the CPU
 to allocate an exact output shape. Combine consumes the saved inverse and
 count directly on the GPU.
 
-Each slot has a producer-written generation and one consumer-written ACK per
-peer. A generation combines an operation epoch with a chunk number. Payload
+Each channel's slot has a producer-written generation and one consumer-written
+ACK per peer. A generation combines an operation epoch with a chunk number. Payload
 writers issue system fences before publishing; readers finish their loads
 before acknowledging. Synchronization uses naturally aligned, single-writer
 loads/stores with system acquire/release semantics, not mapped-host atomic
@@ -119,14 +144,19 @@ also catches a failure in its final layer. This requires worker restart. The
 standalone default keeps errors recoverable for inspection, but the failed
 communication context still must be destroyed.
 
-This first implementation has deliberate limits: one CTA limits bandwidth,
-all-peer header ACKs generate control traffic, and each operation drains its
-queues before returning. Double slots provide bounded buffering; they do not
-establish overlap with expert GEMM or arbitrary cross-layer concurrency.
-Send and receive instruction streams within one rank are interleaved, not yet
-assigned independent warps or CTAs for full-duplex throughput tuning.
-Fixed-capacity padding also has an expert-runner cost. These costs must be
-measured separately from removed CPU route planning and object collectives.
+Remaining limits include all-peer header ACK traffic and draining each
+operation's queues before returning. Double slots and multiple channels
+provide buffering and parallel progress; they do not establish overlap with
+expert GEMM or arbitrary cross-layer concurrency. Each channel still
+interleaves sends and receives rather than assigning dedicated sender/receiver
+blocks. Fixed-capacity padding also has an expert-runner cost. These costs
+must be measured separately from removed CPU route planning and collectives.
+
+The design borrows GPU layout preparation, channel partitioning, and batched
+publication from [DeepEP v1.2.1 layout](https://github.com/deepseek-ai/DeepEP/blob/v1.2.1/csrc/kernels/layout.cu)
+and [intranode kernels](https://github.com/deepseek-ai/DeepEP/blob/v1.2.1/csrc/kernels/intranode.cu).
+The implementation here uses shared host memory and its own flow control;
+DeepEP's peer-memory addresses and hardware assumptions are not imported.
 
 ## Combine and numerical contract
 

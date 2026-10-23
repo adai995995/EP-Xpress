@@ -6,6 +6,7 @@ communication library itself does not depend on SGLang or its global state.
 
 from collections import deque
 from dataclasses import dataclass
+import logging
 import os
 
 import torch
@@ -28,6 +29,7 @@ from sglang.srt.runtime_context import get_parallel
 
 
 _contexts = {}
+_logger = logging.getLogger(__name__)
 
 
 def close_contexts():
@@ -80,6 +82,7 @@ class HostEPDispatcher(BaseDispatcher):
             max_tokens_per_rank=int(os.environ.get("EP_XPRESS_MAX_TOKENS", "16384")),
             chunk_bytes=int(os.environ.get("EP_XPRESS_CHUNK_BYTES", str(2 << 20))),
             slots=int(os.environ.get("EP_XPRESS_SLOTS", "2")),
+            channels=int(os.environ.get("EP_XPRESS_CHANNELS", "4")),
             host_pool_budget_bytes=int(os.environ.get("EP_XPRESS_HOST_BUDGET_BYTES", str(512 << 20))),
             transport=transport,
             fatal_errors=transport == "host_sm",
@@ -101,6 +104,12 @@ class HostEPDispatcher(BaseDispatcher):
                 config=self._config,
                 device=self._device,
             )
+            if self._config.transport == "host_sm":
+                _logger.info(
+                    "EP-Xpress host_sm channels: requested=%d effective=%d",
+                    self._config.channels,
+                    _contexts[self._context_key].effective_channels,
+                )
         return _contexts[self._context_key]
 
     def _check_eager(self):
