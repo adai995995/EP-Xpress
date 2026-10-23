@@ -4,6 +4,10 @@ These experiments run the complete Qwen3-30B-A3B-Instruct-2507 model through
 SGLang v0.5.21. They are distinct from the synthetic expert function in the
 standalone transport replay.
 
+The latest rank-pair queue and submission-path results are in
+[Rank-pair combine and critical-path cleanup](#rank-pair-combine-and-critical-path-cleanup).
+Earlier sections describe earlier runtime revisions and their measurements.
+
 ## Matched configuration
 
 - Eight H20D GPUs on one host; BF16 unquantized model weights and activations.
@@ -20,8 +24,10 @@ standalone transport replay.
 - Synthetic token-ID requests: 512 input tokens and 32 generated tokens,
   greedy decoding, ignored EOS, disabled radix cache. Request hashes match
   across configurations. Concurrent batch sizes are 1, 8, and 32.
-- Each shape has eight warmup batches generating four tokens, then three
-  measured batches generating 32 tokens. Values below are medians.
+- The initial channel experiments use eight warmup batches generating four
+  tokens, then three measured batches generating 32 tokens. The later rank-pair
+  comparison uses 16 output tokens per warmup batch in both backends. Values
+  below are medians unless specified otherwise.
 
 These controls establish a comparison under eager execution. They do not
 represent the fastest available SGLang configuration or a CUDA Graph baseline.
@@ -347,7 +353,7 @@ exclude its amplification by subsequent backpressure. These spreads use the shar
 base and matching operation identities, with unquantified clock-alignment
 uncertainty; raw GPU globaltimer values are never subtracted across devices.
 
-### Consequences for the next optimization
+### Consequences for the next optimization at that revision
 
 Deduplication and source-shared payloads primarily reduce dispatch traffic.
 Combine returns distinct already-weighted partials from each participating
@@ -355,7 +361,7 @@ expert rank; those results cannot be deduplicated as identical activations.
 Lower byte counts do not compensate automatically for inefficient host reads,
 frequent small control transactions, or stalled queues.
 
-The present producer reuses a slot only after every peer has acknowledged it,
+The measured producer reuses a slot only after every peer has acknowledged it,
 including peers that did not select its payload. A CTA processes ready peers
 in sequence. These are concrete places to test destination-aware reclamation
 and more independent receive progress, while preserving safe shared-slot
@@ -367,6 +373,120 @@ The data establishes these mechanisms and their observed residency; it does
 not assign all both-missing waits to ACK latency, establish achieved physical
 PCIe bandwidth, or predict the speedup of removing a wait. An optimization must
 be validated again against the same default NCCL full-model baseline.
+
+## Rank-pair combine and critical-path cleanup
+
+Measured on 2026-10-23 with runtime `d3410eb`. The model, eight GPUs, BF16,
+TP/EP/DP=8, expert/attention kernels, and eager execution remain as specified
+above. SGLang is pinned to `e00930c5489053f26d86b179cee0d087f846acbb`
+(v0.5.21 with the adapter patch). Both the default NCCL baseline and candidate
+were run afresh for batches 1 and 32. Each shape has eight warmup batches
+generating **16 tokens**, followed by three timed batches with 512 input and
+32 output tokens. No profiler or combine counters are enabled during timing.
+
+### What changed
+
+Combine now has a separate directed queue for each source/destination rank
+pair in each channel. Only that queue's destination acknowledges its slots.
+A block progresses both outgoing and incoming traffic with one peer, so a
+full outgoing queue does not prevent it from receiving. Unrelated peers no
+longer gate that pair's slot reuse. The whole combine operation still needs
+its required results and pair terminal frames before it can finish.
+
+At 16 channels and EP8, the combine grid grows from 16 to 128 blocks per GPU,
+including the self/local blocks. Channel count is not a fixed SM count. The
+per-pair chunk row limit is divided by the world size to keep the aggregate
+payload budget approximately fixed. The actual combine arena increases from
+4,259,840 to 4,718,592 bytes per rank because headers and page rounding grow.
+This is therefore not an isolated ACK-policy ablation: queue layout, scheduling
+parallelism, and per-queue granularity also change.
+
+The first pair-queue implementation exposed substantial repeated control
+work. The final timed runtime additionally:
+
+- Removes Python host-header error scans from normal submission and
+  `Pending.wait()`. Scanning remains at explicit `check_errors()` or diagnostic
+  boundaries. These were health checks, separate from the GPU ready/ACK
+  protocol; they were not payload copies or GPU completion fences.
+- Samples mapped-host abort flags and timeout clocks on the first loop iteration
+  and every 256 iterations thereafter, instead of every iteration. Error
+  observation can consequently be delayed; this is an iteration cadence,
+  not a wall-clock response bound.
+- Replaces read-only `atomicAdd(status, 0)` operations with relaxed device
+  status loads, and checks the immutable operation fingerprint on the first
+  received frame of each peer/channel rather than every frame.
+- Caches the adapter's resolved Context and timeout conversion, removes the
+  adapter's redundant per-call capture query, consolidates native combine
+  capacity validation, and limits token-index validation to its destination
+  block. Sequence/epoch checks, ready/ACK ordering, bounds, and tensor/handle
+  lifetime dependencies remain.
+
+Dispatch still shares a source payload for multicast; its queue reclamation
+has not been changed to actual-reader acknowledgments in this revision.
+Combine partials are directed to one destination, so they do not require a
+multicast reference counter. The final runtime also includes `daec161`'s
+capture guard at first Context initialization and `d3410eb`'s removal of the
+adapter's duplicate expert-output shape check; the core still validates it.
+The measured runtime SHA is `d3410eb`.
+
+### Full-model result
+
+| Concurrent requests | NCCL batch latency (s) | EP-Xpress batch latency (s) | EP-Xpress latency increase | NCCL output tokens/s | EP-Xpress output tokens/s |
+|---|---:|---:|---:|---:|---:|
+| 1 | 3.090 | 3.108 | 0.61% | 10.357 | 10.295 |
+| 32 | 3.391 | 3.954 | 16.59% | 301.943 | 258.979 |
+
+Observed three-repeat batch-latency ranges are 3.030–3.096 seconds for NCCL
+and 3.108–3.121 for EP-Xpress at batch 1; at batch 32 they are 3.385–3.456
+and 3.932–4.019 seconds respectively. These ranges are not confidence
+intervals. Batch 1 is close to NCCL and does not establish a speedup. Batch 32
+remains slower than NCCL.
+
+| Concurrent requests | NCCL mean TTFT (ms) | EP-Xpress mean TTFT (ms) | NCCL per-request TPOT (ms) | EP-Xpress per-request TPOT (ms) |
+|---|---:|---:|---:|---:|
+| 1 | 192.189 | 196.213 | 93.465 | 93.951 |
+| 32 | 470.762 | 821.056 | 93.972 | 100.161 |
+
+TTFT and TPOT first average across requests in each repetition, then take
+the median over three repetitions. TPOT uses each request's elapsed time
+between its first and last received token divided by the number of tokens
+after its first streaming chunk. It is not the median of individual token
+intervals. The larger remaining relative gap at batch 32 is in time to first
+token; the 6.59% per-request TPOT increase is smaller. These client timings
+do not identify a specific transport bottleneck or PCIe utilization.
+
+For implementation history, the first pair-queue runtime (`ebaedcf`) measured
+4.144 and 5.012 seconds at batches 1 and 32. The control-path cleanup reduces
+these to 3.108 and 3.954 seconds, or 25.0% and 21.1%. Multiple changes were
+measured together; these reductions cannot all be attributed to Python error
+scanning. That intermediate run completed all six timed batches, but its
+runner lost its output connection afterward and required separately recovered
+transport evidence. It is not the validated final comparison above.
+
+The preceding cleanup run (`6ecedd7`, before the cold-init guard and duplicate
+adapter-check removal) measured 3.117 and 3.918 seconds. The final rerun's
+small changes have no demonstrated independent performance benefit.
+
+The earlier source-shared 16-channel results were 3.404 and 4.929 seconds.
+The current medians are 8.7% and 19.8% lower. This is historical context with
+a different warmup length, not a fresh ablation or the performance baseline.
+The fresh default NCCL comparison is the main result.
+
+### Evidence and limits
+
+The final comparison passed configuration, input-hash, source, hardware, and
+transport checks with no warnings or errors. All eight candidate ranks used
+16 effective channels. NCCL logs show SHM transport with no P2P, NET, or NVLS
+connections; all eight GPUs have zero NVLink payload counter increments in
+both runs. The candidate's EP payload itself uses GPU loads/stores to mapped
+host memory. Both full-model runs completed without reported runtime errors.
+
+Four additional short natural-language prompts produced identical greedy
+text and all 29 generated token IDs across the two backends. Maximum common-
+prefix log-probability difference was 0.218722. This is limited output sanity,
+not proof of layer-wise numerical equivalence or identical expert routes
+throughout the timed requests. No new phase profiling was collected for this
+revision, so older communication-time fractions must not be assigned to it.
 
 Deployment addresses, credentials, model paths, and raw logs are deliberately
 excluded. Experiment records remain in the operator's private artifact store.

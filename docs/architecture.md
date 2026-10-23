@@ -191,10 +191,11 @@ remain alive until their transport work completes. GPU status is sticky;
 invalid routes, insufficient receive capacity, or a timeout poison the context.
 `check()` is an explicit synchronizing validation boundary. Normal submission
 and `wait()` do not scan mapped host error headers. GPU workers poll mapped
-abort headers at entry and periodically, rather than on every loop iteration;
+abort headers on the first loop iteration and every 256 iterations thereafter;
 local GPU status checks and per-frame ready/credit checks remain. This reduces
-health-check traffic while allowing bounded polling delay before a peer abort
-is observed. Bounds checks, publication fences, ACK ordering, and stream
+health-check traffic but can delay peer-abort observation by up to 255
+completed loop iterations; it is not a wall-clock response guarantee.
+Bounds checks, publication fences, ACK ordering, and stream
 dependencies still protect payload access and buffer lifetime. CPU-readable
 abort words are inspected at explicit validation or diagnostic boundaries.
 Once a failure is observed, later submissions reject the failed context.
@@ -210,6 +211,33 @@ context, while the context caches timeout conversion and native occupancy
 limits. Dynamic tensor shapes, scheduler-provided capacity, operation
 generations, and handle ownership are still checked when each operation is
 submitted. These metadata checks do not read routing tensors back to the CPU.
+
+A follow-up audit identified remaining control work that is not yet removed:
+
+- Dispatch launches a final kernel whose only job is to zero the valid count
+  after an error. Normal execution does no useful work in that kernel. Removing
+  it requires preserving the standalone nonfatal error contract or making the
+  SGLang fatal-error mode explicit at the native launch boundary.
+- Native entry points still check fixed parameters and look up cached launch
+  capacity under a mutex. GPU attribute and occupancy queries are already
+  cached. A prepared native context could validate fixed parameters once while
+  keeping dynamic bounds and tensor lifetime checks on submission.
+- Each layer recomputes scheduler receive capacity from existing CPU counts.
+  Sharing that result across layers requires a reliable forward identifier;
+  caching by a mutable list's address would be incorrect.
+- Operation identity is still serialized and hashed on the CPU for each call.
+  A numeric operation identity could avoid that work but must preserve matching
+  across ranks and independently live dispatch handles.
+- GPU route preparation still checks duplicate expert IDs and finite weights.
+  A trusted-input mode would need an explicit contract before removing those
+  checks; expert-index bounds also protect memory access.
+
+The dispatch loop's barrier before reading shared error state also separates
+the previous iteration's reads from the next iteration's updates. Sampling
+health checks does not make that barrier redundant. Ready/ACK fences, stream
+events and `record_stream` likewise carry data dependencies, rather than
+serving only as diagnostics. The adapter's duplicate expert-output shape check
+has been removed; the core retains the check for both transports.
 
 Remaining limits include dispatch's all-peer header ACK traffic and draining
 each operation's queues before returning. Double slots and multiple channels

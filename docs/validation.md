@@ -21,6 +21,24 @@ below describe prior revisions and were not all repeated for this change.
 Validation date: 2026-10-23. These results establish reference-implementation
 correctness, not a production throughput or model-inference speedup claim.
 
+### Subsequent critical-path cleanup
+
+Runtimes `6ecedd7` and `d3410eb` compiled and completed full-model SGLang
+inference on eight GPUs at batches 1 and 32, following the performance-first validation
+policy. The broad native suite above was not rerun for these changes. Matched
+configuration, inputs, hardware, source and host-only transport checks passed;
+all six timed batches in each candidate run completed without reported runtime
+errors. Four short greedy output checks matched all 29 generated token IDs
+against default NCCL.
+The end-to-end results and their numerical limits are recorded in the
+[latest model comparison](model-performance.md#rank-pair-combine-and-critical-path-cleanup).
+
+CPU CI identified a missing capture rejection before first lazy Context
+initialization. Revision `daec161` restores that bootstrap-only guard; its
+targeted adapter check and public CPU CI passed. It does not alter the timed
+steady-state path. The final `d3410eb` model rerun includes that guard and removal
+of the adapter's duplicate shape check; the core shape check remains.
+
 ## GPU-initiated backend
 
 The `host_sm` implementation was compiled and exercised with CUDA toolkit
@@ -119,10 +137,11 @@ utilization.
 
 Full SGLang startup and matched eager model runs with one, eight, and 32
 concurrent requests are documented in [the model comparison](model-performance.md).
-The sole performance baseline is SGLang's native NCCL backend. The current
-GPU-initiated implementation remains slower in all three shapes, at both four
-and 16 channels. Both settings passed four short generated-output checks with
-matching token IDs, but these do not replace a layer-wise numerical error study.
+The sole performance baseline is SGLang's native NCCL backend. The earlier
+four- and 16-channel implementations were slower at all three shapes. The
+latest rank-pair revision is close to NCCL at batch 1 and remains 16.6% slower
+at batch 32; batch 8 was not remeasured. Short generated-output checks match
+token IDs, but do not replace a layer-wise numerical error study.
 
 Remaining validation and implementation work:
 
