@@ -15,10 +15,9 @@ import torch.distributed as dist
 from ep_xpress import Config, Context
 from ep_xpress.adapters.sglang_config import (
     contiguous_expert_map,
-    receive_capacity_from_scheduler,
     validate_runner_config,
 )
-from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.dp_attention import get_global_dp_buffer_len
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
@@ -46,7 +45,7 @@ def close_contexts():
 @dataclass(frozen=True)
 class _Ticket:
     handle: object
-    tag: str
+    tag: object
     rows: int
 
 
@@ -76,6 +75,9 @@ class HostEPDispatcher(BaseDispatcher):
         self._device = torch.device("cuda", torch.cuda.current_device())
         self._world_size = size
         transport = os.environ.get("EP_XPRESS_TRANSPORT", "host_ce")
+        diagnostics = os.environ.get("EP_XPRESS_DIAGNOSTICS", "0")
+        if diagnostics not in ("0", "1"):
+            raise ValueError("EP_XPRESS_DIAGNOSTICS must be 0 or 1")
         self._config = Config(
             hidden_size=moe_runner_config.hidden_size,
             topk=moe_runner_config.top_k,
@@ -86,6 +88,7 @@ class HostEPDispatcher(BaseDispatcher):
             host_pool_budget_bytes=int(os.environ.get("EP_XPRESS_HOST_BUDGET_BYTES", str(512 << 20))),
             transport=transport,
             fatal_errors=transport == "host_sm",
+            diagnostics=diagnostics == "1",
         )
         self._expert_map = tuple(contiguous_expert_map(moe_runner_config.num_experts, size))
         self._context_key = (self._group, self._device, self._config, self._expert_map)
@@ -134,17 +137,16 @@ class HostEPDispatcher(BaseDispatcher):
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise ValueError("EP-Xpress requires standard top-k IDs and weights")
         stream = torch.cuda.current_stream(self._device)
-        tag = f"layer/{self._layer_id}/operation/{self._sequence}"
+        tag = (f"layer/{self._layer_id}/operation/{self._sequence}"
+               if self._config.diagnostics or self._config.transport == "host_ce" else None)
         try:
             dispatch_options = {}
             if self._config.transport == "host_sm":
-                # These CPU counts already exist in the scheduler. Reading the
-                # GPU valid count here would synchronize every MoE layer.
-                dispatch_options["recv_capacity"] = receive_capacity_from_scheduler(
-                    get_dp_global_num_tokens(),
-                    world_size=self._world_size,
-                    max_tokens_per_rank=self._config.max_tokens_per_rank,
-                )
+                # The pinned scheduler computes this sum once per forward,
+                # after MAX_LEN/SUM_LEN padding. Reuse that exact CPU bound
+                # instead of validating and summing all rank counts per layer.
+                # Each source's input capacity is still checked by the core.
+                dispatch_options["recv_capacity"] = get_global_dp_buffer_len()
             batch = self._context().dispatch_async(
                 hidden_states,
                 topk_output.topk_ids,

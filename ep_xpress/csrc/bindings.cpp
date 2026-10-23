@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include "host_sm.h"
 
 void add_partial_cuda(torch::Tensor accum, torch::Tensor partial,
                       torch::Tensor token_indices);
@@ -145,6 +146,31 @@ torch::Tensor finish_combine(torch::Tensor remote, torch::Tensor local) {
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  pybind11::class_<PreparedHostSM, std::shared_ptr<PreparedHostSM>>(module, "PreparedHostSM")
+      .def("dispatch", &PreparedHostSM::dispatch,
+          pybind11::arg("x"), pybind11::arg("ids"), pybind11::arg("weights"),
+          pybind11::arg("epoch"), pybind11::arg("output"), pybind11::arg("output_ids"),
+          pybind11::arg("output_weights"), pybind11::arg("inverse"), pybind11::arg("count"),
+          pybind11::arg("identity") = 0)
+      .def("combine", &PreparedHostSM::combine,
+          pybind11::arg("partial"), pybind11::arg("inverse"), pybind11::arg("count"),
+          pybind11::arg("epoch"), pybind11::arg("output"), pybind11::arg("remote"),
+          pybind11::arg("identity") = 0, pybind11::arg("profile") = pybind11::none());
+  module.def("prepare_host_sm", [](torch::Tensor expert_rank, torch::Tensor expert_local,
+      torch::Tensor dispatch_pointers, torch::Tensor combine_pointers, torch::Tensor status,
+      int64_t rank, int64_t hidden, int64_t topk, int64_t slots, int64_t dispatch_rows,
+      int64_t combine_rows, int64_t timeout_ms, int64_t channels,
+      bool diagnostics, bool fatal_errors) {
+    return std::make_shared<PreparedHostSM>(expert_rank, expert_local, dispatch_pointers,
+        combine_pointers, status, rank, hidden, topk, slots, dispatch_rows, combine_rows,
+        timeout_ms, channels, diagnostics, fatal_errors);
+  }, pybind11::arg("expert_rank"), pybind11::arg("expert_local"),
+      pybind11::arg("dispatch_pointers"), pybind11::arg("combine_pointers"),
+      pybind11::arg("status"), pybind11::arg("rank"), pybind11::arg("hidden"),
+      pybind11::arg("topk"), pybind11::arg("slots"), pybind11::arg("dispatch_rows"),
+      pybind11::arg("combine_rows"), pybind11::arg("timeout_ms"), pybind11::arg("channels"),
+      pybind11::kw_only(), pybind11::arg("diagnostics") = false,
+      pybind11::arg("fatal_errors") = false);
   module.def("register_host", &register_host);
   module.def("register_mapped_host", &register_mapped_host);
   module.def("host_sm_max_channels", &host_sm_max_channels, pybind11::arg("world") = 1);

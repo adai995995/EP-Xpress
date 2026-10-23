@@ -155,6 +155,8 @@ class HostSMContext(Context):
     Setup validates the group and placement once, maps all producer queues on
     each GPU, and creates device expert-placement tables. Dispatch and combine
     enqueue GPU work without a Gloo exchange or CPU routing/count readback.
+    Protocol diagnostics and tag fingerprints are opt-in at construction;
+    dynamic tensor bounds, queue credits and stream ordering remain required.
     Call check_errors() at an experiment or application completion boundary.
     """
 
@@ -179,7 +181,8 @@ class HostSMContext(Context):
         if chosen.type != "cuda":
             raise ValueError("device must be CUDA")
         self.device = torch.device("cuda", torch.cuda.current_device() if chosen.index is None else chosen.index)
-        if self.world_size * config.max_tokens_per_rank > (1 << 31) - 1:
+        self._max_receive_capacity = self.world_size * config.max_tokens_per_rank
+        if self._max_receive_capacity > (1 << 31) - 1:
             raise ValueError("total receive capacity must fit int32")
         with torch.cuda.device(self.device):
             native.load()
@@ -199,6 +202,7 @@ class HostSMContext(Context):
         self._arenas = {"dispatch": [], "combine": []}
         self._registered = []
         self._pointers = {}
+        self._prepared = None
         self._root = None
         self._work_stream = None
         self._combine_profile = None
@@ -299,6 +303,13 @@ class HostSMContext(Context):
                     self._expert_rank = torch.tensor(self.expert_to_rank, dtype=torch.int32, device=self.device)
                     self._expert_local = torch.tensor(local_ids, dtype=torch.int32, device=self.device)
                     self._status = torch.zeros(1, dtype=torch.int32, device=self.device)
+                    self._prepared = native.prepare_host_sm(
+                        self._expert_rank, self._expert_local, self._pointers["dispatch"],
+                        self._pointers["combine"], self._status, self.rank,
+                        self.config.hidden_size, self.config.topk, self.config.slots,
+                        self._channel_chunk_rows, self._combine_chunk_rows,
+                        self._timeout_ms, self.effective_channels,
+                        diagnostics=self.config.diagnostics, fatal_errors=self.config.fatal_errors)
                 self._work_stream.synchronize()
         except Exception:
             init_error = "mapped queue registration or CUDA initialization failed"
@@ -487,6 +498,8 @@ class HostSMContext(Context):
             raise RuntimeError("Context is closed")
         if self._failure is not None:
             raise RuntimeError("EP context is in a failed state") from self._failure
+        # The caller's producer stream can be capturing even though the
+        # separate native transport stream is not; keep both boundary guards.
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("host_sm eager backend cannot be captured in a CUDA Graph")
         if self._unwaited >= self.config.max_pending_operations:
@@ -508,20 +521,15 @@ class HostSMContext(Context):
         return _DevicePending(self, value, completed)
 
     def _validate_dispatch(self, x, ids, weights):
+        # Keep only the public contract and CPU-known allocation bounds here.
+        # The prepared native entry validates each operation's dynamic tensor
+        # device/dtype/layout/shape once, before it enqueues any kernel.
         if not all(isinstance(t, torch.Tensor) for t in (x, ids, weights)):
             raise ValueError("dispatch inputs must be tensors")
-        if (x.device != self.device or x.dtype != torch.bfloat16 or x.ndim != 2 or
-                not x.is_contiguous() or x.requires_grad):
-            raise ValueError("x must be contiguous inference BF16 [tokens, hidden] on the context device")
-        if x.shape[1] != self.config.hidden_size or x.shape[0] > self.config.max_tokens_per_rank:
-            raise ValueError("x exceeds configured token capacity or hidden size")
-        shape = (x.shape[0], self.config.topk)
-        if tuple(ids.shape) != shape or tuple(weights.shape) != shape:
-            raise ValueError("top-k tensors must have shape [local_tokens, topk]")
-        if ids.dtype not in (torch.int32, torch.int64) or weights.dtype != torch.float32:
-            raise ValueError("top-k IDs must be integer and weights must be FP32")
-        if ids.device != self.device or weights.device != self.device or weights.requires_grad:
-            raise ValueError("top-k tensors must be inference tensors on the context device")
+        if x.ndim != 2 or x.shape[0] > self.config.max_tokens_per_rank:
+            raise ValueError("x must be [tokens, hidden] within the configured token capacity")
+        if x.requires_grad or weights.requires_grad:
+            raise ValueError("dispatch accepts inference tensors only")
 
     def dispatch_async(self, x, topk_ids, topk_weights, tag=None, stream=None, recv_capacity=None):
         """Enqueue routed dispatch without reading routes or counts on the CPU.
@@ -534,11 +542,11 @@ class HostSMContext(Context):
         with self._lock, torch.cuda.device(self.device):
             try:
                 self._validate_dispatch(x, topk_ids, topk_weights)
-                capacity = self.world_size * self.config.max_tokens_per_rank if recv_capacity is None else recv_capacity
+                capacity = self._max_receive_capacity if recv_capacity is None else recv_capacity
                 if (isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 0 or
-                        capacity > self.world_size * self.config.max_tokens_per_rank):
+                        capacity > self._max_receive_capacity):
                     raise ValueError("recv_capacity must be an integer within the configured group capacity")
-                identity = _operation_identity("dispatch", tag)
+                identity = _operation_identity("dispatch", tag) if self.config.diagnostics else 0
                 epoch = self._begin("dispatch", stream)
                 for tensor in (x, topk_ids, topk_weights):
                     tensor.record_stream(self._work_stream)
@@ -550,12 +558,8 @@ class HostSMContext(Context):
                     weights_out = torch.empty((capacity, self.config.topk), dtype=torch.float32, device=self.device)
                     inverse = torch.empty((capacity, 2), dtype=torch.int64, device=self.device)
                     count = torch.empty(1, dtype=torch.int32, device=self.device)
-                    native.host_sm_dispatch(
-                        x, ids, weights, self._expert_rank, self._expert_local, self._pointers["dispatch"],
-                        self.rank, epoch, self.config.slots, self._channel_chunk_rows,
-                        self._timeout_ms,
-                        hidden, local_ids, weights_out, inverse, count, self._status, identity=identity,
-                        channels=self.effective_channels)
+                    self._prepared.dispatch(x, ids, weights, epoch, hidden, local_ids,
+                                            weights_out, inverse, count, identity=identity)
                     handle = RouteHandle(self._id, self._counter, _DeviceRoute(inverse, count),
                                          x.shape[0], capacity, tag)
                     return self._finish(DispatchBatch(hidden, local_ids, weights_out, handle, count))
@@ -574,12 +578,9 @@ class HostSMContext(Context):
             if handle._consumed:
                 raise ValueError("handle has already been consumed by combine")
             try:
-                if (not isinstance(partial, torch.Tensor) or partial.device != self.device or
-                        partial.dtype != torch.bfloat16 or partial.ndim != 2 or
-                        tuple(partial.shape) != (handle.received_count, self.config.hidden_size) or
-                        not partial.is_contiguous() or partial.requires_grad):
-                    raise ValueError("partial must be contiguous inference BF16 [receive_capacity, hidden] on the context device")
-                identity = _operation_identity("combine", tag, handle.operation)
+                if not isinstance(partial, torch.Tensor) or partial.requires_grad:
+                    raise ValueError("partial must be an inference tensor")
+                identity = _operation_identity("combine", tag, handle.operation) if self.config.diagnostics else 0
                 epoch = self._begin("combine", stream)
                 for tensor in (partial, handle._plan.inverse, handle._plan.count):
                     tensor.record_stream(self._work_stream)
@@ -589,11 +590,8 @@ class HostSMContext(Context):
                     remote = torch.empty((self.world_size, handle.local_token_count, self.config.hidden_size),
                                          dtype=torch.bfloat16, device=self.device)
                     profile, profile_record = self._combine_profile_slice(handle, tag, epoch)
-                    native.host_sm_combine(
-                        partial, handle._plan.inverse, handle._plan.count, self._pointers["combine"],
-                        self.rank, epoch, self.config.slots, self._combine_chunk_rows,
-                        self._timeout_ms, output, remote, self._status,
-                        identity=identity, channels=self.effective_channels, profile=profile)
+                    self._prepared.combine(partial, handle._plan.inverse, handle._plan.count,
+                                           epoch, output, remote, identity=identity, profile=profile)
                     if profile_record is not None:
                         profile_record["submitted"] = True
                     handle._consumed = True
@@ -613,6 +611,9 @@ class HostSMContext(Context):
                 # shutdown. Stop it explicitly to retain its diagnostic report.
                 self._combine_profile = None
                 self._combine_profile_label = None
+                # Release the prepared object's retained device tensors only
+                # after draining transport, and before unregistering mappings.
+                self._prepared = None
                 for address in self._registered:
                     native.unregister_host(address)
                 self._registered.clear()

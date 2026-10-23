@@ -188,56 +188,48 @@ shared cross-GPU atomic counter.
 `Pending.wait()` inserts an event dependency on the consuming stream without
 waiting for device routing on the CPU. Input/output tensors and mapped arenas
 remain alive until their transport work completes. GPU status is sticky;
-invalid routes, insufficient receive capacity, or a timeout poison the context.
+invalid route indices or insufficient receive capacity poison the context.
 `check()` is an explicit synchronizing validation boundary. Normal submission
-and `wait()` do not scan mapped host error headers. GPU workers poll mapped
-abort headers on the first loop iteration and every 256 iterations thereafter;
-local GPU status checks and per-frame ready/credit checks remain. This reduces
-health-check traffic but can delay peer-abort observation by up to 255
-completed loop iterations; it is not a wall-clock response guarantee.
-Bounds checks, publication fences, ACK ordering, and stream
-dependencies still protect payload access and buffer lifetime. CPU-readable
-abort words are inspected at explicit validation or diagnostic boundaries.
-Once a failure is observed, later submissions reject the failed context.
-The SGLang adapter enables `fatal_errors`: a GPU transport error traps after
-publishing the abort flag, so the framework's normal output synchronization
-also catches a failure in its final layer. This requires worker restart. The
-standalone default keeps errors recoverable for inspection, but the failed
-communication context still must be destroyed.
+and `wait()` do not scan mapped host error headers.
 
-Static CPU configuration is resolved outside repeated layer calls: the
-adapter retains group information, expert placement, and its resolved
-context, while the context caches timeout conversion and native occupancy
-limits. Dynamic tensor shapes, scheduler-provided capacity, operation
-generations, and handle ownership are still checked when each operation is
-submitted. These metadata checks do not read routing tensors back to the CPU.
+`Config.diagnostics` defaults to `False` for `host_sm`. The prepared path omits
+CPU tag serialization/hashing, GPU operation fingerprint publication/checking,
+peer-abort and timeout polling, duplicate expert detection, and finite-weight
+checks. Unique top-k IDs and finite weights remain input requirements. Enabling
+this option restores those diagnostics; abort/timeout polling then runs on the
+first loop iteration and every 256 iterations. Diagnostics do not change queue
+ready/ACK, epochs, payload bounds or publication/lifetime synchronization.
 
-A follow-up audit identified remaining control work that is not yet removed:
+With diagnostics disabled, a missing or failed peer can leave a kernel waiting;
+external job cancellation is required. A synchronizing `check()` or `close()`
+cannot impose a host timeout on such a kernel. The SGLang adapter enables
+`fatal_errors`: a detected local GPU transport error traps, so ordinary model
+output synchronization surfaces it. This requires worker restart. The fatal
+inference path omits dispatch's otherwise error-only count-reset kernel;
+nonfatal contexts retain it for the standalone failure-inspection contract.
 
-- Dispatch launches a final kernel whose only job is to zero the valid count
-  after an error. Normal execution does no useful work in that kernel. Removing
-  it requires preserving the standalone nonfatal error contract or making the
-  SGLang fatal-error mode explicit at the native launch boundary.
-- Native entry points still check fixed parameters and look up cached launch
-  capacity under a mutex. GPU attribute and occupancy queries are already
-  cached. A prepared native context could validate fixed parameters once while
-  keeping dynamic bounds and tensor lifetime checks on submission.
-- Each layer recomputes scheduler receive capacity from existing CPU counts.
-  Sharing that result across layers requires a reliable forward identifier;
-  caching by a mutable list's address would be incorrect.
-- Operation identity is still serialized and hashed on the CPU for each call.
-  A numeric operation identity could avoid that work but must preserve matching
-  across ranks and independently live dispatch handles.
-- GPU route preparation still checks duplicate expert IDs and finite weights.
-  A trusted-input mode would need an explicit contract before removing those
-  checks; expert-index bounds also protect memory access.
+Bootstrap constructs `PreparedHostSM`, validates static placement, pointer
+layout, rank/world, queue sizes and cooperative launch capacity, and retains
+its CUDA tensors. It caches addresses, slot/channel strides, timeout conversion
+and launch configuration. Per-operation native submission does not repeat the
+capacity mutex/map lookup. It retains only checks for changing tensor shapes,
+dtype/device/layout, epoch and bounds, with one device-guard scope. Placement
+and pointer tables are read back only once during bootstrap; routes and valid
+counts remain on the GPU throughout submission.
+
+The adapter reads SGLang's `get_global_dp_buffer_len()`, already computed once
+per forward after MAX_LEN/SUM_LEN padding, instead of validating/summing rank
+counts in every layer. It caches the resolved Context and omits diagnostic tag
+strings unless diagnostics are enabled. Each source still checks its local
+input token limit; the receiving Context checks the aggregate capacity bound.
+The core validates expert-output shape without duplicating it in the adapter.
 
 The dispatch loop's barrier before reading shared error state also separates
-the previous iteration's reads from the next iteration's updates. Sampling
+the previous iteration's reads from the next iteration's updates. Disabling
 health checks does not make that barrier redundant. Ready/ACK fences, stream
-events and `record_stream` likewise carry data dependencies, rather than
-serving only as diagnostics. The adapter's duplicate expert-output shape check
-has been removed; the core retains the check for both transports.
+events and `record_stream` likewise carry required data dependencies. The
+producer and native work-stream capture guards check different streams and
+remain in place because CUDA Graph execution is not implemented.
 
 Remaining limits include dispatch's all-peer header ACK traffic and draining
 each operation's queues before returning. Double slots and multiple channels

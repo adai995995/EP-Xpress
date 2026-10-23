@@ -113,11 +113,16 @@ The SGLang adapter obtains its bound from existing scheduler metadata.
 
 Normal submission and `wait()` do not scan host queue error headers. Use
 `check()` at a completed experiment/request boundary to inspect asynchronous
-errors. The GPU amortizes abort-header polling across loop iterations and
-checks operation identity on the first frame from each peer and channel.
+errors. `Config(diagnostics=False)` is the default for `host_sm`: tag hashing,
+operation fingerprints, peer-abort/timeout polling, duplicate expert detection,
+and finite-weight diagnostics are disabled. Inputs must still satisfy the
+unique top-k and finite-weight contract. Set `diagnostics=True` to investigate
+protocol errors; absent peers otherwise require external job cancellation.
 Required ready/credit checks, payload bounds, and slot-lifetime ordering remain
-in the transport. Static adapter group information and the resolved context
-are cached; dynamic input shapes and scheduler capacities are still checked.
+in the transport. Bootstrap creates a prepared native operator that validates
+and caches placement, queue layout and launch capacity once. Only changing
+tensor shapes/layouts and bounds are checked on each operation. The adapter
+reuses SGLang's CPU capacity already computed once per forward.
 
 The SM backend batches routing and metadata access. `channels` is the number
 of logical work partitions, not a count of reserved SMs. Dispatch launches one

@@ -65,6 +65,16 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             cfg.mapped_arena_bytes(4, queue_peers=8)
 
+    def test_host_sm_diagnostics_are_explicit_and_boolean(self):
+        self.assertFalse(Config(128, 4, 32, transport="host_sm").diagnostics)
+        self.assertTrue(Config(128, 4, 32, transport="host_sm", diagnostics=True).diagnostics)
+        for value in (0, 1, None, "false"):
+            with self.assertRaisesRegex(ValueError, "diagnostics must be a bool"):
+                Config(128, 4, 32, transport="host_sm", diagnostics=value)
+        with self.assertRaisesRegex(ValueError, "only supported by host_sm"):
+            Config(128, 4, 32, transport="host_ce", diagnostics=True)
+        self.assertFalse(Config(128, 4, 32, transport="host_ce").diagnostics)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -73,6 +73,8 @@ def fake_adapter(rows=3, scheduler_counts=(2, 1)):
             return Pending(batch)
 
         def combine_async(self, *args, **kwargs):
+            if args[0].shape != batch.hidden.shape:
+                raise ValueError("partial shape does not match the dispatch handle")
             calls.append(("combine", args, kwargs))
             return Pending(Tensor((2, 16)))
 
@@ -107,7 +109,8 @@ def fake_adapter(rows=3, scheduler_counts=(2, 1)):
            StandardCombineInput=combine_type, StandardDispatchOutput=output_type)
     module("sglang.srt.layers.moe.topk", StandardTopKOutput=topk_type,
            TopKOutputChecker=SimpleNamespace(format_is_standard=lambda value: isinstance(value, topk_type)))
-    module("sglang.srt.layers.dp_attention", get_dp_global_num_tokens=lambda: scheduler_counts)
+    module("sglang.srt.layers.dp_attention",
+           get_global_dp_buffer_len=lambda: None if scheduler_counts is None else sum(scheduler_counts))
     parallel = SimpleNamespace(tp_size=2, attn_dp_size=2, moe_ep_size=2, moe_ep_rank=0,
                                moe_ep_group=SimpleNamespace(cpu_group=object()))
     module("sglang.srt.runtime_context", get_parallel=lambda: parallel)
@@ -182,13 +185,18 @@ class AdapterContractTest(unittest.TestCase):
                 dispatcher.combine(fixture.combine(Tensor((7, 16))))
                 self.assertIs(fixture.calls[-1][1][1], fixture.batch.handle)
 
-    def test_host_sm_requires_scheduler_capacity(self):
+    def test_host_sm_reuses_scheduler_capacity(self):
         with patch.dict(os.environ, {"EP_XPRESS_TRANSPORT": "host_sm"}):
-            with fake_adapter(scheduler_counts=None) as fixture:
+            with fake_adapter(scheduler_counts=[2, 5]) as fixture:
                 dispatcher = fixture.module.HostEPDispatcher(runner_config())
-                with self.assertRaisesRegex(ValueError, "scheduler token counts"):
-                    dispatcher.dispatch(Tensor((2, 16)), fixture.topk(object(), object(), object()))
-                self.assertEqual(fixture.calls, [])
+                scheduler = sys.modules["sglang.srt.layers.dp_attention"]
+                scheduler.get_global_dp_buffer_len = lambda: 11
+                # The adapter imported the getter; replace that binding to
+                # model the scheduler's next forward without inspecting routes.
+                fixture.module.get_global_dp_buffer_len = scheduler.get_global_dp_buffer_len
+                dispatcher.dispatch(Tensor((2, 16)), fixture.topk(object(), object(), object()))
+                self.assertEqual(fixture.calls[-1][2]["recv_capacity"], 11)
+                self.assertIsNone(fixture.calls[-1][2]["tag"])
 
     def test_no_second_id_mapping_or_weight_application(self):
         with fake_adapter() as fixture:
@@ -214,9 +222,16 @@ class AdapterContractTest(unittest.TestCase):
             dispatcher.dispatch(Tensor((2, 16)), topk)
             with self.assertRaises(RuntimeError):
                 dispatcher.dispatch(Tensor((2, 16)), topk)
+            dispatcher.combine(fixture.combine(Tensor((3, 16))))
+            with self.assertRaises(RuntimeError):
+                dispatcher.combine(fixture.combine(Tensor((3, 16))))
+        with fake_adapter() as fixture:
+            dispatcher = fixture.module.HostEPDispatcher(runner_config())
+            dispatcher.dispatch(Tensor((2, 16)), fixture.topk(object(), object(), object()))
+            # Shape validation belongs to the core. Its failure makes this
+            # adapter unusable; it must not retry a partially submitted epoch.
             with self.assertRaises(ValueError):
                 dispatcher.combine(fixture.combine(Tensor((3, 2, 16))))
-            dispatcher.combine(fixture.combine(Tensor((3, 16))))
             with self.assertRaises(RuntimeError):
                 dispatcher.combine(fixture.combine(Tensor((3, 16))))
 

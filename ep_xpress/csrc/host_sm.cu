@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 #include <cub/block/block_scan.cuh>
+#include "host_sm.h"
 
 namespace {
 constexpr int kThreads = 256;
@@ -243,6 +244,9 @@ struct TransportArgs {
   int input_rows, hidden, topk, capacity;
   int64_t slot_stride, channel_stride;
   uint64_t epoch, timeout_ns, identity;
+  bool diagnostics = true;
+  bool trusted_placement = false;
+  bool fatal_errors = false;
 };
 
 // These atomics address this GPU's VRAM only. Host synchronization words retain
@@ -327,7 +331,7 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
     cursor = int(int64_t(n) * channel / a.channels);
     end = int(int64_t(n) * (channel + 1) / a.channels);
     producer_done = sent_chunks = 0;
-    start = ticks_ns();
+    start = a.diagnostics ? ticks_ns() : 0;
   }
   for (int peer = tid; peer < a.world; peer += blockDim.x) {
     peer_done[peer] = peer == a.rank;
@@ -336,7 +340,7 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
   __syncthreads();
   uint32_t iteration = 0;
   while (true) {
-    const bool check_health = (iteration++ & 255u) == 0;
+    const bool check_health = a.diagnostics && (iteration++ & 255u) == 0;
     profile_iteration_begin(profile);
     profile_phase(profile, PPeerPoll);
     // Check different peers concurrently; never spin on a blocked producer.
@@ -386,15 +390,18 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
           for (int k = 0; k < a.topk; ++k) {
             const int64_t expert = ids[int64_t(row) * a.topk + k];
             if (expert == -1) continue;
-            if (expert < 0 || expert >= a.experts || !isfinite(a.weights[int64_t(row) * a.topk + k])) {
+            if (expert < 0 || expert >= a.experts ||
+                (a.diagnostics && !isfinite(a.weights[int64_t(row) * a.topk + k]))) {
               fail(a.status, 1); continue;
             }
             const int destination = a.expert_rank[expert];
-            if (destination < 0 || destination >= a.world || a.expert_local[expert] < 0) {
+            if (!a.trusted_placement &&
+                (destination < 0 || destination >= a.world || a.expert_local[expert] < 0)) {
               fail(a.status, 1); continue;
             }
-            for (int j = 0; j < k; ++j)
-              if (ids[int64_t(row) * a.topk + j] == expert) fail(a.status, 1);
+            if (a.diagnostics)
+              for (int j = 0; j < k; ++j)
+                if (ids[int64_t(row) * a.topk + j] == expert) fail(a.status, 1);
             mask |= uint64_t(1) << destination;
           }
         }
@@ -480,7 +487,7 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
         if (num_remote || cursor == end) {
           if (tid == 0) {
             host_store32(send_slot + kRowsOffset, num_remote ? num_remote : uint32_t(-1));
-            host_store64(send_slot + kIdentityOffset, a.identity);
+            if (a.diagnostics) host_store64(send_slot + kIdentityOffset, a.identity);
           }
           __threadfence_system();
           __syncthreads();
@@ -513,7 +520,8 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
         uint64_t expected = (a.epoch << 32) | uint64_t(peer_chunk[tid] + 1);
         if (acquire(control(slot, 0)) == expected) {
           rows = int32_t(host_load32(slot + kRowsOffset));
-          if (peer_chunk[tid] == 0 && host_load64(slot + kIdentityOffset) != a.identity) fail(a.status, 5);
+          if (a.diagnostics && peer_chunk[tid] == 0 &&
+              host_load64(slot + kIdentityOffset) != a.identity) fail(a.status, 5);
           if (rows < -1 || rows == 0 || rows > a.chunk_rows) fail(a.status, 1);
         }
       }
@@ -650,7 +658,7 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
   profile_finish(profile, a.profile, error);
   if (tid == 0 && error) {
     release(reinterpret_cast<uint64_t*>(own), uint64_t(error));
-    if (host_load64(own + 16)) {
+    if (a.fatal_errors || host_load64(own + 16)) {
       __threadfence_system();
       asm volatile("trap;");
     }
@@ -690,12 +698,12 @@ __global__ void host_sm_pair_combine_kernel(TransportArgs a) {
     end = int(int64_t(n) * (channel + 1) / a.channels);
     sent = received = send_done = 0;
     recv_done = local;
-    start = ticks_ns();
+    start = a.diagnostics ? ticks_ns() : 0;
   }
   __syncthreads();
   uint32_t iteration = 0;
   while (true) {
-    const bool check_health = (iteration++ & 255u) == 0;
+    const bool check_health = a.diagnostics && (iteration++ & 255u) == 0;
     profile_iteration_begin(profile);
     profile_phase(profile, PPeerPoll);
     if (tid == 0) {
@@ -787,7 +795,7 @@ __global__ void host_sm_pair_combine_kernel(TransportArgs a) {
       } else if (count || cursor == end) {
         if (tid == 0) {
           host_store32(send_slot + kRowsOffset, count ? count : uint32_t(-1));
-          host_store64(send_slot + kIdentityOffset, a.identity);
+          if (a.diagnostics) host_store64(send_slot + kIdentityOffset, a.identity);
         }
         __threadfence_system();
         __syncthreads();
@@ -814,7 +822,8 @@ __global__ void host_sm_pair_combine_kernel(TransportArgs a) {
       if (!recv_done) {
         if (acquire(control(recv_slot, 0)) == ((a.epoch << 32) | uint64_t(received + 1))) {
           rows = int32_t(host_load32(recv_slot + kRowsOffset));
-          if (received == 0 && host_load64(recv_slot + kIdentityOffset) != a.identity) fail(a.status, 5);
+          if (a.diagnostics && received == 0 &&
+              host_load64(recv_slot + kIdentityOffset) != a.identity) fail(a.status, 5);
           if (rows < -1 || rows == 0 || rows > min(kThreads, a.chunk_rows)) fail(a.status, 1);
         }
         if constexpr (Profile) {
@@ -893,7 +902,7 @@ __global__ void host_sm_pair_combine_kernel(TransportArgs a) {
   profile_finish(profile, a.profile, error);
   if (tid == 0 && error) {
     release(control(own, 0), uint64_t(error));
-    if (host_load64(own + 16)) {
+    if (a.fatal_errors || host_load64(own + 16)) {
       __threadfence_system();
       asm volatile("trap;");
     }
@@ -943,8 +952,12 @@ void launch_transport(TransportArgs args, cudaStream_t stream) {
         kernel, dim3(lanes), dim3(kThreads), parameters, 0, stream));
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  host_sm_finalize_kernel<Combine><<<Combine ? blocks : 1, kThreads, 0, stream>>>(args);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  // Fatal inference contexts terminate on a device error; zeroing count after
+  // an error cannot be observed safely and needs no normal-path kernel launch.
+  if (Combine || !args.fatal_errors) {
+    host_sm_finalize_kernel<Combine><<<Combine ? blocks : 1, kThreads, 0, stream>>>(args);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 }
 
 void tensor_check(const torch::Tensor& value, at::ScalarType dtype, int dimensions,
@@ -979,7 +992,165 @@ void common_check(torch::Tensor input, torch::Tensor pointers, int64_t rank,
   TORCH_CHECK((channels == 1 && world == 1) || channels <= max_channels_current_device(world),
               "requested channels require cooperative all-resident launch support and capacity");
 }
+
+void operation_check(const torch::Tensor& input, const torch::Tensor& output,
+                     const torch::Device& device, int hidden, int64_t epoch) {
+  tensor_check(input, at::kBFloat16, 2, device, "input");
+  tensor_check(output, at::kBFloat16, 2, device, "output");
+  TORCH_CHECK(input.size(1) == hidden && output.size(1) == hidden &&
+                  input.size(0) <= INT32_MAX && output.size(0) <= INT32_MAX,
+              "invalid input or output shape for prepared transport");
+  TORCH_CHECK(epoch > 0 && epoch < (int64_t(1) << 31), "invalid epoch");
+}
+
+cudaStream_t eager_stream(const torch::Device& device) {
+  const auto stream = c10::cuda::getCurrentCUDAStream(device.index()).stream();
+  cudaStreamCaptureStatus capture;
+  C10_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+  TORCH_CHECK(capture == cudaStreamCaptureStatusNone,
+              "host_sm does not support CUDA Graph capture or replay");
+  return stream;
+}
 }  // namespace
+
+struct PreparedHostSM::Impl {
+  // Keep all static device addresses alive. Bootstrap tensors are immutable for
+  // this object's lifetime; contexts own the underlying registered host arenas.
+  std::vector<torch::Tensor> retained;
+  torch::Device device = torch::Device(torch::kCPU);
+  TransportArgs dispatch{};
+  TransportArgs combine{};
+};
+
+PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_local,
+    torch::Tensor dispatch_pointers, torch::Tensor combine_pointers,
+    torch::Tensor status, int64_t rank, int64_t hidden, int64_t topk,
+    int64_t slots, int64_t dispatch_rows, int64_t combine_rows,
+    int64_t timeout_ms, int64_t channels, bool diagnostics, bool fatal_errors) {
+  TORCH_CHECK(status.is_cuda(), "status must be a CUDA tensor");
+  const auto device = status.device();
+  tensor_check(status, at::kInt, 1, device, "status");
+  TORCH_CHECK(status.numel() == 1, "status must contain one element");
+  tensor_check(dispatch_pointers, at::kLong, 1, device, "dispatch arena pointers");
+  tensor_check(combine_pointers, at::kLong, 1, device, "combine arena pointers");
+  const int64_t world = dispatch_pointers.numel();
+  TORCH_CHECK(world > 0 && world <= kMaxRanks && rank >= 0 && rank < world &&
+                  combine_pointers.numel() == world, "invalid rank/world");
+  TORCH_CHECK(hidden > 0 && hidden <= INT32_MAX && hidden % 2 == 0 &&
+                  topk > 0 && topk <= 256, "invalid hidden/topk");
+  TORCH_CHECK(slots > 0 && slots <= 64 && dispatch_rows > 0 && dispatch_rows <= 65536 &&
+                  combine_rows > 0 && combine_rows <= 65536, "invalid queue dimensions");
+  TORCH_CHECK(timeout_ms > 0 && timeout_ms <= 3600000, "invalid timeout");
+  TORCH_CHECK(channels >= 1 && channels <= 32, "invalid channel count");
+  tensor_check(expert_rank, at::kInt, 1, device, "expert rank");
+  tensor_check(expert_local, at::kInt, 1, device, "expert local");
+  TORCH_CHECK(expert_rank.numel() > 0 && expert_rank.numel() <= INT32_MAX &&
+                  expert_rank.sizes() == expert_local.sizes(), "invalid expert placement shape");
+  const c10::cuda::CUDAGuard guard(device);
+  eager_stream(device);
+  TORCH_CHECK((channels == 1 && world == 1) || channels <= max_channels_current_device(int(world)),
+              "requested channels require cooperative all-resident launch support and capacity");
+  // This is the only host read of placement and arena tables. Dynamic route
+  // expert indices remain bounds checked on the GPU before table access.
+  const auto ranks_cpu = expert_rank.cpu();
+  const auto locals_cpu = expert_local.cpu();
+  for (int64_t i = 0; i < expert_rank.numel(); ++i) {
+    TORCH_CHECK(ranks_cpu.data_ptr<int32_t>()[i] >= 0 &&
+                    ranks_cpu.data_ptr<int32_t>()[i] < world &&
+                    locals_cpu.data_ptr<int32_t>()[i] >= 0, "invalid expert placement entry");
+  }
+  for (const auto& pointers : {dispatch_pointers, combine_pointers}) {
+    const auto cpu = pointers.cpu();
+    for (int64_t i = 0; i < world; ++i) {
+      const auto address = uint64_t(cpu.data_ptr<int64_t>()[i]);
+      TORCH_CHECK(address != 0 && address % 8 == 0, "invalid mapped arena address");
+    }
+  }
+  impl_ = std::make_shared<Impl>();
+  impl_->retained = {expert_rank, expert_local, dispatch_pointers, combine_pointers, status};
+  impl_->device = device;
+  for (bool combine : {false, true}) {
+    auto& a = combine ? impl_->combine : impl_->dispatch;
+    a.pointers = (combine ? combine_pointers : dispatch_pointers).data_ptr<int64_t>();
+    a.expert_rank = expert_rank.data_ptr<int32_t>();
+    a.expert_local = expert_local.data_ptr<int32_t>();
+    a.status = status.data_ptr<int32_t>();
+    a.experts = int(expert_rank.numel());
+    a.world = int(world); a.rank = int(rank); a.hidden = int(hidden);
+    a.topk = combine ? 0 : int(topk); a.slots = int(slots);
+    a.chunk_rows = int(combine ? combine_rows : dispatch_rows); a.channels = int(channels);
+    const int64_t row = align_up(16 + int64_t(a.topk) * 12 + hidden * 2, 16);
+    a.slot_stride = align_up(kSlotHeader + int64_t(a.chunk_rows) * row, 128);
+    a.channel_stride = channel_bytes(hidden, a.topk, slots, a.chunk_rows);
+    a.timeout_ns = uint64_t(timeout_ms) * 1000000;
+    a.diagnostics = diagnostics; a.trusted_placement = true; a.fatal_errors = fatal_errors;
+  }
+}
+
+void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Tensor weights,
+    int64_t epoch, torch::Tensor output, torch::Tensor output_ids,
+    torch::Tensor output_weights, torch::Tensor inverse, torch::Tensor count,
+    int64_t identity) {
+  auto a = impl_->dispatch;
+  const auto device = impl_->device;
+  operation_check(input, output, device, a.hidden, epoch);
+  TORCH_CHECK(identity >= 0, "invalid operation identity");
+  TORCH_CHECK(ids.scalar_type() == at::kInt || ids.scalar_type() == at::kLong,
+              "ids must have int32 or int64 dtype");
+  tensor_check(ids, ids.scalar_type(), 2, device, "ids");
+  tensor_check(weights, at::kFloat, 2, device, "weights");
+  TORCH_CHECK(ids.size(0) == input.size(0) && ids.size(1) == a.topk &&
+                  ids.sizes() == weights.sizes(), "invalid routing shape");
+  tensor_check(output_ids, at::kLong, 2, device, "output ids");
+  tensor_check(output_weights, at::kFloat, 2, device, "output weights");
+  TORCH_CHECK(output_ids.size(0) == output.size(0) && output_ids.size(1) == a.topk &&
+                  output_ids.sizes() == output_weights.sizes(), "invalid output routing shape");
+  tensor_check(inverse, at::kLong, 2, device, "inverse");
+  TORCH_CHECK(inverse.size(0) == output.size(0) && inverse.size(1) == 2, "invalid inverse shape");
+  tensor_check(count, at::kInt, 1, device, "count");
+  TORCH_CHECK(count.numel() == 1, "count must contain one element");
+  const c10::cuda::CUDAGuard guard(device);
+  const auto stream = eager_stream(device);
+  a.input = input.data_ptr<at::BFloat16>(); a.ids = ids.data_ptr();
+  a.weights = weights.data_ptr<float>(); a.output = output.data_ptr<at::BFloat16>();
+  a.output_ids = output_ids.data_ptr<int64_t>(); a.output_weights = output_weights.data_ptr<float>();
+  a.output_inverse = inverse.data_ptr<int64_t>(); a.output_count = count.data_ptr<int32_t>();
+  a.input_rows = int(input.size(0)); a.capacity = int(output.size(0));
+  a.epoch = uint64_t(epoch); a.identity = uint64_t(identity);
+  if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t>(a, stream);
+  else launch_transport<false, int64_t>(a, stream);
+}
+
+void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch::Tensor count,
+    int64_t epoch, torch::Tensor output, torch::Tensor remote, int64_t identity,
+    c10::optional<torch::Tensor> profile) {
+  auto a = impl_->combine;
+  const auto device = impl_->device;
+  operation_check(partial, output, device, a.hidden, epoch);
+  TORCH_CHECK(identity >= 0, "invalid operation identity");
+  tensor_check(inverse, at::kLong, 2, device, "inverse");
+  TORCH_CHECK(inverse.size(0) == partial.size(0) && inverse.size(1) == 2, "invalid inverse shape");
+  tensor_check(count, at::kInt, 1, device, "count");
+  TORCH_CHECK(count.numel() == 1, "count must contain one element");
+  tensor_check(remote, at::kBFloat16, 3, device, "remote accumulation");
+  TORCH_CHECK(remote.size(0) == a.world && remote.size(1) == output.size(0) &&
+                  remote.size(2) == a.hidden, "invalid accumulation shape");
+  if (profile.has_value()) {
+    tensor_check(*profile, at::kLong, 2, device, "profile");
+    TORCH_CHECK(profile->size(0) == a.channels * a.world && profile->size(1) == PFieldCount,
+                "profile must have shape [channels * world, ", PFieldCount, "]");
+  }
+  const c10::cuda::CUDAGuard guard(device);
+  const auto stream = eager_stream(device);
+  a.input = partial.data_ptr<at::BFloat16>(); a.input_inverse = inverse.data_ptr<int64_t>();
+  a.input_count = count.data_ptr<int32_t>(); a.output = output.data_ptr<at::BFloat16>();
+  a.remote = remote.data_ptr<at::BFloat16>();
+  a.profile = profile.has_value() ? profile->data_ptr<int64_t>() : nullptr;
+  a.input_rows = int(partial.size(0)); a.capacity = int(output.size(0));
+  a.epoch = uint64_t(epoch); a.identity = uint64_t(identity);
+  if (profile.has_value()) launch_transport<true, int64_t, true>(a, stream);
+  else launch_transport<true, int64_t>(a, stream);
+}
 
 int64_t host_sm_max_channels(int64_t world) {
   TORCH_CHECK(world >= 1 && world <= kMaxRanks, "invalid queue peer count");

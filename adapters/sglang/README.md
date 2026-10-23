@@ -90,18 +90,25 @@ would remap the IDs a second time. Expert outputs are already weighted and
 locally summed; `combine_async(..., weights_applied=True)` only reduces across
 ranks. No top-k weight is applied a second time.
 
-For `host_sm`, the adapter sizes each receive tensor from the sum of SGLang's
-existing CPU scheduler token counts for that forward. Rank deduplication bounds
+For `host_sm`, the adapter sizes each receive tensor from SGLang's existing
+`get_global_dp_buffer_len()`: the scheduler computes the sum of padded rank
+counts once per forward in the pinned revision. Rank deduplication bounds
 each destination by this sum. It does not copy routes or receive counts to the
 CPU. The actual valid count and inverse map remain on the GPU. Standard/Triton
 receives the full capacity, with unused IDs set to `-1`, weights and activations
 set to zero; combine reads only the valid prefix using the GPU handle. Padding
 can add expert-runner overhead, so this interface alone does not establish a
 performance improvement. A missing or invalid scheduler bound fails explicitly.
-The adapter enables fatal CUDA errors for this backend: a kernel route, capacity,
-or timeout failure aborts the worker's CUDA context and surfaces at SGLang's
+The adapter enables fatal CUDA errors for this backend: a detected route or
+capacity failure aborts the worker's CUDA context and surfaces at SGLang's
 normal output synchronization. This also rejects a failed final MoE layer without
 adding a per-layer CPU fence. Restart the worker group after such a failure.
+The default `EP_XPRESS_DIAGNOSTICS=0` disables tag/fingerprint validation,
+duplicate-expert and finite-weight checks, and peer-abort/timeout polling.
+Set it to `1` for those protocol diagnostics. With diagnostics disabled, a
+missing peer requires external job cancellation. The fatal inference path
+omits dispatch's otherwise error-only count-reset kernel. Ready/ACK, epochs,
+memory bounds, stream dependencies, and combine reduction remain active.
 
 The patch classifies this backend as completing its own combine, so Qwen3's
 existing local-router forward skips the outer post-expert reduction. That

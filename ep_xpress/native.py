@@ -38,7 +38,7 @@ def load(*, verbose: bool = False):
         source_dir = Path(__file__).resolve().parent / "csrc"
         sources = [source_dir / name for name in ("bindings.cpp", "kernels.cu", "host_sm.cu")]
         digest = hashlib.sha256()
-        for source in sources:
+        for source in sources + sorted(source_dir.glob("*.h")):
             digest.update(source.read_bytes())
         digest.update(torch.__version__.encode())
         digest.update(str(torch.version.cuda).encode())
@@ -224,6 +224,40 @@ def host_sm_arena_bytes(hidden: int, topk: int, slots: int, chunk_rows: int,
         _integer(hidden, "hidden", 1), _integer(topk, "topk"),
         _integer(slots, "slots", 1), _integer(chunk_rows, "chunk_rows", 1),
         _integer(channels, "channels", 1), _integer(queue_peers, "queue_peers", 1),
+    )
+
+
+def prepare_host_sm(
+    expert_rank, expert_local, dispatch_pointers, combine_pointers, status,
+    rank, hidden, topk, slots, dispatch_rows, combine_rows, timeout_ms, channels,
+    *, diagnostics=False, fatal_errors=False,
+):
+    """Validate and cache immutable GPU transport state during bootstrap.
+
+    The returned operator retains the placement, pointer-table and status
+    tensors. They must not be mutated or resized while it is alive; registered
+    host arenas remain the context's responsibility. Preparation reads placement
+    and pointer tables once on the host. Dispatch/combine never repeat that read
+    or the cooperative occupancy query. Each call still validates dynamic
+    tensor shapes, dtype/device/layout and epoch before enqueuing work.
+
+    Diagnostics are opt-in: abort/timeout polling, identity fingerprints, finite
+    route weights and duplicate expert checks are omitted by default. Route
+    bounds, capacity checks, sticky device status and the ready/ACK protocol are
+    always active. With diagnostics off, a missing peer requires external job
+    cancellation. Fatal contexts trap on a device error and omit dispatch's
+    otherwise error-only count-reset kernel.
+    """
+    if not isinstance(diagnostics, bool) or not isinstance(fatal_errors, bool):
+        raise TypeError("diagnostics and fatal_errors must be bools")
+    return load().prepare_host_sm(
+        expert_rank, expert_local, dispatch_pointers, combine_pointers, status,
+        _integer(rank, "rank"), _integer(hidden, "hidden", 1),
+        _integer(topk, "topk", 1), _integer(slots, "slots", 1),
+        _integer(dispatch_rows, "dispatch_rows", 1),
+        _integer(combine_rows, "combine_rows", 1),
+        _integer(timeout_ms, "timeout_ms", 1), _integer(channels, "channels", 1),
+        diagnostics=diagnostics, fatal_errors=fatal_errors,
     )
 
 

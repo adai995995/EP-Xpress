@@ -277,7 +277,8 @@ def run(args):
     dist.init_process_group("gloo", timeout=timedelta(seconds=args.timeout))
     config = Config(hidden_size=args.hidden, topk=4, max_tokens_per_rank=args.tokens,
                     chunk_bytes=args.chunk_bytes, slots=args.slots,
-                    timeout_seconds=args.timeout, transport=args.transport, channels=args.channels)
+                    timeout_seconds=args.timeout, transport=args.transport, channels=args.channels,
+                    diagnostics=bool(args.expect_error))
     totals = []
     profile_summaries = None
     cases = args.cases.split(",")

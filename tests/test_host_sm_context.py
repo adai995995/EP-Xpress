@@ -2,9 +2,10 @@
 
 import os
 import struct
+import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -165,3 +166,63 @@ def test_native_pair_allocator_and_capacity_pass_world_to_extension():
         assert native.host_sm_arena_bytes(128, 0, 2, 3, channels=4, queue_peers=8) == 4096 * 32
         load.return_value.host_sm_max_channels.assert_called_once_with(8)
         load.return_value.host_sm_arena_bytes.assert_called_once_with(128, 0, 2, 3, 4, 8)
+
+
+@pytest.mark.parametrize("diagnostics", [False, True])
+def test_context_uses_prepared_operations_and_hashes_tags_only_when_enabled(diagnostics):
+    context = object.__new__(HostSMContext)
+    context.config = Config(4, 2, 3, transport="host_sm", diagnostics=diagnostics)
+    context.device = torch.device("cuda", 0)
+    context.world_size = 2
+    context._max_receive_capacity = 6
+    context._id = "prepared-context"
+    context._counter = 1
+    context._lock = threading.RLock()
+    context._work_stream = object()
+    context._prepared = Mock()
+    context._begin = Mock(return_value=1)
+    context._finish = Mock(side_effect=lambda value: value)
+    context._abort = Mock()
+    context._combine_profile = None
+    x = torch.zeros((3, 4), dtype=torch.bfloat16)
+    ids = torch.zeros((3, 2), dtype=torch.int64)
+    weights = torch.ones((3, 2), dtype=torch.float32)
+    # Unserializable metadata is intentionally allowed when diagnostics are
+    # disabled: normal submissions do not inspect tags or perform JSON/hash.
+    tag = {"layer": 1} if diagnostics else object()
+    empty = torch.empty
+
+    def cpu_empty(shape, **kwargs):
+        kwargs.pop("device", None)
+        return empty(shape, **kwargs)
+
+    with patch("ep_xpress.host_sm.torch.cuda.device", side_effect=lambda _: nullcontext()), \
+            patch("ep_xpress.host_sm.torch.cuda.stream", side_effect=lambda _: nullcontext()), \
+            patch.object(torch.Tensor, "record_stream"), \
+            patch("ep_xpress.host_sm.torch.empty", side_effect=cpu_empty), \
+            patch("ep_xpress.host_sm._operation_identity", wraps=_operation_identity) as identity:
+        batch = context.dispatch_async(x, ids, weights, tag=tag, recv_capacity=5)
+        result = context.combine_async(batch.hidden, batch.handle, tag=tag)
+
+    dispatch = context._prepared.dispatch.call_args
+    combine = context._prepared.combine.call_args
+    assert dispatch.args[:4] == (x, ids, weights, 1)
+    assert dispatch.args[4] is batch.hidden
+    assert dispatch.args[7] is batch.handle.inverse_map
+    assert dispatch.args[8] is batch.valid_count
+    assert combine.args[0] is batch.hidden
+    assert combine.args[1] is batch.handle.inverse_map
+    assert combine.args[2] is batch.valid_count
+    assert combine.args[3] == 1
+    assert combine.args[4] is result
+    assert tuple(result.shape) == (3, 4)
+    assert batch.handle._consumed
+    assert combine.kwargs["profile"] is None
+    if diagnostics:
+        assert identity.call_count == 2
+        assert dispatch.kwargs["identity"] == _operation_identity("dispatch", tag)
+        assert combine.kwargs["identity"] == _operation_identity("combine", tag, 1)
+    else:
+        identity.assert_not_called()
+        assert dispatch.kwargs["identity"] == combine.kwargs["identity"] == 0
+    context._abort.assert_not_called()

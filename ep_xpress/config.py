@@ -21,12 +21,17 @@ class Config:
     graph_mode: str = "eager"
     fatal_errors: bool = False
     channels: int = 4  # host_sm lanes; ignored by host_ce
+    diagnostics: bool = False  # opt-in host_sm protocol diagnostics
 
     def __post_init__(self):
         if not isinstance(self.fatal_errors, bool):
             raise ValueError("fatal_errors must be a bool")
         if self.fatal_errors and self.transport != "host_sm":
             raise ValueError("fatal_errors is only supported by host_sm")
+        if not isinstance(self.diagnostics, bool):
+            raise ValueError("diagnostics must be a bool")
+        if self.diagnostics and self.transport != "host_sm":
+            raise ValueError("diagnostics is only supported by host_sm")
         for name in ("hidden_size", "topk", "max_tokens_per_rank", "chunk_bytes",
                      "slots", "host_pool_budget_bytes", "max_pending_operations", "channels"):
             value = getattr(self, name)
