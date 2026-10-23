@@ -97,6 +97,9 @@ class HostEPDispatcher(BaseDispatcher):
             raise ValueError("EP_XPRESS_DIAGNOSTICS must be 0 or 1")
         decode_workspace = os.environ.get("EP_XPRESS_DECODE_WORKSPACE", "1")
         fused_decode = os.environ.get("EP_XPRESS_FUSED_DECODE", "1")
+        combine_warps = os.environ.get("EP_XPRESS_COMBINE_WARP_SPECIALIZATION", "1")
+        if combine_warps not in ("0", "1"):
+            raise ValueError("EP_XPRESS_COMBINE_WARP_SPECIALIZATION must be 0 or 1")
         if decode_workspace not in ("0", "1") or fused_decode not in ("0", "1"):
             raise ValueError("EP_XPRESS_DECODE_WORKSPACE and EP_XPRESS_FUSED_DECODE must be 0 or 1")
         self._reuse_decode_workspace = transport == "host_sm" and decode_workspace == "1"
@@ -116,6 +119,7 @@ class HostEPDispatcher(BaseDispatcher):
                                 if transport == "host_sm" else 0),
             decode_max_tokens=(int(os.environ.get("EP_XPRESS_DECODE_MAX_TOKENS", "64"))
                                if transport == "host_sm" else 0),
+            combine_warp_specialization=transport == "host_sm" and combine_warps == "1",
         )
         adaptive = os.environ.get("EP_XPRESS_ADAPTIVE_CHANNELS", "1")
         valid_count = os.environ.get("EP_XPRESS_VALID_COUNT", "1")

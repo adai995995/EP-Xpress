@@ -97,20 +97,23 @@ adaptive switch, must not exceed `EP_XPRESS_CHANNELS`, and is clamped to the
 negotiated cooperative capacity. Set the same options on every rank.
 
 The following `host_sm` options select workspace reuse, bounded decode fusion
-and general combine frame sizing:
+and general combine frame sizing/execution:
 
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
 | `EP_XPRESS_DECODE_WORKSPACE` | `1` | Cache communication tensors for eligible decode operations; `0` uses independent tensors per call. |
 | `EP_XPRESS_FUSED_DECODE` | `1` | Use mailbox receive/reduce fusion for eligible decode; `0` retains pair queues. |
+| `EP_XPRESS_COMBINE_WARP_SPECIALIZATION` | `1` | Give prepared non-fused combine four Tx warps and four Rx warps per CTA; `0` retains the sequential pair-queue kernel. |
 | `EP_XPRESS_DECODE_MAX_TOKENS` | `64` | Reserve this many mailbox token slots per source rank and use it as the adapter's global-capacity eligibility bound. `0` disables both small-decode selections. |
 | `EP_XPRESS_COMBINE_FRAME_ROWS` | `0` | Fix rows per pair-queue frame independently of allocated channels. `0` restores the original split of the chunk budget across channels and peers. |
 
-The two switches accept `0` or `1`; both size settings accept integers from
+The three switches accept `0` or `1`; both size settings accept integers from
 `0` through `256`. Core `Config.decode_max_tokens` and
 `Config.combine_frame_rows` default to `0`. The adapter enables a 64-token
 mailbox by default and retains budget-derived pair frames unless overridden.
-Workspace reuse and fusion can be ablated separately.
+Workspace reuse and fusion can be ablated separately. Core
+`Config.combine_warp_specialization` defaults to `False`; the adapter enables
+it for `host_sm` prepared pair queues.
 
 Eligibility is identical on all ranks: no rank may be extending, and the
 global scheduler capacity must lie between zero and `DECODE_MAX_TOKENS`,
@@ -119,6 +122,16 @@ it also bounds every local source's token count without a new collective.
 Local token counts only select the shape of local cached storage. Prefill and
 larger decode continue using pair queues. Fixed frame rows apply to those
 queue operations; they do not size the per-token decode mailboxes.
+
+Warp specialization applies to prepared non-fused combine, including prefill,
+while eligible decode keeps its fused mailbox path. It preserves 256 threads
+per CTA, the existing grid and channel policy, and the configured frame size.
+The Tx and Rx groups use independent shared metadata and 128-thread barriers.
+Tx publishes READY after every writer fences; Rx publishes ACK after every
+reader finishes. Tx credit waits therefore leave Rx free to drain incoming
+frames. Both groups complete before the CTA exits. This is communication
+progress overlap, not a measurement of bidirectional PCIe bandwidth or an
+implementation of communication/expert-GEMM overlap.
 
 Increasing `COMBINE_FRAME_ROWS` may reduce the number of queue frames while
 increasing mapped host storage. With fixed rows, increasing allocated channels
@@ -215,10 +228,12 @@ final BF16 round; weights are not applied again. Each published contribution
 waits only for its destination's ACK. No unrelated rank ACK or terminal frame
 is required by mailbox combine. Dispatch's existing terminal handshake remains.
 
-The existing combine phase profiler supports pair queues only. For a profile
-run, set `EP_XPRESS_FUSED_DECODE=0` before worker startup; attempting to use
-fusion during a combine capture fails explicitly. Such a profile measures the
-queue path and cannot be used as a phase breakdown of fused decode. Protocol
+The existing combine phase profiler supports the sequential pair-queue
+kernel only. For a profile run, set both
+`EP_XPRESS_COMBINE_WARP_SPECIALIZATION=0` and `EP_XPRESS_FUSED_DECODE=0` before
+worker startup. Captures with warp specialization or fusion fail explicitly.
+Such a profile measures the old sequential kernel and cannot be used as a
+phase breakdown of warp-specialized combine or fused decode. Protocol
 diagnostics controlled by `EP_XPRESS_DIAGNOSTICS` remain a separate option.
 
 For controlled worker shutdown, call

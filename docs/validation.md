@@ -1,5 +1,28 @@
 # Validation
 
+## Independent Tx/Rx warp groups for pair combine
+
+The prepared pair-combine option gives each 256-thread CTA four sending and
+four receiving warps, with separate shared metadata and group barriers. The
+frame ABI, CTA grid, final reduction and decode mailbox implementation are
+unchanged. The CUDA extension compiles successfully; all eight validation
+devices report a safe cooperative capacity of 32 channels at world size eight.
+
+Two focused three-GPU parameter cases passed for 4-row and 256-row frames.
+Each exercises six operation epochs with one/two active channels and two
+slots, covering asymmetric bidirectional traffic, an empty rank, local-only
+and all-empty operations, repeated multi-frame reuse and a hidden-size tail.
+Outputs and remote scratch match the legacy raw combine bit for bit. All
+published slots are acknowledged on completion, including terminal frames;
+prepared-path frame counts match the owner-list partition. Diagnostics are
+enabled in these bounded protocol checks; full-model timing uses the normal
+diagnostics-disabled setting.
+
+Python syntax, three focused local Config/adapter cases, and whitespace checks
+pass. The broader native suite was not repeated. Legacy phase counters are
+explicitly unavailable for the new concurrent kernel; disabling the option
+profiles the old sequential kernel, not the new execution.
+
 ## Decode workspace and fused mailbox combine
 
 Runtime `4356b6f` adds explicitly borrowed decode workspaces, a bounded host

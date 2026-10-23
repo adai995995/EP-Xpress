@@ -1031,6 +1031,204 @@ __global__ void host_sm_pair_combine_kernel(TransportArgs a) {
   }
 }
 
+// Prepared ring combine gives the two directions independent warp groups.
+// A CTA still owns one rank pair and the grid remains all-resident. Neither
+// direction enters a full-CTA barrier until both are finished: a producer
+// waiting for credit cannot prevent its consumer from returning the peer ACK.
+// Keep 256-row metadata capacity even though each group has only 128 threads.
+constexpr int kCombineGroupThreads = kThreads / 2;
+template <int Barrier>
+__device__ __forceinline__ void combine_group_sync() {
+  static_assert(kCombineGroupThreads == 128, "combine warp groups require 128 threads");
+  asm volatile("bar.sync %0, 128;" :: "n"(Barrier) : "memory");
+}
+
+__device__ __forceinline__ void combine_group_health(
+    TransportArgs a, char* own, char* other, uint64_t start, uint32_t iteration) {
+  if (a.diagnostics && (iteration & 255u) == 0) {
+    if (acquire(control(own, 0)) || acquire(control(own, 1)) ||
+        acquire(control(other, 0)) || acquire(control(other, 1))) fail(a.status, 4);
+    if (ticks_ns() - start > a.timeout_ns) fail(a.status, 3);
+  }
+}
+
+__global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
+  __shared__ int begin, end;
+  __shared__ int send_rows[kThreads], send_tokens[kThreads], recv_tokens[kThreads];
+  __shared__ int tx_error, tx_ready, tx_count, tx_complete, rx_error, rx_count;
+  __shared__ uint64_t start;
+  const int tid = threadIdx.x;
+  const int channel = blockIdx.x / a.world, peer = blockIdx.x % a.world;
+  char* own = reinterpret_cast<char*>(a.pointers[a.rank]) +
+      (int64_t(channel) * a.world + peer) * a.channel_stride;
+  char* other = reinterpret_cast<char*>(a.pointers[peer]) +
+      (int64_t(channel) * a.world + a.rank) * a.channel_stride;
+  const int64_t x_offset = payload_offset(a.chunk_rows, 0);
+  if (tid == 0) {
+    int n = a.owner_counts[peer];
+    if (n < 0 || n > a.input_rows) { fail(a.status, 1); n = 0; }
+    begin = int(int64_t(n) * channel / a.channels);
+    end = int(int64_t(n) * (channel + 1) / a.channels);
+    start = a.diagnostics ? ticks_ns() : 0;
+  }
+  __syncthreads();
+
+  if (peer == a.rank) {
+    // Local rows never enter a host queue. Use the whole CTA for this copy.
+    for (int cursor = begin; cursor < end; cursor += kThreads) {
+      const int count = min(kThreads, end - cursor);
+      if (tid < count) {
+        const int row = a.owner_rows[int64_t(peer) * a.input_rows + cursor + tid];
+        if (row < 0 || row >= a.input_rows) fail(a.status, 1);
+        else {
+          const int64_t token = a.input_inverse[int64_t(row) * 2 + 1];
+          if (token < 0 || token > INT32_MAX ||
+              (a.diagnostics && a.input_inverse[int64_t(row) * 2] != peer)) fail(a.status, 1);
+          else if (token >= a.capacity) fail(a.status, 2);
+          else { send_rows[tid] = row; send_tokens[tid] = int(token); }
+        }
+      }
+      __syncthreads();
+      if (tid == 0) tx_error = read_status(a.status);
+      __syncthreads();
+      if (tx_error) break;
+      for (int64_t i = tid; i < int64_t(count) * (a.hidden / 2); i += kThreads) {
+        const int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
+        reinterpret_cast<uint32_t*>(a.output + int64_t(send_tokens[row]) * a.hidden)[h] =
+            reinterpret_cast<const uint32_t*>(a.input + int64_t(send_rows[row]) * a.hidden)[h];
+      }
+      __syncthreads();
+    }
+  } else if (tid < kCombineGroupThreads) {
+    // Tx owns only outgoing metadata and polls only this destination's credit.
+    int cursor = begin, sent = 0;
+    bool terminal_sent = false;
+    uint32_t iteration = 0;
+    while (true) {
+      char* slot = own + kArenaHeader + (sent % a.slots) * a.slot_stride;
+      if (tid == 0) {
+        combine_group_health(a, own, other, start, iteration++);
+        tx_error = read_status(a.status);
+        tx_ready = tx_complete = 0;
+        if (!tx_error && terminal_sent) {
+          // Drain our published payloads and terminal before arena reuse. Rx
+          // continues independently while the destination returns these ACKs.
+          tx_complete = 1;
+          for (int i = 0; i < a.slots; ++i) {
+            char* previous = own + kArenaHeader + i * a.slot_stride;
+            if (acquire(control(previous, 1)) != acquire(control(previous, 0))) {
+              tx_complete = 0;
+              break;
+            }
+          }
+        } else if (!tx_error &&
+                   acquire(control(slot, 1)) == acquire(control(slot, 0))) {
+          tx_ready = 1;
+          tx_count = min(min(kThreads, a.chunk_rows), end - cursor);
+        }
+      }
+      combine_group_sync<1>();
+      if (tx_error || tx_complete) break;
+      if (!tx_ready) { combine_group_sync<1>(); __nanosleep(64); continue; }
+      const int count = tx_count;
+      for (int i = tid; i < count; i += kCombineGroupThreads) {
+        const int row = a.owner_rows[int64_t(peer) * a.input_rows + cursor + i];
+        if (row < 0 || row >= a.input_rows) fail(a.status, 1);
+        else {
+          const int64_t token = a.input_inverse[int64_t(row) * 2 + 1];
+          if (token < 0 || token > INT32_MAX ||
+              (a.diagnostics && a.input_inverse[int64_t(row) * 2] != peer)) fail(a.status, 1);
+          else { send_rows[i] = row; send_tokens[i] = int(token); }
+        }
+      }
+      combine_group_sync<1>();
+      if (tid == 0) tx_error = read_status(a.status);
+      combine_group_sync<1>();
+      if (tx_error) break;
+      for (int i = tid; i < count; i += kCombineGroupThreads)
+        host_store32(slot + kSlotHeader + i * 4, send_tokens[i]);
+      for (int64_t i = tid; i < int64_t(count) * (a.hidden / 2); i += kCombineGroupThreads) {
+        const int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
+        host_store32(slot + x_offset + i * 4,
+            reinterpret_cast<const uint32_t*>(a.input + int64_t(send_rows[row]) * a.hidden)[h]);
+      }
+      if (tid == 0) {
+        host_store32(slot + kRowsOffset, count ? count : uint32_t(-1));
+        if (a.diagnostics) host_store64(slot + kIdentityOffset, a.identity);
+      }
+      // All writers complete their system fence before the leader publishes.
+      __threadfence_system();
+      combine_group_sync<1>();
+      ++sent;
+      if (tid == 0) release(control(slot, 0), (a.epoch << 32) | uint64_t(sent));
+      cursor += count;
+      terminal_sent = count == 0;
+      // Before another iteration can overwrite shared metadata, every writer
+      // must have finished using it; the preceding group barrier provides this.
+    }
+  } else {
+    // Rx owns separate metadata, so it can read and return credit while Tx is
+    // writing a different slot or polling a full outgoing ring.
+    const int lane = tid - kCombineGroupThreads;
+    int received = 0;
+    uint32_t iteration = 0;
+    while (true) {
+      char* slot = other + kArenaHeader + (received % a.slots) * a.slot_stride;
+      if (lane == 0) {
+        combine_group_health(a, own, other, start, iteration++);
+        rx_count = 0;
+        if (acquire(control(slot, 0)) == ((a.epoch << 32) | uint64_t(received + 1))) {
+          rx_count = int32_t(host_load32(slot + kRowsOffset));
+          if (a.diagnostics && received == 0 &&
+              host_load64(slot + kIdentityOffset) != a.identity) fail(a.status, 5);
+          if (rx_count < -1 || rx_count == 0 || rx_count > min(kThreads, a.chunk_rows)) fail(a.status, 1);
+        }
+        rx_error = read_status(a.status);
+      }
+      combine_group_sync<2>();
+      if (rx_error) break;
+      const int count = rx_count;
+      if (!count) { combine_group_sync<2>(); __nanosleep(64); continue; }
+      for (int i = lane; i < count; i += kCombineGroupThreads) {
+        const int token = int(host_load32(slot + kSlotHeader + i * 4));
+        recv_tokens[i] = token;
+        if (token < 0 || token >= a.capacity) fail(a.status, 2);
+      }
+      combine_group_sync<2>();
+      if (lane == 0) rx_error = read_status(a.status);
+      combine_group_sync<2>();
+      if (rx_error) break;
+      for (int64_t i = lane; i < int64_t(count) * (a.hidden / 2); i += kCombineGroupThreads) {
+        const int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
+        auto* dst = reinterpret_cast<uint32_t*>(
+            a.remote + (int64_t(peer) * a.capacity + recv_tokens[row]) * a.hidden);
+        dst[h] = host_load32(slot + x_offset + i * 4);
+      }
+      // Do not ACK until every reader has finished the host payload. This is
+      // the same reuse boundary as the legacy pair kernel, scoped to Rx warps.
+      __threadfence_system();
+      combine_group_sync<2>();
+      ++received;
+      if (lane == 0) release(control(slot, 1), (a.epoch << 32) | uint64_t(received));
+      if (count == -1) break;
+    }
+  }
+
+  // A completed group can wait here without occupying the other group's named
+  // barrier. Both directions finish (or observe the sticky error) before exit.
+  __syncthreads();
+  if (tid == 0) {
+    const int error = read_status(a.status);
+    if (error) {
+      release(control(own, 0), uint64_t(error));
+      if (a.fatal_errors || host_load64(own + 16)) {
+        __threadfence_system();
+        asm volatile("trap;");
+      }
+    }
+  }
+}
+
 // Decode uses bounded, direct-address return mailboxes. A producer owns one
 // payload per (destination rank, original token); only that destination writes
 // its ACK. The preceding call drains every outgoing ACK before returning on
@@ -1214,7 +1412,7 @@ int max_channels_current_device(int world = 1) {
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&cooperative, cudaDevAttrCooperativeLaunch, device));
   if (!cooperative) { capacities.emplace(key, 0); return 0; }
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-  int a, b, c, diagnostic, selective_a, selective_b, mailbox_capacity;
+  int a, b, c, diagnostic, selective_a, selective_b, mailbox_capacity, warp_pair_capacity;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&a, host_sm_transport_kernel<false, int32_t>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, host_sm_transport_kernel<false, int64_t>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&c, host_sm_pair_combine_kernel<false>, kThreads, 0));
@@ -1222,13 +1420,14 @@ int max_channels_current_device(int world = 1) {
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&selective_a, host_sm_transport_kernel<false, int32_t, false, true>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&selective_b, host_sm_transport_kernel<false, int64_t, false, true>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&mailbox_capacity, host_sm_mailbox_combine_kernel, kThreads, 0));
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&warp_pair_capacity, host_sm_warp_pair_combine_kernel, kThreads, 0));
   const int capacity = std::min({32, sms * std::min({a, b, selective_a, selective_b, mailbox_capacity}),
-                                 sms * std::min(c, diagnostic) / world});
+                                 sms * std::min({c, diagnostic, warp_pair_capacity}) / world});
   capacities.emplace(key, capacity);
   return capacity;
 }
 
-template <bool Combine, typename Id, bool Profile = false, bool Selective = false>
+template <bool Combine, typename Id, bool Profile = false, bool Selective = false, bool WarpCombine = false>
 void launch_transport(TransportArgs args, cudaStream_t stream) {
   const int64_t elements = int64_t(args.capacity) * args.hidden * (Combine ? args.world : 1);
   const int blocks = int(std::max<int64_t>(1, std::min<int64_t>(4096, (elements + kThreads - 1) / kThreads)));
@@ -1236,12 +1435,14 @@ void launch_transport(TransportArgs args, cudaStream_t stream) {
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   const int lanes = args.channels * (Combine ? args.world : 1);
   if (lanes == 1) {
-    if constexpr (Combine) host_sm_pair_combine_kernel<Profile><<<1, kThreads, 0, stream>>>(args);
+    if constexpr (WarpCombine) host_sm_warp_pair_combine_kernel<<<1, kThreads, 0, stream>>>(args);
+    else if constexpr (Combine) host_sm_pair_combine_kernel<Profile><<<1, kThreads, 0, stream>>>(args);
     else host_sm_transport_kernel<false, Id, Profile, Selective><<<1, kThreads, 0, stream>>>(args);
   } else {
     void* parameters[] = {&args};
     const void* kernel;
-    if constexpr (Combine) kernel = reinterpret_cast<const void*>(host_sm_pair_combine_kernel<Profile>);
+    if constexpr (WarpCombine) kernel = reinterpret_cast<const void*>(host_sm_warp_pair_combine_kernel);
+    else if constexpr (Combine) kernel = reinterpret_cast<const void*>(host_sm_pair_combine_kernel<Profile>);
     else kernel = reinterpret_cast<const void*>(host_sm_transport_kernel<false, Id, Profile, Selective>);
     C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
         kernel, dim3(lanes), dim3(kThreads), parameters, 0, stream));
@@ -1332,6 +1533,7 @@ struct PreparedHostSM::Impl {
   TransportArgs combine{};
   uint64_t last_mailbox_epoch = 0;
   cudaStream_t mailbox_stream = nullptr;
+  bool combine_warp_specialization = false;
 };
 
 PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_local,
@@ -1339,7 +1541,8 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
     torch::Tensor status, int64_t rank, int64_t hidden, int64_t topk,
     int64_t slots, int64_t dispatch_rows, int64_t combine_rows,
     int64_t timeout_ms, int64_t channels, bool diagnostics, bool fatal_errors,
-    c10::optional<torch::Tensor> mailbox_pointers, int64_t mailbox_tokens) {
+    c10::optional<torch::Tensor> mailbox_pointers, int64_t mailbox_tokens,
+    bool combine_warp_specialization) {
   TORCH_CHECK(status.is_cuda(), "status must be a CUDA tensor");
   const auto device = status.device();
   tensor_check(status, at::kInt, 1, device, "status");
@@ -1394,6 +1597,7 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
   impl_->retained = {expert_rank, expert_local, dispatch_pointers, combine_pointers, status};
   if (mailbox_pointers.has_value()) impl_->retained.push_back(*mailbox_pointers);
   impl_->device = device;
+  impl_->combine_warp_specialization = combine_warp_specialization;
   for (bool combine : {false, true}) {
     auto& a = combine ? impl_->combine : impl_->dispatch;
     a.pointers = (combine ? combine_pointers : dispatch_pointers).data_ptr<int64_t>();
@@ -1527,6 +1731,10 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     impl_->last_mailbox_epoch = uint64_t(epoch);
     impl_->mailbox_stream = stream;
+  } else if (impl_->combine_warp_specialization) {
+    TORCH_CHECK(!profile.has_value(),
+                "warp-specialized prepared combine does not support phase profiling; explicitly disable combine_warp_specialization to profile the legacy kernel");
+    launch_transport<true, int64_t, false, false, true>(a, stream);
   } else if (profile.has_value()) launch_transport<true, int64_t, true>(a, stream);
   else launch_transport<true, int64_t>(a, stream);
 }

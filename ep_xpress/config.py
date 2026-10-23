@@ -24,8 +24,13 @@ class Config:
     diagnostics: bool = False  # opt-in host_sm protocol diagnostics
     combine_frame_rows: int = 0  # 0: split chunk budget; positive: rows per pair/frame
     decode_max_tokens: int = 0  # 0: no decode mailbox; otherwise per-source capacity
+    combine_warp_specialization: bool = False  # independent pair-queue send/receive groups
 
     def __post_init__(self):
+        if not isinstance(self.combine_warp_specialization, bool):
+            raise ValueError("combine_warp_specialization must be a bool")
+        if self.combine_warp_specialization and self.transport != "host_sm":
+            raise ValueError("combine_warp_specialization is only supported by host_sm")
         if not isinstance(self.fatal_errors, bool):
             raise ValueError("fatal_errors must be a bool")
         if self.fatal_errors and self.transport != "host_sm":

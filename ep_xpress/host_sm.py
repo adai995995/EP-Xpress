@@ -397,7 +397,8 @@ class HostSMContext(Context):
                         self._timeout_ms, self.effective_channels,
                         diagnostics=self.config.diagnostics, fatal_errors=self.config.fatal_errors,
                         mailbox_pointers=self._pointers.get("mailbox"),
-                        mailbox_tokens=self.config.decode_max_tokens)
+                        mailbox_tokens=self.config.decode_max_tokens,
+                        combine_warp_specialization=self.config.combine_warp_specialization)
                 self._work_stream.synchronize()
         except Exception:
             init_error = "mapped queue registration or CUDA initialization failed"
@@ -456,6 +457,9 @@ class HostSMContext(Context):
         with self._lock, torch.cuda.device(self.device):
             if self._closed:
                 raise RuntimeError("Context is closed")
+            if self.config.combine_warp_specialization:
+                raise ValueError("combine phase profiling requires combine_warp_specialization=False; "
+                                 "its counters describe the sequential pair-queue kernel")
             self._check_aborted()
             if self._combine_profile is not None:
                 raise RuntimeError("stop the current combine profile before starting another")

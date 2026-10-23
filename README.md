@@ -24,7 +24,9 @@ measured against the intended inference framework and workload.
   Prepared `host_sm` dispatch shares each producer's payload among its actual
   readers and reclaims it using only their ACKs. Combine uses independent
   queues for each directed rank pair and channel, with GPU owner row lists
-  generated during dispatch. An optional bounded decode path receives and
+  generated during dispatch. Optional warp specialization gives prepared pair
+  queues four sending warps and four receiving warps within the same CTA.
+  An optional bounded decode path receives and
   reduces directly from per-token host mailboxes in one combine kernel.
 - Explicitly borrowed decode workspaces reuse communication tensors. Generic
   calls without a workspace retain operation-owned outputs and route storage.
@@ -156,6 +158,16 @@ split of `chunk_bytes` across channels and peers. Larger fixed frames consume
 more host memory as the allocated channel count grows; the host budget covers
 both queues and optional mailboxes. Dispatch frame sizing is unchanged.
 
+`Config(combine_warp_specialization=True)` lets prepared pair-queue combine
+advance sending and receiving in independent four-warp groups within each
+256-thread CTA. The core default is `False`, which retains the sequential
+send/receive implementation. The SGLang adapter enables this option by default
+with `EP_XPRESS_COMBINE_WARP_SPECIALIZATION=1`. It changes neither the grid,
+channel count, frame capacity nor fused decode execution. Separate group
+metadata and barriers preserve READY/ACK ordering while permitting concurrent
+progress; this alone establishes neither measured bidirectional PCIe bandwidth
+nor overlap with expert computation.
+
 Normal submission and `wait()` do not scan host queue error headers. Use
 `check()` at a completed experiment/request boundary to inspect asynchronous
 errors. `Config(diagnostics=False)` is the default for `host_sm`: tag hashing,
@@ -212,10 +224,13 @@ run_workload(ep)
 report = ep.stop_combine_profile()
 ```
 
-This instrumentation supports pair-queue combine only. Do not submit
-`fused_combine=True` during a capture; the core rejects that combination. For
-SGLang diagnostics, set `EP_XPRESS_FUSED_DECODE=0` before starting the workers.
-Those profiles describe the queue path, not fused mailbox execution.
+This instrumentation supports the sequential pair-queue kernel only. Set
+`Config.combine_warp_specialization=False` and do not submit
+`fused_combine=True` during a capture; unsupported combinations are rejected.
+For SGLang diagnostics, set both `EP_XPRESS_COMBINE_WARP_SPECIALIZATION=0`
+and `EP_XPRESS_FUSED_DECODE=0` before starting the workers. Those profiles
+describe the old sequential pair-queue kernel, not warp-specialized execution
+or fused decode.
 
 The start call preallocates counters; the stop call bulk-copies them after one
 transport-stream fence. No per-layer CPU readback or collective is added.

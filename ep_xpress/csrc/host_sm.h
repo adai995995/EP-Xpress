@@ -14,7 +14,8 @@ class PreparedHostSM {
       torch::Tensor status, int64_t rank, int64_t hidden, int64_t topk,
       int64_t slots, int64_t dispatch_rows, int64_t combine_rows,
       int64_t timeout_ms, int64_t channels, bool diagnostics, bool fatal_errors,
-      c10::optional<torch::Tensor> mailbox_pointers, int64_t mailbox_tokens);
+      c10::optional<torch::Tensor> mailbox_pointers, int64_t mailbox_tokens,
+      bool combine_warp_specialization);
   void dispatch(torch::Tensor input, torch::Tensor ids, torch::Tensor weights,
       int64_t epoch, torch::Tensor output, torch::Tensor output_ids,
       torch::Tensor output_weights, torch::Tensor inverse, torch::Tensor count,

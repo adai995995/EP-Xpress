@@ -239,6 +239,7 @@ def prepare_host_sm(
     expert_rank, expert_local, dispatch_pointers, combine_pointers, status,
     rank, hidden, topk, slots, dispatch_rows, combine_rows, timeout_ms, channels,
     *, diagnostics=False, fatal_errors=False, mailbox_pointers=None, mailbox_tokens=0,
+    combine_warp_specialization=False,
 ):
     """Validate and cache immutable GPU transport state during bootstrap.
 
@@ -270,9 +271,15 @@ def prepare_host_sm(
     selects receive-and-reduce fusion with remote=None. Mailbox tokens bound
     each source rank's token capacity; their host storage remains owned by the
     context. Omitting these arguments preserves the rank-pair queue path.
+
+    combine_warp_specialization=True gives prepared pair queues independent
+    128-thread send/receive groups. It preserves the grid and frame layout,
+    leaves fused mailbox combine unchanged, and rejects phase profiling.
+    The default False keeps the sequential pair kernel and its profiler.
     """
-    if not isinstance(diagnostics, bool) or not isinstance(fatal_errors, bool):
-        raise TypeError("diagnostics and fatal_errors must be bools")
+    if not all(isinstance(value, bool) for value in
+               (diagnostics, fatal_errors, combine_warp_specialization)):
+        raise TypeError("diagnostics, fatal_errors and combine_warp_specialization must be bools")
     return load().prepare_host_sm(
         expert_rank, expert_local, dispatch_pointers, combine_pointers, status,
         _integer(rank, "rank"), _integer(hidden, "hidden", 1),
@@ -283,6 +290,7 @@ def prepare_host_sm(
         diagnostics=diagnostics, fatal_errors=fatal_errors,
         mailbox_pointers=mailbox_pointers,
         mailbox_tokens=_integer(mailbox_tokens, "mailbox_tokens"),
+        combine_warp_specialization=combine_warp_specialization,
     )
 
 

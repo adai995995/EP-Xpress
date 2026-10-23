@@ -219,6 +219,30 @@ Another pair's payload or ACK cannot block its cursor. CTAs for other peers
 advance independently, subject to shared GPU and PCIe resources. The local
 peer CTA copies local partials directly to GPU output without host traffic.
 
+Core `Config.combine_warp_specialization` defaults to `False`; this retains
+the sequential send/receive loop. Setting it to `True` selects a prepared
+owner-list kernel with four Tx warps and four Rx warps in the same 256-thread
+CTA. The SGLang adapter enables it by default through
+`EP_XPRESS_COMBINE_WARP_SPECIALIZATION=1`. The CTA grid, active channel count,
+frame capacity and fused decode mailbox kernel are unchanged.
+
+Tx and Rx have separate shared metadata arrays and separate named barriers
+covering their respective 128 threads. Tx waits only for its destination
+credit, publishes payload and terminal frames, then drains its outgoing ACKs.
+Rx independently polls incoming READY, copies the payload into remote scratch
+and acknowledges the consumed generation. Every payload writer completes a
+system fence before the Tx group barrier and leader READY publication. Every
+reader finishes before the Rx group barrier and leader ACK publication. A
+full-CTA barrier joins the groups only after both directions complete or
+observe an error. Local-only CTAs retain their device copy. Frame metadata
+capacity remains 256 rows, processed in strides by each 128-thread group.
+
+The phase profiler currently instruments only the sequential pair kernel.
+Warp specialization rejects profile captures explicitly; selecting the old
+path for profiling does not measure the new kernel. This execution split
+permits concurrent communication progress but does not itself demonstrate
+PCIe full-duplex utilization or overlap with expert computation.
+
 Terminal frames remain necessary even for empty pairs. A pair CTA completes
 after sending and receiving its terminals and draining its own outgoing ACKs.
 The operation completes only after all CTAs finish, then the final reduction
@@ -366,8 +390,10 @@ Remaining limits include draining published payload ACKs before returning and
 dispatch's all-peer terminal handshake. Double slots and multiple active channels
 provide buffering and parallel progress; they do not establish overlap with
 expert GEMM or arbitrary cross-layer concurrency. Dispatch interleaves sends
-and receives within each channel CTA; pair-queue combine does so within each pair CTA,
-rather than assigning dedicated sender/receiver blocks. The owner-list path
+and receives within each channel CTA. Prepared pair-queue combine can assign
+independent Tx/Rx warp groups within each pair CTA; the core default retains
+the sequential loop. Neither configuration uses dedicated sender/receiver
+blocks or pipelines expert computation. The owner-list path
 removes combine's repeated inverse scans, but still performs per-frame
 metadata, fence, and ACK work. Mailbox combine replaces those frames with
 per-token notifications and still waits for each actual contributor. Reused
