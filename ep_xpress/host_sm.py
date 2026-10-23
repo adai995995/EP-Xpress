@@ -43,8 +43,8 @@ class _MappedArena:
     """One private shared-file mapping; registration is managed by the context."""
 
     def __init__(self, path, size, channels=1):
-        if isinstance(channels, bool) or not isinstance(channels, int) or not 1 <= channels <= 32:
-            raise ValueError("mapped queue channels must be in [1, 32]")
+        if isinstance(channels, bool) or not isinstance(channels, int) or not 1 <= channels <= 32 * 63:
+            raise ValueError("mapped queue lanes must be in [1, 2016]")
         if size % channels or (size // channels) % 4096:
             raise ValueError("mapped queue channel extents must be page aligned")
         self.channels = channels
@@ -179,7 +179,7 @@ class HostSMContext(Context):
             raise ValueError("total receive capacity must fit int32")
         with torch.cuda.device(self.device):
             native.load()
-            self._channel_capacity = native.host_sm_max_channels()
+            self._channel_capacity = native.host_sm_max_channels(self.world_size)
         members = dist.get_process_group_ranks(group) if group is not None else list(range(dist.get_world_size()))
         self.group = dist.new_group(ranks=members, backend="gloo",
                                     timeout=timedelta(seconds=config.timeout_seconds),
@@ -219,17 +219,23 @@ class HostSMContext(Context):
             raise ValueError("EP ranks must share one host, configuration and expert placement")
         if len({item[3] for item in signatures}) != self.world_size:
             raise ValueError("each EP rank must use a distinct CUDA device")
-        # A cooperative grid must fit every device. This is bootstrap metadata,
-        # never a per-layer collective. A device lacking cooperative launch uses
-        # the explicitly reported single-lane path across the entire group.
+        # The dispatch and pairwise combine grids must fit every device. This
+        # is bootstrap metadata, never a per-layer collective. Only world=1
+        # can use the single-CTA fallback without cooperative launch support.
+        if self.world_size > 1 and any(item[4] < 1 for item in signatures):
+            raise ValueError("rank-pair combine requires cooperative all-resident launch support")
         self.effective_channels = min(self.config.channels, *(max(1, item[4]) for item in signatures))
         self._channel_chunk_rows = self.config.channel_chunk_rows(self.effective_channels)
+        self._combine_chunk_rows = self.config.combine_chunk_rows(self.effective_channels, self.world_size)
+        self._queue_peers = {"dispatch": 1, "combine": self.world_size}
         with torch.cuda.device(self.device):
             self._arena_sizes = {phase: native.host_sm_arena_bytes(
-                self.config.hidden_size, topk, self.config.slots, self._channel_chunk_rows,
-                channels=self.effective_channels)
+                self.config.hidden_size, topk, self.config.slots,
+                self._channel_chunk_rows if phase == "dispatch" else self._combine_chunk_rows,
+                channels=self.effective_channels, queue_peers=self._queue_peers[phase])
                 for phase, topk in (("dispatch", self.config.topk), ("combine", 0))}
-        if any(self._arena_sizes[phase] != self.config.mapped_arena_bytes(topk, self.effective_channels)
+        if any(self._arena_sizes[phase] != self.config.mapped_arena_bytes(
+                   topk, self.effective_channels, queue_peers=self._queue_peers[phase])
                for phase, topk in (("dispatch", self.config.topk), ("combine", 0))):
             raise RuntimeError("mapped queue allocation ABI mismatch")
         self._pool_bytes = sum(self._arena_sizes.values()) * self.world_size
@@ -271,7 +277,7 @@ class HostSMContext(Context):
                         pointers = []
                         for peer in range(self.world_size):
                             arena = _MappedArena(self._root / f"{phase}-{peer}.arena", size,
-                                                 channels=self.effective_channels)
+                                                 channels=self.effective_channels * self._queue_peers[phase])
                             self._arenas[phase].append(arena)
                             if peer == self.rank and self.config.fatal_errors:
                                 # Bootstrap-only flag: native errors also trap,
@@ -358,8 +364,9 @@ class HostSMContext(Context):
             fields = native.host_sm_profile_fields()
             if not fields or len(set(fields)) != len(fields):
                 raise RuntimeError("invalid native combine diagnostic schema")
-            shape = (max_operations, self.effective_channels, len(fields))
-            storage_bytes = max_operations * self.effective_channels * len(fields) * 8
+            lanes = self.effective_channels * self.world_size
+            shape = (max_operations, lanes, len(fields))
+            storage_bytes = max_operations * lanes * len(fields) * 8
             if storage_bytes * 2 + 4 > 64 << 20:
                 raise ValueError("combine profile GPU and pinned readout buffers exceed the 64 MiB budget")
             with torch.cuda.stream(self._work_stream):
@@ -413,7 +420,7 @@ class HostSMContext(Context):
 
         Copies are queued on the transport stream, followed by one stream
         synchronization. No Gloo operation is involved. The report retains raw
-        per-channel rows in native field order; wait counters overlap phase
+        per-(channel, peer) rows in native field order; wait counters overlap phase
         counters, and timings are diagnostic kernel residency, not wire time.
         Fatal CUDA failures may prevent readout and require worker restart.
         """
@@ -433,8 +440,12 @@ class HostSMContext(Context):
                 session["status_readout"].copy_(self._status, non_blocking=True)
             self._work_stream.synchronize()
             result = {
-                "schema_version": 1, "transport": "host_sm", "rank": self.rank,
+                "schema_version": 2, "transport": "host_sm", "rank": self.rank,
+                "world_size": self.world_size, "queue_layout": "rank_pair",
                 "channels": self.effective_channels, "fields": session["fields"],
+                "counter_rows": [{"channel": channel, "peer": peer}
+                                 for channel in range(self.effective_channels)
+                                 for peer in range(self.world_size)],
                 "max_operations": session["max_operations"], "captured_operations": used,
                 "dropped_operations": session["dropped_operations"],
                 "status": int(session["status_readout"].tolist()[0]),
@@ -447,7 +458,7 @@ class HostSMContext(Context):
                     "clock_scope": "GPU globaltimer; raw timestamps are not assumed comparable across devices",
                     "phase_fields": session["fields"][3:12],
                     "idle_fields": [field for field in session["fields"] if field.startswith("idle_") and field.endswith("_ns")],
-                    "phase_rule": "nine disjoint phase durations sum to elapsed_ns per channel",
+                    "phase_rule": "nine disjoint phase durations sum to elapsed_ns per (channel, peer) CTA",
                     "completion_phase_order": session["fields"][3:12],
                     "idle_rule": "no-progress wait categories are exclusive subsets of elapsed time; they overlap the phase view",
                     "interpretation": "instrumented GPU instructions and CTA/peer waiting, not pure PCIe transfer time",
@@ -575,7 +586,7 @@ class HostSMContext(Context):
                     profile, profile_record = self._combine_profile_slice(handle, tag, epoch)
                     native.host_sm_combine(
                         partial, handle._plan.inverse, handle._plan.count, self._pointers["combine"],
-                        self.rank, epoch, self.config.slots, self._channel_chunk_rows,
+                        self.rank, epoch, self.config.slots, self._combine_chunk_rows,
                         max(1, math.ceil(self.config.timeout_seconds * 1000)), output, remote, self._status,
                         identity=identity, channels=self.effective_channels, profile=profile)
                     if profile_record is not None:

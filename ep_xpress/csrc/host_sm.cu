@@ -653,26 +653,259 @@ int64_t channel_bytes(int64_t hidden, int64_t topk, int64_t slots, int64_t rows)
   return align_up(kArenaHeader + slots * align_up(kSlotHeader + rows * row, 128), 4096);
 }
 
-int max_channels_current_device() {
+// A combine CTA owns both directions of exactly one rank pair. Neither its
+// producer cursor nor its credit depends on any other destination. Keeping
+// send and receive together, with the entire grid resident, ensures a full
+// outbound ring never prevents the inbound ring from being drained.
+template <bool Profile = false>
+__global__ void host_sm_pair_combine_kernel(TransportArgs a) {
+  using Scan = cub::BlockScan<int, kThreads>;
+  __shared__ typename Scan::TempStorage scan_storage;
+  __shared__ int cursor, end, error, sent, received, send_done, recv_done;
+  __shared__ int selected[kThreads], tokens[kThreads], count, next, rows, complete;
+  __shared__ uint64_t start, previous;
+  __shared__ ProfileState<Profile> profile;
+  profile_init(profile);
+  const int tid = threadIdx.x;
+  const int channel = blockIdx.x / a.world, peer = blockIdx.x % a.world;
+  const bool local = peer == a.rank;
+  char* own = reinterpret_cast<char*>(a.pointers[a.rank]) +
+      (int64_t(channel) * a.world + peer) * a.channel_stride;
+  char* other = reinterpret_cast<char*>(a.pointers[peer]) +
+      (int64_t(channel) * a.world + a.rank) * a.channel_stride;
+  const int64_t x_offset = payload_offset(a.chunk_rows, 0);
+  if (tid == 0) {
+    int n = *a.input_count;
+    if (n < 0 || n > a.input_rows) { fail(a.status, 1); n = 0; }
+    cursor = int(int64_t(n) * channel / a.channels);
+    end = int(int64_t(n) * (channel + 1) / a.channels);
+    sent = received = send_done = 0;
+    recv_done = local;
+    start = ticks_ns();
+  }
+  __syncthreads();
+  while (true) {
+    profile_iteration_begin(profile);
+    profile_phase(profile, PPeerPoll);
+    if (tid == 0) {
+      if (acquire(control(own, 0)) || acquire(control(own, 1)) ||
+          acquire(control(other, 0)) || acquire(control(other, 1))) fail(a.status, 4);
+      error = atomicAdd(a.status, 0);
+    }
+    __syncthreads();
+    if (error) break;
+    char* send_slot = own + kArenaHeader + (sent % a.slots) * a.slot_stride;
+    if (tid == 0) {
+      previous = local || send_done ? 0 : acquire(control(send_slot, 0));
+      // Exactly one consumer owns ACK word 1 in this directed queue.
+      complete = !local && !send_done && acquire(control(send_slot, 1)) != previous;
+      if constexpr (Profile) {
+        profile.credit_missing = complete;
+        profile.values[PCreditPolls] += !local && !send_done;
+        profile.values[PCreditBlockedObservations] += complete;
+      }
+    }
+    __syncthreads();
+    if (!send_done && !complete) {
+      profile_phase(profile, PRouteLocal);
+      const int batch = min(kThreads, end - cursor);
+      bool selected_here = false;
+      int token = 0;
+      if (tid < batch) {
+        const int64_t destination = a.input_inverse[int64_t(cursor + tid) * 2];
+        const int64_t index = a.input_inverse[int64_t(cursor + tid) * 2 + 1];
+        if (destination < 0 || destination >= a.world || index < 0 || index > INT32_MAX)
+          fail(a.status, 1);
+        else {
+          selected_here = destination == peer;
+          token = int(index);
+          if (selected_here && local && token >= a.capacity) fail(a.status, 2);
+        }
+      }
+      int prefix, total;
+      Scan(scan_storage).ExclusiveSum(int(selected_here), prefix, total);
+      const int limit = local ? kThreads : min(kThreads, a.chunk_rows);
+      if (selected_here && prefix < limit) {
+        selected[prefix] = cursor + tid;
+        tokens[prefix] = token;
+      }
+      __syncthreads();
+      if (tid == 0) {
+        count = min(total, limit);
+        // A dense tile may contain more rows than the bounded host slot.
+        // Keep the unsent suffix for this pair's next independent iteration.
+        next = total > limit ? selected[limit - 1] + 1 : cursor + batch;
+        error = atomicAdd(a.status, 0);
+      }
+      __syncthreads();
+      if (error) break;
+      if (local) {
+        for (int64_t i = tid; i < int64_t(count) * (a.hidden / 2); i += blockDim.x) {
+          const int r = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
+          reinterpret_cast<uint32_t*>(a.output + int64_t(tokens[r]) * a.hidden)[h] =
+              reinterpret_cast<const uint32_t*>(a.input + int64_t(selected[r]) * a.hidden)[h];
+        }
+      } else {
+        profile_phase(profile, PSendMetadata);
+        if (tid < count) host_store32(send_slot + kSlotHeader + tid * 4, tokens[tid]);
+        profile_phase(profile, PSendPayload);
+        for (int64_t i = tid; i < int64_t(count) * (a.hidden / 2); i += blockDim.x) {
+          const int r = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
+          host_store32(send_slot + x_offset + i * 4,
+              reinterpret_cast<const uint32_t*>(a.input + int64_t(selected[r]) * a.hidden)[h]);
+        }
+      }
+      __syncthreads();
+      if (tid == 0) {
+        cursor = next;
+        if constexpr (Profile) {
+          profile.progress |= batch != 0;
+          profile.values[PLocalRows] += local ? count : 0;
+          profile.values[PSendRows] += local ? 0 : count;
+          profile.values[PWrittenBytes] += local ? 0 : int64_t(count) * a.hidden * 2;
+        }
+      }
+      __syncthreads();
+      profile_phase(profile, PPublish);
+      if (local) {
+        if (tid == 0) send_done = cursor == end;
+      } else if (count || cursor == end) {
+        if (tid == 0) {
+          host_store32(send_slot + kRowsOffset, count ? count : uint32_t(-1));
+          host_store64(send_slot + kIdentityOffset, a.identity);
+        }
+        __threadfence_system();
+        __syncthreads();
+        if (tid == 0) {
+          release(control(send_slot, 0), (a.epoch << 32) | uint64_t(++sent));
+          send_done = !count;
+          if constexpr (Profile) {
+            const int64_t elapsed = ticks_ns() - profile.values[PBegin];
+            if (profile.values[PFirstPublish] < 0) profile.values[PFirstPublish] = elapsed;
+            if (count && profile.values[PFirstPayloadPublish] < 0)
+              profile.values[PFirstPayloadPublish] = elapsed;
+            ++profile.values[PSendFrames];
+            profile.values[PTerminalSent] += !count;
+            profile.progress = true;
+          }
+        }
+      }
+    }
+    __syncthreads();
+    profile_phase(profile, PPeerPoll);
+    char* recv_slot = other + kArenaHeader + (received % a.slots) * a.slot_stride;
+    if (tid == 0) {
+      rows = 0;
+      if (!recv_done) {
+        if (acquire(control(recv_slot, 0)) == ((a.epoch << 32) | uint64_t(received + 1))) {
+          rows = int32_t(host_load32(recv_slot + kRowsOffset));
+          if (host_load64(recv_slot + kIdentityOffset) != a.identity) fail(a.status, 5);
+          if (rows < -1 || rows == 0 || rows > min(kThreads, a.chunk_rows)) fail(a.status, 1);
+        }
+        if constexpr (Profile) {
+          ++profile.values[PReadyPolls];
+          profile.ready_missing = !rows;
+          profile.values[PUnreadyObservations] += !rows;
+          if (rows && profile.values[PFirstReceive] < 0)
+            profile.values[PFirstReceive] = ticks_ns() - profile.values[PBegin];
+        }
+      }
+      error = atomicAdd(a.status, 0);
+    }
+    __syncthreads();
+    if (error) break;
+    if (rows) {
+      profile_phase(profile, PReceiveMetadata);
+      if (tid < rows) {
+        const int token = int(host_load32(recv_slot + kSlotHeader + tid * 4));
+        tokens[tid] = token;
+        if (token < 0 || token >= a.capacity) fail(a.status, 2);
+      }
+      __syncthreads();
+      if (tid == 0) error = atomicAdd(a.status, 0);
+      __syncthreads();
+      if (error) break;
+      profile_phase(profile, PReceivePayload);
+      if constexpr (Profile) {
+        if (tid == 0 && rows > 0 && profile.values[PFirstPayloadReceive] < 0)
+          profile.values[PFirstPayloadReceive] = profile.mark - profile.values[PBegin];
+      }
+      for (int64_t i = tid; i < int64_t(rows) * (a.hidden / 2); i += blockDim.x) {
+        const int r = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
+        auto* dst = reinterpret_cast<uint32_t*>(
+            a.remote + (int64_t(peer) * a.capacity + tokens[r]) * a.hidden);
+        dst[h] = host_load32(recv_slot + x_offset + i * 4);
+      }
+      profile_phase(profile, PAck);
+      // Every reader must finish before publishing the sole consumer's ACK.
+      __threadfence_system();
+      __syncthreads();
+      if (tid == 0) {
+        release(control(recv_slot, 1), (a.epoch << 32) | uint64_t(++received));
+        recv_done = rows == -1;
+        if constexpr (Profile) {
+          ++profile.values[PReceiveFrames];
+          profile.values[PTerminalReceived] += rows == -1;
+          profile.values[PReceiveRows] += max(0, rows);
+          profile.values[PReadBytes] += int64_t(max(0, rows)) * a.hidden * 2;
+          profile.progress = true;
+        }
+      }
+    }
+    __syncthreads();
+    profile_phase(profile, POther);
+    bool unacked = false;
+    if (!local && send_done && recv_done) {
+      for (int i = tid; i < a.slots; i += blockDim.x) {
+        char* slot = own + kArenaHeader + i * a.slot_stride;
+        if (acquire(control(slot, 1)) != acquire(control(slot, 0))) unacked = true;
+      }
+    }
+    const int outstanding = __syncthreads_or(unacked);
+    if (tid == 0) {
+      complete = send_done && recv_done && !outstanding;
+      if (!complete && ticks_ns() - start > a.timeout_ns) fail(a.status, 3);
+      error = atomicAdd(a.status, 0);
+    }
+    __syncthreads();
+    if (complete || error) {
+      profile_iteration_end(profile, send_done && recv_done && outstanding);
+      break;
+    }
+    __nanosleep(64);
+    profile_iteration_end(profile, send_done && recv_done && outstanding);
+  }
+  profile_finish(profile, a.profile, error);
+  if (tid == 0 && error) {
+    release(control(own, 0), uint64_t(error));
+    if (host_load64(own + 16)) {
+      __threadfence_system();
+      asm volatile("trap;");
+    }
+  }
+}
+
+int max_channels_current_device(int world = 1) {
   // Capability is fixed for this extension/device. Validate direct native
   // calls without repeating attribute and occupancy queries on every layer.
   static std::mutex mutex;
-  static std::map<int, int> capacities;
+  static std::map<std::pair<int, int>, int> capacities;
   int device, cooperative, sms;
   C10_CUDA_CHECK(cudaGetDevice(&device));
   std::lock_guard<std::mutex> lock(mutex);
-  const auto cached = capacities.find(device);
+  const auto key = std::make_pair(device, world);
+  const auto cached = capacities.find(key);
   if (cached != capacities.end()) return cached->second;
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&cooperative, cudaDevAttrCooperativeLaunch, device));
-  if (!cooperative) { capacities.emplace(device, 0); return 0; }
+  if (!cooperative) { capacities.emplace(key, 0); return 0; }
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
   int a, b, c, diagnostic;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&a, host_sm_transport_kernel<false, int32_t>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, host_sm_transport_kernel<false, int64_t>, kThreads, 0));
-  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&c, host_sm_transport_kernel<true, int64_t>, kThreads, 0));
-  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&diagnostic, host_sm_transport_kernel<true, int64_t, true>, kThreads, 0));
-  const int capacity = std::min(32, sms * std::min({a, b, c, diagnostic}));
-  capacities.emplace(device, capacity);
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&c, host_sm_pair_combine_kernel<false>, kThreads, 0));
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&diagnostic, host_sm_pair_combine_kernel<true>, kThreads, 0));
+  const int capacity = std::min({32, sms * std::min(a, b), sms * std::min(c, diagnostic) / world});
+  capacities.emplace(key, capacity);
   return capacity;
 }
 
@@ -682,13 +915,17 @@ void launch_transport(TransportArgs args, cudaStream_t stream) {
   const int blocks = int(std::max<int64_t>(1, std::min<int64_t>(4096, (elements + kThreads - 1) / kThreads)));
   host_sm_init_kernel<Combine><<<blocks, kThreads, 0, stream>>>(args);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  if (args.channels == 1) {
-    host_sm_transport_kernel<Combine, Id, Profile><<<1, kThreads, 0, stream>>>(args);
+  const int lanes = args.channels * (Combine ? args.world : 1);
+  if (lanes == 1) {
+    if constexpr (Combine) host_sm_pair_combine_kernel<Profile><<<1, kThreads, 0, stream>>>(args);
+    else host_sm_transport_kernel<false, Id, Profile><<<1, kThreads, 0, stream>>>(args);
   } else {
     void* parameters[] = {&args};
+    const void* kernel;
+    if constexpr (Combine) kernel = reinterpret_cast<const void*>(host_sm_pair_combine_kernel<Profile>);
+    else kernel = reinterpret_cast<const void*>(host_sm_transport_kernel<false, Id, Profile>);
     C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
-        reinterpret_cast<const void*>(host_sm_transport_kernel<Combine, Id, Profile>),
-        dim3(args.channels), dim3(kThreads), parameters, 0, stream));
+        kernel, dim3(lanes), dim3(kThreads), parameters, 0, stream));
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   host_sm_finalize_kernel<Combine><<<Combine ? blocks : 1, kThreads, 0, stream>>>(args);
@@ -728,8 +965,9 @@ void common_check(torch::Tensor input, torch::Tensor pointers, int64_t rank,
 }
 }  // namespace
 
-int64_t host_sm_max_channels() {
-  return max_channels_current_device();
+int64_t host_sm_max_channels(int64_t world) {
+  TORCH_CHECK(world >= 1 && world <= kMaxRanks, "invalid queue peer count");
+  return max_channels_current_device(int(world));
 }
 
 std::vector<std::string> host_sm_profile_fields() {
@@ -738,11 +976,12 @@ std::vector<std::string> host_sm_profile_fields() {
 }
 
 int64_t host_sm_arena_bytes(int64_t hidden, int64_t topk, int64_t slots,
-                            int64_t chunk_rows, int64_t channels) {
+                            int64_t chunk_rows, int64_t channels, int64_t queue_peers) {
   TORCH_CHECK(hidden > 0 && hidden <= INT32_MAX && hidden % 2 == 0 && topk >= 0 && topk <= 256 &&
               slots > 0 && slots <= 64 && chunk_rows > 0 && chunk_rows <= 65536 &&
-              channels > 0 && channels <= 32, "invalid arena dimensions or channels");
-  return channels * channel_bytes(hidden, topk, slots, chunk_rows);
+              channels > 0 && channels <= 32 && queue_peers > 0 && queue_peers <= kMaxRanks,
+              "invalid arena dimensions or channels");
+  return channels * queue_peers * channel_bytes(hidden, topk, slots, chunk_rows);
 }
 
 void host_sm_dispatch_cuda(torch::Tensor input, torch::Tensor ids, torch::Tensor weights,
@@ -799,6 +1038,10 @@ void host_sm_combine_cuda(torch::Tensor partial, torch::Tensor inverse, torch::T
     int64_t timeout_ms, torch::Tensor output, torch::Tensor remote, torch::Tensor status,
     int64_t identity, int64_t channels, c10::optional<torch::Tensor> profile) {
   common_check(partial, pointers, rank, epoch, slots, chunk_rows, timeout_ms, output, status, channels);
+  const c10::cuda::CUDAGuard guard(partial.device());
+  TORCH_CHECK((channels == 1 && pointers.numel() == 1) ||
+              channels <= max_channels_current_device(int(pointers.numel())),
+              "pair queues require cooperative all-resident capacity for channels * world blocks");
   tensor_check(inverse, at::kLong, 2, partial.device(), "inverse");
   TORCH_CHECK(inverse.size(0) == partial.size(0) && inverse.size(1) == 2, "invalid inverse shape");
   tensor_check(count, at::kInt, 1, partial.device(), "count");
@@ -808,10 +1051,9 @@ void host_sm_combine_cuda(torch::Tensor partial, torch::Tensor inverse, torch::T
               remote.size(2) == output.size(1), "invalid accumulation shape");
   if (profile.has_value()) {
     tensor_check(*profile, at::kLong, 2, partial.device(), "profile");
-    TORCH_CHECK(profile->size(0) == channels && profile->size(1) == PFieldCount,
-                "profile must have shape [channels, ", PFieldCount, "]");
+    TORCH_CHECK(profile->size(0) == channels * pointers.numel() && profile->size(1) == PFieldCount,
+                "profile must have shape [channels * world, ", PFieldCount, "]");
   }
-  const c10::cuda::CUDAGuard guard(partial.device());
   TransportArgs a{};
   a.input = partial.data_ptr<at::BFloat16>();
   a.input_inverse = inverse.data_ptr<int64_t>();

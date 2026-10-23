@@ -66,7 +66,8 @@ class Config:
 
     def pool_bytes(self, world_size):
         if self.transport == "host_sm":
-            return world_size * (self.mapped_arena_bytes(self.topk) + self.mapped_arena_bytes(0))
+            return world_size * (self.mapped_arena_bytes(self.topk) +
+                                 self.mapped_arena_bytes(0, queue_peers=world_size))
         return 2 * world_size * self.slots * self.slot_bytes
 
     def channel_chunk_rows(self, channels=None):
@@ -74,16 +75,29 @@ class Config:
         channels = self.channels if channels is None else channels
         return max(1, (self.chunk_rows + channels - 1) // channels)
 
-    def mapped_arena_bytes(self, topk, channels=None):
+    def combine_chunk_rows(self, channels=None, queue_peers=1):
+        """Split each channel's payload budget across independent peer queues."""
+        if (isinstance(queue_peers, bool) or not isinstance(queue_peers, int) or
+                not 1 <= queue_peers <= 63):
+            raise ValueError("queue_peers must be an integer in [1, 63]")
+        rows = self.channel_chunk_rows(channels)
+        return max(1, (rows + queue_peers - 1) // queue_peers)
+
+    def mapped_arena_bytes(self, topk, channels=None, queue_peers=1):
         """Mapped queue allocation including per-row metadata and control words.
 
         Kept in agreement with the native ABI and checked during bootstrap.
-        Dispatch uses configured topk; combine uses zero routing-weight slots.
+        Dispatch uses one queue per channel. Combine uses one queue per peer
+        and channel, splitting the payload budget before page/header rounding.
         """
         channels = self.channels if channels is None else channels
+        if (isinstance(queue_peers, bool) or not isinstance(queue_peers, int) or
+                not 1 <= queue_peers <= 63 or (topk and queue_peers != 1)):
+            raise ValueError("queue_peers must be in [1, 63] and dispatch requires one queue")
+        rows = self.combine_chunk_rows(channels, queue_peers)
         row_bytes = ((16 + topk * 12 + self.hidden_size * 2 + 15) // 16) * 16
-        slot_bytes = ((640 + self.channel_chunk_rows(channels) * row_bytes + 127) // 128) * 128
-        return channels * ((128 + self.slots * slot_bytes + 4095) // 4096) * 4096
+        slot_bytes = ((640 + rows * row_bytes + 127) // 128) * 128
+        return channels * queue_peers * ((128 + self.slots * slot_bytes + 4095) // 4096) * 4096
 
     def pinned_working_set_bytes(self, world_size):
         """Shared rings plus all ranks' reusable private receive packs."""

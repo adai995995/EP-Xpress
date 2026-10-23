@@ -26,9 +26,10 @@ class Stream:
 
 
 @contextmanager
-def cpu_context(channels=4, fields=FIELDS):
+def cpu_context(channels=4, fields=FIELDS, world=1):
     context = object.__new__(HostSMContext)
     context.rank = 0
+    context.world_size = world
     context.device = torch.device("cuda", 0)
     context.effective_channels = channels
     context._lock = threading.RLock()
@@ -140,3 +141,22 @@ def test_combined_gpu_and_pinned_storage_is_bounded():
             context.start_combine_profile(65536)
         allocate.assert_not_called()
         assert context._combine_profile is None
+
+
+def test_pair_profile_rows_are_explicit_and_budget_counts_every_peer():
+    with cpu_context(channels=2, world=3) as context:
+        context.start_combine_profile(1)
+        sample, _ = context._combine_profile_slice(handle(), None, 1)
+        assert sample.shape == (6, len(FIELDS))
+        report = context.stop_combine_profile()
+        assert report["schema_version"] == 2
+        assert report["queue_layout"] == "rank_pair"
+        assert report["channels"] == 2
+        assert report["world_size"] == 3
+        assert report["counter_rows"] == [
+            {"channel": channel, "peer": peer} for channel in range(2) for peer in range(3)]
+    with cpu_context(channels=32, world=8) as context, \
+            patch("ep_xpress.host_sm.torch.zeros") as allocate:
+        with pytest.raises(ValueError, match="64 MiB budget"):
+            context.start_combine_profile(2048)
+        allocate.assert_not_called()

@@ -89,18 +89,27 @@ rank-order reduction. These kernels are stream ordered, so communication
 blocks do not also serialize full-buffer initialization and final reduction.
 
 The channel count is agreed during bootstrap using the minimum safe kernel
-occupancy across the group. More than one channel uses a single-device
-cooperative launch, ensuring the whole bounded grid can run; independent
-persistent channels must not rely on ordinary block scheduling for progress.
-Devices without cooperative launch use one ordinary block. There is no
-multi-device cooperative launch, GPU peer memory, TMA, or per-layer CPU
+occupancy across the group. A channel is a logical work partition, not a
+reserved SM. Dispatch launches `channels` CTAs; combine launches
+`channels * world_size` CTAs, including one local-only CTA per channel. CUDA
+determines their placement, and several CTAs may reside on one SM. For
+multi-rank contexts, cooperative launch support is required even with one
+channel. The common channel limit accounts for the full combine grid and both
+its ordinary and diagnostic kernel occupancy. A single-device cooperative
+launch ensures the bounded grid can be resident; persistent workers must not
+rely on queued blocks eventually being scheduled for progress. Only a
+one-rank, one-channel context can use an ordinary one-block launch. There is
+no multi-device cooperative launch, GPU peer memory, TMA, or per-layer CPU
 capability exchange. See [CUDA cooperative launch requirements](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cooperative-groups.html).
 
-`chunk_bytes` is divided across channels, rounding up to whole rows. Each lane
-has its own page-aligned arena and ring slots. Actual negotiated allocation,
-including rounding and metadata, is checked against the host-memory budget.
-Producer work batches contain at most 256 rows per published frame, even when
-a channel has room for more; the configured chunk size is an upper bound.
+For dispatch, `chunk_bytes` is divided across channels, rounding up to whole
+rows. Combine divides it across both channels and peers. This keeps the
+payload budget approximately constant as queues are split, although row
+rounding, queue headers, and page alignment add overhead. Each queue has its
+own page-aligned arena and ring slots. Actual negotiated allocation is checked
+against the host-memory budget. Producer work batches contain at most 256 rows
+per published frame, even when a queue has room for more; the configured chunk
+size is an upper bound.
 
 The caller supplies a CPU-known receive capacity, such as the sum of scheduler
 token counts. The exact received row count stays in a CUDA tensor, together
@@ -110,13 +119,14 @@ this padded shape and must mask these IDs. No device count is read by the CPU
 to allocate an exact output shape. Combine consumes the saved inverse and
 count directly on the GPU.
 
-Each channel's slot has a producer-written generation and one consumer-written
-ACK per peer. A generation combines an operation epoch with a chunk number. Payload
-writers issue system fences before publishing; readers finish their loads
-before acknowledging. Synchronization uses naturally aligned, single-writer
-loads/stores with system acquire/release semantics, not mapped-host atomic
-read-modify-write operations. The implementation follows CUDA's mapped-memory
-access constraints: [CUDA memory documentation](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/understanding-memory.html).
+Each dispatch channel's slot has a producer-written generation and one
+consumer-written ACK per peer. A generation combines an operation epoch with
+a chunk number. Payload writers issue system fences before publishing;
+readers finish their loads before acknowledging. Synchronization uses
+naturally aligned, single-writer loads/stores with system acquire/release
+semantics, not mapped-host atomic read-modify-write operations. The
+implementation follows CUDA's mapped-memory access constraints:
+[CUDA memory documentation](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/understanding-memory.html).
 
 Each frame also carries a stable fingerprint of its phase, optional API tag,
 and, for combine, originating dispatch operation. Peers check that identity on
@@ -124,13 +134,52 @@ the GPU, including terminal frames. This detects inconsistent layer tags and
 handle order without a CPU collective. The fingerprint hashes only small API
 metadata; GPU routing IDs and weights are never read back for this check.
 
-The producer reuses a slot only after all peer ACKs match its previous
-generation. Every peer acknowledges each header, including when its rank is
-absent from the payload mask. An explicit terminal frame covers empty inputs.
-The CTA alternates producer work with receiver progress instead of waiting
-inside a blocked producer. Before returning, it consumes peer terminal frames
-and drains its own slot ACKs. This prevents one operation from overwriting a
-chunk that a delayed peer still needs.
+The dispatch producer reuses a slot only after all peer ACKs match its
+previous generation. Every peer acknowledges each header, including when its
+rank is absent from the payload mask. An explicit terminal frame covers empty
+inputs. The CTA alternates producer work with receiver progress instead of
+waiting inside a blocked producer. Before returning, it consumes peer terminal
+frames and drains its own slot ACKs. This prevents one operation from
+overwriting a chunk that a delayed peer still needs.
+
+## Host-SM combine queues
+
+Combine uses separate source-owned rings indexed by `(channel, destination
+rank)`. Each directed queue has one producer and one consumer. Its slot has a
+producer-written generation and a single ACK word written only by that
+destination. A source can reuse a slot as soon as that consumer has copied
+its payload to local GPU scratch and acknowledged the generation. Other
+ranks neither inspect that payload nor acknowledge its slot.
+
+```text
+GPU A sender -> host Q[A, B, channel] -> GPU B receiver
+GPU B sender -> host Q[B, A, channel] -> GPU A receiver
+```
+
+One CTA on each GPU owns both directions of a `(channel, peer)` pair. Each
+pair has an independent input cursor, outgoing credit, and incoming sequence.
+If its outgoing ring is full, that CTA still checks and drains incoming data.
+Another pair's payload or ACK cannot block its cursor. CTAs for other peers
+advance independently, subject to shared GPU and PCIe resources. The local
+peer CTA copies local partials directly to GPU output without host traffic.
+
+Terminal frames remain necessary even for empty pairs. A pair CTA completes
+after sending and receiving its terminals and draining its own outgoing ACKs.
+The operation completes only after all CTAs finish, then the final reduction
+runs in stream order. Thus queue credit is pair-local, while operation
+completion still requires every peer to enter the operation. This release
+does not expose early per-token completion or overlap expert GEMM with
+individual returned chunks. Source-indexed scratch and deterministic
+rank-order reduction are unchanged by queue arrival order.
+
+This split applies to combine only. Dispatch still shares one host payload
+among destinations and retains all-peer header ACKs. A future multicast
+reclamation scheme could count only the actual readers of each payload, but
+that is not implemented here. Such a count must be tied to a generation and
+advance only after each reader finishes; it cannot assume that atomic
+decrements to mapped host memory are coherent across GPUs. Per-reader,
+single-writer completion records can provide that logical count without a
+shared cross-GPU atomic counter.
 
 `Pending.wait()` inserts an event dependency on the consuming stream without
 waiting for device routing on the CPU. Input/output tensors and mapped arenas
@@ -144,13 +193,15 @@ also catches a failure in its final layer. This requires worker restart. The
 standalone default keeps errors recoverable for inspection, but the failed
 communication context still must be destroyed.
 
-Remaining limits include all-peer header ACK traffic and draining each
-operation's queues before returning. Double slots and multiple channels
+Remaining limits include dispatch's all-peer header ACK traffic and draining
+each operation's queues before returning. Double slots and multiple channels
 provide buffering and parallel progress; they do not establish overlap with
-expert GEMM or arbitrary cross-layer concurrency. Each channel still
-interleaves sends and receives rather than assigning dedicated sender/receiver
-blocks. Fixed-capacity padding also has an expert-runner cost. These costs
-must be measured separately from removed CPU route planning and collectives.
+expert GEMM or arbitrary cross-layer concurrency. Dispatch interleaves sends
+and receives within each channel CTA; combine does so within each pair CTA,
+rather than assigning dedicated sender/receiver blocks. Each combine pair
+also scans its channel's inverse-route range to select its own rows.
+Fixed-capacity padding has an expert-runner cost. These costs must be measured
+separately from removed CPU route planning and collectives.
 
 The design borrows GPU layout preparation, channel partitioning, and batched
 publication from [DeepEP v1.2.1 layout](https://github.com/deepseek-ai/DeepEP/blob/v1.2.1/csrc/kernels/layout.cu)

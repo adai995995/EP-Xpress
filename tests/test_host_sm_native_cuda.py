@@ -25,7 +25,8 @@ def extension():
 @contextmanager
 def arenas(world=1, hidden=8, topk=2, slots=2, chunk_rows=1, channels=1):
     mappings, addresses, pointers = [], [], []
-    nbytes = native.host_sm_arena_bytes(hidden, topk, slots, chunk_rows, channels=channels)
+    nbytes = native.host_sm_arena_bytes(hidden, topk, slots, chunk_rows,
+                                       channels=channels, queue_peers=world if topk == 0 else 1)
     try:
         for _ in range(world):
             mapping = mmap.mmap(-1, nbytes)
@@ -315,7 +316,7 @@ def _profile_combine_inputs(pointers, tokens):
 
 
 @pytest.mark.parametrize("channels,tokens", [(1, 0), (1, 1), (1, 17), (4, 0), (4, 1), (4, 17)])
-def test_host_sm_combine_profile_preserves_local_outputs_and_slot_reuse(channels, tokens):
+def test_host_sm_combine_profile_preserves_local_outputs_and_epoch_reuse(channels, tokens):
     if channels > 1 and native.host_sm_max_channels() < channels:
         pytest.skip(f"device cannot safely run {channels} cooperative transport channels")
     with arenas(topk=0, slots=1, chunk_rows=2, channels=channels) as (_, pointers):
@@ -339,9 +340,10 @@ def test_host_sm_combine_profile_preserves_local_outputs_and_slot_reuse(channels
                 for channel in range(channels)]
             for row in rows:
                 assert row["send_payload_rows"] == row["receive_payload_rows"] == 0
-                assert row["send_frames"] == row["terminal_sent"] == 1
+                # The self-pair CTA bypasses host queues and publishes no terminal.
+                assert row["send_frames"] == row["terminal_sent"] == 0
                 assert row["receive_frames"] == row["terminal_received"] == 0
-                assert row["first_publish_elapsed_ns"] >= 0
+                assert row["first_publish_elapsed_ns"] == -1
                 assert row["first_receive_elapsed_ns"] == -1
                 assert row["first_payload_publish_elapsed_ns"] == -1
                 assert row["first_payload_receive_elapsed_ns"] == -1
@@ -349,21 +351,25 @@ def test_host_sm_combine_profile_preserves_local_outputs_and_slot_reuse(channels
 
 @pytest.mark.parametrize("waiting", ["ready", "both", "drain"])
 def test_host_sm_combine_profile_accounts_missing_peer_waits_and_bytes(waiting):
+    if native.host_sm_max_channels(2) < 1:
+        pytest.skip("device cannot safely run the pairwise combine grid")
     tokens = 3 if waiting == "both" else 0
     with arenas(world=2, topk=0, slots=1, chunk_rows=2) as (mappings, pointers):
         partial, inverse, count, output, scratch, status = _profile_combine_inputs(pointers, tokens)
         inverse[:tokens, 0] = 1
         if waiting == "drain":
             # The peer has finished sending, but never ACKs our terminal frame.
-            slot = 128
+            slot = 128  # Rank 1's channel 0 -> rank 0 queue is its first lane.
             struct.pack_into("<i", mappings[1], slot + 512, -1)
             struct.pack_into("<Q", mappings[1], slot + 520, 0)
             struct.pack_into("<Q", mappings[1], slot, (1 << 32) | 1)
-        profile = torch.empty(1, len(native.host_sm_profile_fields()), dtype=torch.int64, device="cuda")
+        profile = torch.empty(2, len(native.host_sm_profile_fields()), dtype=torch.int64, device="cuda")
         native.host_sm_combine(partial, inverse, count, pointers, 0, 1, 1, 2, 20,
                                output, scratch, status, profile=profile)
         assert status.item() == 3
-        row = _checked_profile(profile, status=3)[0]
+        # Row 0 is the self-pair CTA, which may finish before the remote timeout.
+        # Row 1 alone owns the missing rank 1 queue and its measured wait.
+        row = _checked_profile(profile[1:2], status=3)[0]
         field = "idle_final_drain_ns" if waiting == "drain" else f"idle_wait_{waiting}_ns"
         assert row[field] > 0
         assert row["idle_iterations"] > 0

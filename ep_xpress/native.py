@@ -191,17 +191,18 @@ def register_mapped_host(address: int, nbytes: int) -> int:
     )
 
 
-def host_sm_max_channels() -> int:
+def host_sm_max_channels(world: int = 1) -> int:
     """Cooperative transport occupancy on the current GPU; zero means unavailable.
 
     Context construction agrees on the minimum capability across the group and
-    uses one noncooperative lane when any participant lacks cooperative launch.
+    accounts for ``channels * world`` combine CTAs. Only world=1 supports the
+    single-CTA fallback when cooperative launch is unavailable.
     """
-    return load().host_sm_max_channels()
+    return load().host_sm_max_channels(_integer(world, "world", 1))
 
 
 def host_sm_profile_fields():
-    """Ordered int64 per-channel diagnostic fields for optional combine capture.
+    """Ordered int64 per-pair-CTA diagnostic fields for optional combine capture.
 
     Timing fields ending in ``_ns`` use GPU globaltimer nanoseconds. Phase
     durations and wait subsets must be interpreted using the native schema;
@@ -210,16 +211,19 @@ def host_sm_profile_fields():
     return list(load().host_sm_profile_fields())
 
 
-def host_sm_arena_bytes(hidden: int, topk: int, slots: int, chunk_rows: int, channels: int = 1) -> int:
+def host_sm_arena_bytes(hidden: int, topk: int, slots: int, chunk_rows: int,
+                        channels: int = 1, queue_peers: int = 1) -> int:
     """Bytes for all lanes of one producer; topk=0 selects combine storage.
 
-    chunk_rows is the per-lane capacity, not the producer's total payload budget.
-    Each lane has its own page-aligned arena and independent queue control.
+    chunk_rows is the per-queue capacity, not the producer's total payload budget.
+    Dispatch uses queue_peers=1; combine requires queue_peers=world. Flattened
+    queue index is channel * queue_peers + peer. Each queue has independent
+    page-aligned storage and control.
     """
     return load().host_sm_arena_bytes(
         _integer(hidden, "hidden", 1), _integer(topk, "topk"),
         _integer(slots, "slots", 1), _integer(chunk_rows, "chunk_rows", 1),
-        _integer(channels, "channels", 1),
+        _integer(channels, "channels", 1), _integer(queue_peers, "queue_peers", 1),
     )
 
 
@@ -262,11 +266,13 @@ def host_sm_combine(
     [world, local_tokens, hidden]. The owning GPU sums ranks in ascending order
     in FP32, rounds to BF16, and adds the local BF16 partial. `partial`
     already includes routing weights. Arena and status lifetime rules are the
-    same as host_sm_dispatch; combine uses separate arenas with topk=0.
-    Optional ``profile`` is a CUDA int64 [channels, field_count] output whose
+    same as host_sm_dispatch; combine uses separate arenas allocated with
+    topk=0 and queue_peers=world. chunk_rows is the per-pair capacity.
+    Optional ``profile`` is a CUDA int64 [channels * world, field_count] output whose
     columns follow host_sm_profile_fields(). None selects the uninstrumented
     kernel variant. The caller retains its storage through completion and
-    reads it only at an explicit diagnostic boundary.
+    reads it only at an explicit diagnostic boundary. Row index is
+    channel * world + peer, including the local-bypass peer CTA.
     """
     load().host_sm_combine(
         partial, inverse, count, pointers, rank, epoch, slots, chunk_rows,

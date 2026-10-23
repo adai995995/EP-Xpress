@@ -173,7 +173,7 @@ def channel_configuration(context, world, args):
     capacities = []
     if args.transport == "host_sm":
         capacities = [None] * world
-        dist.all_gather_object(capacities, native.host_sm_max_channels())
+        dist.all_gather_object(capacities, native.host_sm_max_channels(world))
     if args.require_channels is not None and effective != args.require_channels:
         raise AssertionError(
             f"test requires {args.require_channels} active channels, got {effective}; "
@@ -186,6 +186,12 @@ def check_combine_profile(context, rank, world, args, cases):
     """Read diagnostics only after all captured operations have completed."""
     report = context.stop_combine_profile()
     assert report["status"] == 0 and not report["host_failed"]
+    assert report["schema_version"] == 2 and report["queue_layout"] == "rank_pair"
+    assert report["rank"] == rank and report["world_size"] == world
+    assert report["channels"] == context.effective_channels
+    counter_rows = [{"channel": channel, "peer": peer}
+                    for channel in range(context.effective_channels) for peer in range(world)]
+    assert report["counter_rows"] == counter_rows
     expected_operations = [(iteration, case) for iteration in range(args.iterations) for case in cases]
     assert report["captured_operations"] == len(expected_operations)
     assert report["dropped_operations"] == 0
@@ -204,9 +210,10 @@ def check_combine_profile(context, rank, world, args, cases):
         assert operation["tag"] == [iteration, case]
         assert operation["label"] == {"iteration": iteration, "case": case}
         assert operation["local_tokens"] == input_count(rank, world, args.tokens, case, iteration)
-        assert len(counters) == context.effective_channels
+        assert len(counters) == len(counter_rows)
+        assert all(len(values) == len(report["fields"]) for values in counters)
         rows = [dict(zip(report["fields"], values)) for values in counters]
-        for row in rows:
+        for location, row in zip(counter_rows, rows):
             assert row["status"] == 0
             assert row["end_ns"] - row["begin_ns"] == row["elapsed_ns"] > 0
             assert sum(row[field] for field in phases) == row["elapsed_ns"]
@@ -215,8 +222,13 @@ def check_combine_profile(context, rank, world, args, cases):
             assert row["idle_iterations"] + row["progress_iterations"] == row["loop_iterations"]
             assert row["credit_blocked_progress_iterations"] <= row["progress_iterations"]
             assert row["ready_missing_progress_iterations"] <= row["progress_iterations"]
-            assert row["terminal_sent"] == 1
-            assert row["terminal_received"] == world - 1
+            remote_peer = location["peer"] != rank
+            assert row["terminal_sent"] == int(remote_peer)
+            assert row["terminal_received"] == int(remote_peer)
+            if remote_peer:
+                assert row["local_rows"] == 0
+            else:
+                assert row["send_payload_rows"] == row["receive_payload_rows"] == 0
             assert row["send_frames"] >= row["terminal_sent"]
             assert row["receive_frames"] >= row["terminal_received"]
             assert row["payload_written_bytes"] == row["send_payload_rows"] * args.hidden * 2
@@ -250,7 +262,9 @@ def check_combine_profile(context, rank, world, args, cases):
             "cta_elapsed_ns_max": max(row["elapsed_ns"] for row in rows),
             "phase_partition_verified": True, "idle_subsets_verified": True,
         })
-    return {"rank": rank, "channels": context.effective_channels,
+    return {"schema_version": report["schema_version"], "queue_layout": report["queue_layout"],
+            "rank": rank, "world_size": world, "channels": context.effective_channels,
+            "counter_rows": counter_rows,
             "captured_operations": report["captured_operations"], "operations": summaries}
 
 

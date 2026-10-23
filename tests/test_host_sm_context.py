@@ -10,7 +10,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from ep_xpress import Config, Context
+from ep_xpress import Config, Context, native
 from ep_xpress.host_sm import HostSMContext, _MappedArena, _operation_identity
 
 
@@ -84,7 +84,7 @@ def test_multilane_abort_and_fatal_flags_cover_every_queue(tmp_path):
         arena.close()
 
 
-@pytest.mark.parametrize("capacities, expected", [([16, 8, 16], 4), ([16, 0, 16], 1), ([16, 2, 8], 2)])
+@pytest.mark.parametrize("capacities, expected", [([16, 8, 16], 4), ([0], 1), ([16, 2, 8], 2)])
 def test_bootstrap_negotiates_group_min_then_checks_actual_budget(capacities, expected):
     context = object.__new__(HostSMContext)
     context.rank = 0
@@ -99,10 +99,11 @@ def test_bootstrap_negotiates_group_min_then_checks_actual_budget(capacities, ex
     def gather(result, signature, group):
         result[:] = [(*signature[:3], f"gpu-{rank}", cap) for rank, cap in enumerate(capacities)]
 
-    def arena_size(hidden, topk, slots, chunk_rows, channels):
-        assert chunk_rows == context.config.channel_chunk_rows(expected)
+    def arena_size(hidden, topk, slots, chunk_rows, channels, queue_peers):
+        assert queue_peers == (1 if topk else context.world_size)
+        assert chunk_rows == context.config.combine_chunk_rows(expected, queue_peers)
         assert channels == expected
-        return context.config.mapped_arena_bytes(topk, channels)
+        return context.config.mapped_arena_bytes(topk, channels, queue_peers=queue_peers)
 
     with patch("ep_xpress.host_sm.dist.all_gather_object", side_effect=gather), \
             patch("ep_xpress.host_sm.torch.cuda.get_device_properties", return_value=SimpleNamespace(uuid="gpu-0")), \
@@ -112,5 +113,55 @@ def test_bootstrap_negotiates_group_min_then_checks_actual_budget(capacities, ex
         with pytest.raises(ValueError, match="negotiated mapped host queues exceed"):
             context._bootstrap(None)
     assert context.effective_channels == expected
-    assert context._pool_bytes == sum(context.config.mapped_arena_bytes(k, expected) for k in (2, 0)) * len(capacities)
+    assert context._combine_chunk_rows == context.config.combine_chunk_rows(expected, len(capacities))
+    assert context._pool_bytes == len(capacities) * (
+        context.config.mapped_arena_bytes(2, expected) +
+        context.config.mapped_arena_bytes(0, expected, queue_peers=len(capacities)))
     broadcast.assert_not_called()  # No storage is created after a budget failure.
+
+
+def test_pair_grid_rejects_missing_cooperative_support_before_allocation():
+    context = object.__new__(HostSMContext)
+    context.rank, context.world_size = 0, 2
+    context.config = Config(128, 2, 32, transport="host_sm")
+    context.expert_to_rank = (0, 1)
+    context.device = torch.device("cuda", 0)
+    context.group = object()
+    context._channel_capacity = 8
+
+    def gather(result, signature, group):
+        result[:] = [(*signature[:3], f"gpu-{rank}", cap) for rank, cap in enumerate((8, 0))]
+
+    with patch("ep_xpress.host_sm.dist.all_gather_object", side_effect=gather), \
+            patch("ep_xpress.host_sm.torch.cuda.get_device_properties", return_value=SimpleNamespace(uuid="gpu-0")), \
+            patch("ep_xpress.host_sm.native.host_sm_arena_bytes") as allocate:
+        with pytest.raises(ValueError, match="cooperative all-resident"):
+            context._bootstrap(None)
+    allocate.assert_not_called()
+
+
+def test_pair_queue_abort_headers_cover_more_than_32_lanes(tmp_path):
+    lanes = 4 * 9
+    path = tmp_path / "pair-queue.arena"
+    path.write_bytes(bytes(lanes * 4096))
+    path.chmod(0o600)
+    arena = _MappedArena(path, lanes * 4096, channels=lanes)
+    try:
+        arena.set_fatal_errors()
+        arena.request_abort()
+        assert all(struct.unpack_from("=QQ", arena.data, lane * 4096 + 8) == (1, 1)
+                   for lane in range(lanes))
+        struct.pack_into("=Q", arena.data, (lanes - 1) * 4096, 3)
+        assert struct.unpack_from("=Q", arena.data, (lanes - 1) * 4096)[0] == 3
+    finally:
+        arena.close()
+
+
+def test_native_pair_allocator_and_capacity_pass_world_to_extension():
+    with patch("ep_xpress.native.load") as load:
+        load.return_value.host_sm_max_channels.return_value = 16
+        load.return_value.host_sm_arena_bytes.return_value = 4096 * 32
+        assert native.host_sm_max_channels(8) == 16
+        assert native.host_sm_arena_bytes(128, 0, 2, 3, channels=4, queue_peers=8) == 4096 * 32
+        load.return_value.host_sm_max_channels.assert_called_once_with(8)
+        load.return_value.host_sm_arena_bytes.assert_called_once_with(128, 0, 2, 3, 4, 8)

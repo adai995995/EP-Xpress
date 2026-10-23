@@ -25,7 +25,7 @@ class ConfigTests(unittest.TestCase):
     def test_host_sm_mapped_budget_and_limits(self):
         cfg = Config(128, 4, 32, transport="host_sm", chunk_bytes=1024)
         self.assertEqual(cfg.chunk_rows, 4)
-        self.assertEqual(cfg.pool_bytes(8), 8 * (cfg.mapped_arena_bytes(4) + cfg.mapped_arena_bytes(0)))
+        self.assertEqual(cfg.pool_bytes(8), 8 * (cfg.mapped_arena_bytes(4) + cfg.mapped_arena_bytes(0, queue_peers=8)))
         self.assertEqual(cfg.pinned_working_set_bytes(8), cfg.pool_bytes(8))
         for changes in ({"hidden_size": 127}, {"topk": 257}, {"slots": 65},
                         {"chunk_bytes": 256 * 65537}, {"timeout_seconds": 3601},
@@ -50,6 +50,20 @@ class ConfigTests(unittest.TestCase):
         ce_one = Config(128, 4, 32, channels=1)
         ce_four = Config(128, 4, 32, channels=4)
         self.assertEqual(ce_one.pinned_working_set_bytes(8), ce_four.pinned_working_set_bytes(8))
+
+    def test_pair_budget_uses_per_pair_rows_and_counts_all_headers(self):
+        cfg = Config(128, 4, 32, transport="host_sm", chunk_bytes=73 * 256, channels=4)
+        self.assertEqual(cfg.channel_chunk_rows(), 19)
+        self.assertEqual(cfg.combine_chunk_rows(queue_peers=8), 3)
+        row_stride = 272  # aligned BF16 payload plus row metadata
+        slot_stride = ((640 + 3 * row_stride + 127) // 128) * 128
+        lane_bytes = ((128 + 2 * slot_stride + 4095) // 4096) * 4096
+        self.assertEqual(cfg.mapped_arena_bytes(0, queue_peers=8), 4 * 8 * lane_bytes)
+        for peers in (0, 64, True, 1.5):
+            with self.assertRaises(ValueError):
+                cfg.mapped_arena_bytes(0, queue_peers=peers)
+        with self.assertRaises(ValueError):
+            cfg.mapped_arena_bytes(4, queue_peers=8)
 
 
 if __name__ == "__main__":

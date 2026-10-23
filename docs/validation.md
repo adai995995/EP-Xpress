@@ -1,5 +1,23 @@
 # Validation
 
+## Rank-pair combine revision
+
+The pair-queue CUDA extension compiled successfully. Thirty-one focused
+bootstrap, profile-layout, local-combine and bounded-wait checks passed. Two
+additional three-GPU protocol checks passed using RAM-backed shared mappings:
+
+- Independent pair progress: rank 2 launches no consumer and sends no ACK.
+  Ranks 0 and 1 still exchange multiple frames, reuse a one-slot queue, copy
+  the expected payload, and drain their mutual terminal frames before the
+  absent pair times out.
+- Successful mixed-destination combine across repeated epochs, with uneven
+  counts, empty input/channel partitions, and exact output checks.
+
+An initial version of these two test fixtures used a container overlay file
+that CUDA could not register. Switching the fixture to the same `/dev/shm`
+mapping type used by the runtime resolved that setup failure. The checks
+below describe prior revisions and were not all repeated for this change.
+
 Validation date: 2026-10-23. These results establish reference-implementation
 correctness, not a production throughput or model-inference speedup claim.
 
