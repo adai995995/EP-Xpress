@@ -5,7 +5,7 @@ SGLang v0.5.21. They are distinct from the synthetic expert function in the
 standalone transport replay.
 
 The latest results are in
-[Expert route alignment and NUMA inspection](#expert-route-alignment-and-numa-inspection).
+[Producer-local host-arena allocation](#producer-local-host-arena-allocation).
 Earlier sections describe earlier runtime revisions and their measurements.
 
 ## Matched configuration
@@ -1091,3 +1091,106 @@ short full-model sanity prompts match text and all 29 generated token IDs
 against NCCL. Their common-prefix log probabilities differ by up to 0.218722
 (mean absolute difference 0.014670); this is a limited output sanity check,
 not a claim of full-model numerical equivalence or identical timing-run routes.
+
+## Producer-local host-arena allocation
+
+The preceding inspection found every shared arena on NUMA node 0. Runtime
+`d7dc52d` moves allocation from the rank-0 coordinator to each payload producer.
+Rank 0 creates the private shared directory; each producer creates, reserves
+and zero-initializes its own dispatch, combine and decode-mailbox files under
+its existing worker memory policy. An initialization-only collective completes
+before any worker maps and registers its peers' files. Allocation errors are
+collected at this same boundary, before any registered mapping can be used.
+
+Combine files contain separate destination queues, but their payload owner is
+still the producer in the filename. Mailboxes follow the same ownership rule.
+The library does not derive NUMA nodes from rank numbers or override affinity.
+Applications must configure their workers' memory policies before creating a
+context; a tmpfs mount policy can also affect allocation. Physical page location
+is checked separately from process binding.
+
+This change adds no dispatch/combine synchronization or per-layer NUMA calls.
+The communication kernels, frame sizes, channel selection, expert alignment,
+workspace reuse and numerical operations are unchanged. Producer-local memory
+does not make cross-node consumers local; those readers and their ACK writes
+still reach the producer's memory node.
+
+### Measured page placement
+
+The pre-warmup snapshot identifies eight workers, 24 unique arenas and 192
+mapping views. Each arena is mapped by all eight ranks, and all views agree on
+full resident-page coverage. The check uses physical node page counts, not
+the worker's `bind` label. Every dispatch, combine and mailbox arena for
+producers 0 through 3 is on node 0; every arena for producers 4 through 7 is on
+node 1, matching the configured GPU/worker topology.
+Post-timing snapshots confirm the same per-producer placement and full coverage.
+
+| Physical page placement | Node 0 | Node 1 | Total |
+|---|---:|---:|---:|
+| Previous coordinator allocation | 155.53125 MiB | 0 MiB | 155.53125 MiB |
+| Producer allocation, before warmup | 77.765625 MiB | 77.765625 MiB | 155.53125 MiB |
+
+Each producer owns 2,144 dispatch pages, 2,304 combine pages and 529 mailbox
+pages, all 4 KiB. Consequently each node has 19,908 pages. The inspection is
+outside the performance timing window and does not sample every memory access.
+
+### Full-model result
+
+Both backends use the preceding eight-GPU, BF16, TP/DP/EP8 eager configuration,
+512 input tokens and 32 output tokens, with eight 16-token warmup batches and
+three timed repetitions at batches 1 and 32. Four-row frames, 32 allocated
+channels, adaptive channel selection, valid-count experts, decode workspace
+reuse, fused decode and prefill Tx/Rx warp separation remain unchanged.
+The default NCCL baseline is measured freshly, first, followed by EP-Xpress.
+Neither performance run uses a profiler. Physical page checks happen outside
+warmup and timing. The latency definitions are the same as the preceding
+alignment comparison; all times below are milliseconds.
+
+| Backend | Concurrent requests | Completion median [min, max] | Last TTFT | Steady-window TPOT | Mean request TPOT | Output tokens/s |
+|---|---:|---:|---:|---:|---:|---:|
+| Default NCCL | 1 | 3105.647 [3040.094, 3119.601] | 192.871 | 93.957 | 93.957 | 10.304 |
+| Producer-local EP-Xpress | 1 | 2821.935 [2818.582, 2823.066] | 184.600 | 85.072 | 85.072 | 11.340 |
+| Default NCCL | 32 | 3405.740 [3372.632, 3426.461] | 553.176 | 92.154 | 94.626 | 300.669 |
+| Producer-local EP-Xpress | 32 | 5222.785 [4187.206, 5240.674] | 2478.962 | 89.333 | 90.849 | 196.064 |
+
+Single-request completion is 9.14% lower than fresh NCCL, but batch-32
+completion is 53.35% higher and its output throughput is 34.79% lower. The
+batch-32 last TTFT increases from 553.176 to 2478.962 ms, while steady-window
+decode TPOT remains 3.06% lower than NCCL. The large regression is therefore
+observed before all requests receive their first token, not in the steady
+decode window. TTFT includes scheduling, so it is not pure prefill kernel time.
+
+The previous all-node-0 EP run completes in 2846.474 ms at batch 1 and
+3310.950 ms at batch 32. Producer-local placement changes these medians by
+-0.86% and +57.74%, respectively. The single-request ranges overlap, so this
+does not establish a material incremental single-request benefit. The new
+batch-32 range is entirely slower than the previous EP range, whereas fresh
+NCCL batch-32 completion changes by only +0.28%. The current producer-local
+implementation is retained as the measured experiment; these results do not
+support treating it as a general performance improvement for this workload.
+
+Both backends' three single-request repetitions execute on DP ranks 6, 7 and
+0, respectively. Batch-32 prefill partitions still vary. NCCL splits four
+requests into two local groups on 8, 8 and 5 ranks; EP-Xpress does so on 8, 5
+and 8 ranks. The three EP last-TTFT values are 1429.537, 2478.962 and 2489.123
+ms. Fewer local prefill groups alone therefore do not explain the regression.
+These are sequential runs with three repetitions, not a randomized,
+interleaved old/new allocation ablation; identical inputs do not guarantee
+identical later routing or scheduler execution.
+
+The confirmed change is physical producer-page placement. A plausible next
+question is how it changes cross-node GPU reads, writes and queue progress;
+producer-local allocation only localizes the producer side. This run does not
+separate those costs or establish that remote reads are the cause. No new
+kernel-phase profiling or additional placement experiments were performed.
+
+Both runs pass matched-input, configuration, source and host-only transport
+checks. All 47 tracked files match the frozen source before and after; the
+pinned SGLang patch is unchanged. Critical settings and input hashes also match
+the preceding alignment experiment, as do the GPU identities, PCIe topology,
+container image and model configuration. All eight ranks report 32 effective
+channels. NCCL logs contain SHM and no P2P, NET or NVLS channel records, and
+all eight GPUs have zero NVLink payload increments. Four short output prompts
+match text and all 29 generated token IDs; common-prefix logprob differences
+remain at maximum 0.218722 and mean 0.014670. This is a limited sanity check,
+not full-model numerical equivalence. Experiment containers exit after the run.

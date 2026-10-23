@@ -1,5 +1,27 @@
 # Validation
 
+## Producer-local host allocation
+
+Runtime `d7dc52d` changes host-SM bootstrap allocation only. Each producer creates,
+reserves and initializes its own shared files before a group-wide initialization
+boundary permits registration. Review covers dispatch, pair-combine and decode
+mailbox ownership, temporary mapping/FD cleanup and failure propagation before
+registration. Python syntax and whitespace checks pass; an AST comparison
+confirms all existing context methods except bootstrap are unchanged. No CUDA
+kernel or per-operation stream/ACK protocol is modified.
+
+The complete SGLang model runs directly at batches 1 and 32 against a fresh
+default-NCCL baseline, with no additional native or distributed test suite.
+Before warmup and after timing, physical page inspection verifies all 24
+producer arenas: eight workers, 192 mapping views, complete residency and
+consistent views. Producers 0 through 3 reside entirely on NUMA node 0 and
+producers 4 through 7 on node 1, totaling 77.765625 MiB per node. Source,
+settings and host-only transport checks pass; all NVLink payload increments
+are zero. Four short prompts match 29 generated token IDs, with nonzero
+logprob differences. The batch-32 performance regression is recorded in the
+[producer-allocation experiment](model-performance.md#producer-local-host-arena-allocation);
+successful placement and functional execution do not establish a speedup.
+
 ## Tiled expert routing alignment
 
 Runtime `d8bb75a` replaces the large count-aware expert alignment with tile
