@@ -1,5 +1,39 @@
 # Validation
 
+## Tiled expert routing alignment
+
+Runtime `d8bb75a` replaces the large count-aware expert alignment with tile
+histograms, bounded metadata prefix scans and stable scatter. The small decode
+alignment kernel is unchanged. The new Triton kernels compile in the pinned
+offline CUDA environment.
+
+One focused GPU script passes 15 exact alignment checks against a CPU stable
+layout reference and the existing nine BF16 expert-output checks against the
+original SGLang runner. Coverage includes int32/int64 IDs, zero/partial/full GPU
+counts, inactive capacity containing valid IDs, all-invalid and skewed routes,
+non-power-of-two expert counts, single-expert alignment, 32/64/128-row padding,
+tile tails, and prefix scans spanning multiple metadata chunks. Positive
+out-of-range and wide int64 IDs do not alias valid experts after narrowing.
+Valid expert outputs match bit for bit. Python syntax and whitespace checks
+pass, and an AST comparison confirms that the small alignment kernel is
+unchanged. The broader native and distributed suites were not repeated.
+
+A complete-model trace and read-only NUMA inspection were collected on the
+preceding `a570d86` runtime before replacing the alignment. All 24 shared arenas
+are fully resident on NUMA node 0 despite workers being bound across two nodes;
+placement is left unchanged for the routing comparison. See the
+[alignment experiment](model-performance.md#expert-route-alignment-and-numa-inspection)
+for the profile definitions and limits.
+
+The new runtime completes full-model SGLang inference at batches 1 and 32
+against a fresh default-NCCL baseline, with three measured repetitions per
+shape and no profiler. Source, inputs, settings and host-only transport checks
+pass; all eight ranks retain 32 effective channels and all NVLink payload
+increments are zero. A post-run snapshot confirms the same host-page placement.
+Four short output prompts match text and all 29 generated token IDs; log
+probabilities are not identical. See the alignment experiment for timings and
+the limits on numerical equivalence and attribution to this change.
+
 ## Independent Tx/Rx warp groups for pair combine
 
 The prepared pair-combine option gives each remote-peer 256-thread CTA four

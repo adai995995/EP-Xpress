@@ -5,7 +5,7 @@ SGLang v0.5.21. They are distinct from the synthetic expert function in the
 standalone transport replay.
 
 The latest results are in
-[Independent send and receive warp experiment](#independent-send-and-receive-warp-experiment).
+[Expert route alignment and NUMA inspection](#expert-route-alignment-and-numa-inspection).
 Earlier sections describe earlier runtime revisions and their measurements.
 
 ## Matched configuration
@@ -959,3 +959,135 @@ functional suite or kernel-phase profiling was run for this environment-only
 ablation. Both EP runs finish all requested repetitions without reported
 runtime errors; the adapter keeps the new path enabled, with the explicit
 switch available for further comparisons.
+
+## Expert route alignment and NUMA inspection
+
+Before changing routing alignment, runtime `a570d86` was profiled through the
+complete model at batches 1 and 32. Warp-specialized prefill combine, four-row
+frames, 32 allocated channels, decode workspace reuse and fused mailbox combine
+remained enabled. This inspection uses the same eight GPUs, BF16 model, EP8,
+eager execution and host-only transport restrictions as the preceding section.
+Each shape has eight 16-token warmup batches, followed by a short eight-token
+diagnostic trace. The later unprofiled performance run uses 32 output tokens.
+
+### Current execution profile
+
+CPU/GPU traces were collected from all eight ranks for both shapes. GPU
+operations are assigned to forwards using launch correlations and annotations;
+CPU annotation timestamps are not used as GPU execution windows. Each entry
+below is an average forward on each rank followed by the median across the
+applicable ranks. Times are milliseconds and cover all model layers in that
+forward, not a single MoE layer. Component times use GPU interval unions.
+
+| Shape / local phase | Ranks | Forwards per rank | GPU forward window | Dispatch | Expert alignment | Expert GEMM | Combine | Observed GPU gaps |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Batch 1, active prefill | 1 | 1 | 113.664 | 9.976 | 0.256 | 2.964 | 20.808 | 74.648 |
+| Batch 1, active decode | 1 | 8 | 101.054 | 2.767 | 0.062 | 0.569 | 1.868 | 93.465 |
+| Batch 1, locally idle ranks | 7 | 9 | 101.487 | 79.387 | 0.093 | 0.979 | 19.684 | 1.157 |
+| Batch 32, prefill | 8 | 2 | 359.028 | 86.813 | 2.894 | 14.971 | 99.886 | 143.945 |
+| Batch 32, decode | 8 | 8 | 103.655 | 39.401 | 0.158 | 1.939 | 20.192 | 39.243 |
+
+Expert alignment is approximately 0.8% of the batch-32 prefill diagnostic
+window. It contains redundant work, but this trace does not identify it as the
+dominant cost. Dispatch, combine and gaps between recorded GPU operations are
+larger. The locally idle ranks still execute expert-parallel work; their long
+communication intervals can include waiting for the active rank and cannot be
+interpreted as high useful PCIe utilization.
+
+Torch profiler perturbs submission timing. Observed gaps mean no recorded GPU
+operation within the attributed forward window; they do not establish whether
+CPU scheduling, launch submission or dependencies caused the gaps. Transport
+intervals include waiting, and fused mailbox combine includes reduction.
+Consequently this table is not an unprofiled end-to-end communication fraction
+or a hardware PCIe bandwidth measurement. Other model kernels are omitted from
+the component columns, and independent rank medians need not add exactly.
+
+### Shared host-memory placement
+
+The host has two NUMA nodes with four GPUs attached to each. GPU worker memory
+policies are bound to their corresponding nodes. However, the 24 shared host
+arenas contain 39,816 resident 4-KiB pages, totaling 155.53125 MiB, all on node 0.
+Before/after snapshots agree. The 192 worker mappings are deduplicated by
+backing-file identity and mapped extent; every view agrees and covers the full
+arena, so the shared pages are not counted eight times.
+
+The current allocator creates and reserves all arena backing files from rank
+0. Worker binding and CUDA host registration do not by themselves give each
+shared arena a different physical placement. This observation establishes an
+asymmetry in host-memory placement, not its latency penalty. Placement remains
+unchanged in this experiment to isolate the routing implementation change. A
+future placement experiment can allocate producer-owned buffers on the relevant
+NUMA node at initialization, while accounting for cross-node multicast readers.
+
+### Tiled expert alignment
+
+Runtime `d8bb75a` replaces the large-input expert alignment with three GPU kernels:
+256-route tile histograms, a bounded prefix scan of the small histogram table,
+and stable tile scatter with expert padding. Route IDs are read twice across
+all experts instead of twice per expert. Sorting within each tile and prefix
+offsets preserve source-row order within every expert. The small alignment
+kernel, GEMMs, numerical precision, routing weights, transport and decode fusion
+are unchanged. The new path adds one kernel launch and tile metadata allocation;
+it introduces no GPU-count readback or host routing decisions.
+
+### Full-model comparison after alignment replacement
+
+The unprofiled run compares runtime `d8bb75a` with a newly measured default
+NCCL baseline. Both use the matched eight-GPU configuration above, with 512
+input tokens, 32 output tokens, eight 16-token warmup batches and three timed
+repetitions per shape. The EP candidate retains four-row combine frames, 32
+allocated channels, adaptive active channels, separate prefill Tx/Rx warps,
+decode workspace reuse and fused mailbox combine. NUMA placement is unchanged.
+NCCL is measured first and EP-Xpress second; this is not an interleaved,
+randomized comparison.
+
+All latency values are milliseconds. Completion is the client-observed time
+until all requests finish. Last TTFT is when the last request receives its first
+token. Steady-window TPOT uses the interval from that point to the first request
+finishing, normalized by observed token progress and batch size. Mean request
+TPOT instead averages each request's decode interval. Ranges are the observed
+three repetitions, not confidence intervals.
+
+| Backend | Concurrent requests | Completion median [min, max] | Last TTFT | Steady-window TPOT | Mean request TPOT | Output tokens/s |
+|---|---:|---:|---:|---:|---:|---:|
+| Default NCCL | 1 | 3063.074 [3048.605, 3081.160] | 190.282 | 92.667 | 92.667 | 10.447 |
+| EP-Xpress | 1 | 2846.474 [2812.844, 2851.764] | 185.941 | 85.819 | 85.819 | 11.242 |
+| Default NCCL | 32 | 3396.269 [3367.625, 3430.748] | 568.421 | 91.613 | 93.400 | 301.507 |
+| EP-Xpress | 32 | 3310.950 [3274.705, 3327.890] | 580.689 | 87.843 | 88.868 | 309.277 |
+
+EP-Xpress reduces completion latency by 7.07% for one request and 2.51% for 32
+requests in this run; corresponding output throughput increases are 7.61% and
+2.58%. The batch-32 last TTFT is still 2.16% higher than NCCL, and mean request
+TTFT is 559.463 versus 499.840 ms, 11.93% higher. The candidate's advantage is
+in subsequent decoding, with steady-window TPOT 4.12% lower at batch 32.
+The measurements do not establish a prefill latency win.
+
+Equal submitted requests do not produce identical scheduler batches. At batch
+32, NCCL splits each rank's four requests into two prefill groups on 8, 6 and 4
+ranks across the three repetitions; EP-Xpress does so on 1, 4 and 2 ranks.
+All repetitions still contain 32 requests. Arrival and scheduling differences
+therefore remain part of the client-observed result.
+
+These are whole-backend comparisons against NCCL, not the isolated speedup of
+the alignment replacement. Compared with the preceding warp-specialized EP
+run, single-request completion is essentially unchanged (2847.997 versus
+2846.474 ms). Batch-32 completion decreases from 3503.642 to 3310.950 ms, but
+the previous run has substantially different first-token timing and request
+partitioning. The small alignment share in the pre-change profile, unchanged
+small decode path, and timing variation prevent attributing that entire
+difference to the new alignment. No isolated before/after alignment kernel
+timing or repeated interleaved old/new model comparison was performed.
+
+Source manifests match all 47 tracked files before and after the run; the
+pinned SGLang patch is unchanged. Input hashes, critical settings and all eight
+effective channel counts match the intended configuration. NCCL transport logs
+show SHM with no P2P, NET or NVLS records, and all eight GPUs have zero NVLink
+payload increments in both runs. A read-only post-run NUMA snapshot again finds
+all 24 host arenas on node 0. Both experiment containers exit after validation.
+
+The focused alignment checks pass all 15 stable-layout cases, and all nine
+BF16 expert-output checks match the original SGLang runner bit for bit. Four
+short full-model sanity prompts match text and all 29 generated token IDs
+against NCCL. Their common-prefix log probabilities differ by up to 0.218722
+(mean absolute difference 0.014670); this is a limited output sanity check,
+not a claim of full-model numerical equivalence or identical timing-run routes.
