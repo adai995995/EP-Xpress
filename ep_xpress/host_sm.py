@@ -8,6 +8,7 @@ not supported. GPU stream dependencies and queue credits remain necessary.
 
 from dataclasses import asdict, dataclass
 from datetime import timedelta
+import copy
 import ctypes
 import hashlib
 import json
@@ -196,6 +197,9 @@ class HostSMContext(Context):
         self._pointers = {}
         self._root = None
         self._work_stream = None
+        self._combine_profile = None
+        self._combine_profile_last = None
+        self._combine_profile_label = None
         try:
             self._bootstrap(shared_directory)
         except BaseException:
@@ -332,6 +336,137 @@ class HostSMContext(Context):
 
     check = check_errors
 
+    def start_combine_profile(self, max_operations=1024):
+        """Start bounded, opt-in GPU diagnostics at a request boundary.
+
+        Allocation and zero initialization happen here, not in combine. Each
+        accepted operation gets independent storage until stop_combine_profile
+        completes. The session never overwrites older samples; excess combines
+        run without instrumentation and increment dropped_operations.
+        """
+        with self._lock, torch.cuda.device(self.device):
+            if self._closed:
+                raise RuntimeError("Context is closed")
+            self._check_aborted()
+            if self._combine_profile is not None:
+                raise RuntimeError("stop the current combine profile before starting another")
+            if (isinstance(max_operations, bool) or not isinstance(max_operations, int) or
+                    not 1 <= max_operations <= 65536):
+                raise ValueError("max_operations must be an integer in [1, 65536]")
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("combine diagnostics cannot start during CUDA Graph capture")
+            fields = native.host_sm_profile_fields()
+            if not fields or len(set(fields)) != len(fields):
+                raise RuntimeError("invalid native combine diagnostic schema")
+            shape = (max_operations, self.effective_channels, len(fields))
+            storage_bytes = max_operations * self.effective_channels * len(fields) * 8
+            if storage_bytes * 2 + 4 > 64 << 20:
+                raise ValueError("combine profile GPU and pinned readout buffers exceed the 64 MiB budget")
+            with torch.cuda.stream(self._work_stream):
+                counters = torch.zeros(shape, dtype=torch.int64, device=self.device)
+            readout = torch.empty(shape, dtype=torch.int64, pin_memory=True)
+            status_readout = torch.empty(1, dtype=torch.int32, pin_memory=True)
+            # Finish initialization before the caller starts its measured
+            # request/trace; this fence is outside the per-layer critical path.
+            self._work_stream.synchronize()
+            self._combine_profile = {
+                "fields": fields, "max_operations": max_operations,
+                "counters": counters, "readout": readout, "status_readout": status_readout,
+                "operations": [], "dropped_operations": 0,
+            }
+            self._combine_profile_label = None
+            self._combine_profile_last = None
+
+    def set_combine_profile_label(self, label):
+        """Snapshot JSON-compatible CPU metadata once per forward, if active.
+
+        Labels may describe local phase, input rows and forward index. They do
+        not infer a global phase for IDLE ranks. Tensors are not accepted.
+        Returns False when diagnostics are off without serializing the label.
+        """
+        with self._lock:
+            if self._combine_profile is None:
+                return False
+            self._combine_profile_label = json.loads(json.dumps(label, allow_nan=False))
+            return True
+
+    def _combine_profile_slice(self, handle, tag, epoch):
+        session = self._combine_profile
+        if session is None:
+            return None, None
+        index = len(session["operations"])
+        if index >= session["max_operations"]:
+            session["dropped_operations"] += 1
+            return None, None
+        record = {
+            "index": index, "operation": self._counter, "epoch": epoch,
+            "dispatch_operation": handle.operation,
+            "tag": copy.deepcopy(tag), "label": self._combine_profile_label,
+            "local_tokens": handle.local_token_count,
+            "received_capacity": handle.received_count, "submitted": False,
+        }
+        session["operations"].append(record)
+        return session["counters"][index], record
+
+    def stop_combine_profile(self):
+        """Finish capture and bulk-read GPU counters at a completed boundary.
+
+        Copies are queued on the transport stream, followed by one stream
+        synchronization. No Gloo operation is involved. The report retains raw
+        per-channel rows in native field order; wait counters overlap phase
+        counters, and timings are diagnostic kernel residency, not wire time.
+        Fatal CUDA failures may prevent readout and require worker restart.
+        """
+        with self._lock, torch.cuda.device(self.device):
+            if self._combine_profile is None:
+                if self._combine_profile_last is None:
+                    raise RuntimeError("no combine profile session has been started")
+                return copy.deepcopy(self._combine_profile_last)
+            session = self._combine_profile
+            self._combine_profile = None
+            self._combine_profile_label = None
+            used = len(session["operations"])
+            # The local session reference retains every GPU slice until all
+            # selected operations and their readback have completed.
+            with torch.cuda.stream(self._work_stream):
+                session["readout"][:used].copy_(session["counters"][:used], non_blocking=True)
+                session["status_readout"].copy_(self._status, non_blocking=True)
+            self._work_stream.synchronize()
+            result = {
+                "schema_version": 1, "transport": "host_sm", "rank": self.rank,
+                "channels": self.effective_channels, "fields": session["fields"],
+                "max_operations": session["max_operations"], "captured_operations": used,
+                "dropped_operations": session["dropped_operations"],
+                "status": int(session["status_readout"].tolist()[0]),
+                "host_failed": self._failure is not None,
+                "operations": session["operations"],
+                "raw_counters": session["readout"][:used].tolist(),
+                "scope": "combine transport kernels only; excludes initialization and final reduction",
+                "timing": {
+                    "unit": "nanoseconds for fields ending in _ns",
+                    "clock_scope": "GPU globaltimer; raw timestamps are not assumed comparable across devices",
+                    "phase_fields": session["fields"][3:12],
+                    "idle_fields": [field for field in session["fields"] if field.startswith("idle_") and field.endswith("_ns")],
+                    "phase_rule": "nine disjoint phase durations sum to elapsed_ns per channel",
+                    "completion_phase_order": session["fields"][3:12],
+                    "idle_rule": "no-progress wait categories are exclusive subsets of elapsed time; they overlap the phase view",
+                    "interpretation": "instrumented GPU instructions and CTA/peer waiting, not pure PCIe transfer time",
+                    "missing_first_event": -1,
+                },
+                "payload_bytes": "requested payload load/store bytes; excludes metadata/control and is not a hardware PCIe traffic counter",
+            }
+            self._combine_profile_last = result
+            return copy.deepcopy(result)
+
+    def read_combine_profile(self):
+        """Read the completed CPU report without synchronizing or reading CUDA."""
+        with self._lock:
+            if self._combine_profile is not None:
+                raise RuntimeError("stop the combine profile at a completed boundary before reading it")
+            if self._combine_profile_last is None:
+                raise RuntimeError("no completed combine profile is available")
+            return copy.deepcopy(self._combine_profile_last)
+
     def _begin(self, phase, stream):
         if self._closed:
             raise RuntimeError("Context is closed")
@@ -437,11 +572,14 @@ class HostSMContext(Context):
                                          dtype=torch.bfloat16, device=self.device)
                     remote = torch.empty((self.world_size, handle.local_token_count, self.config.hidden_size),
                                          dtype=torch.bfloat16, device=self.device)
+                    profile, profile_record = self._combine_profile_slice(handle, tag, epoch)
                     native.host_sm_combine(
                         partial, handle._plan.inverse, handle._plan.count, self._pointers["combine"],
                         self.rank, epoch, self.config.slots, self._channel_chunk_rows,
                         max(1, math.ceil(self.config.timeout_seconds * 1000)), output, remote, self._status,
-                        identity=identity, channels=self.effective_channels)
+                        identity=identity, channels=self.effective_channels, profile=profile)
+                    if profile_record is not None:
+                        profile_record["submitted"] = True
                     handle._consumed = True
                     return self._finish(output)
             except BaseException as error:
@@ -455,6 +593,10 @@ class HostSMContext(Context):
             with torch.cuda.device(self.device):
                 if self._work_stream is not None:
                     self._work_stream.synchronize()
+                # An unfinished session is intentionally not read implicitly at
+                # shutdown. Stop it explicitly to retain its diagnostic report.
+                self._combine_profile = None
+                self._combine_profile_label = None
                 for address in self._registered:
                     native.unregister_host(address)
                 self._registered.clear()

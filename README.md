@@ -33,7 +33,8 @@ measured against the intended inference framework and workload.
 
 The `host_ce` reference may export unused rows within a nonempty source chunk.
 Reported CE D2H bytes include those rows; ideal routing byte counts are not
-reported as actual transfer volume. SM payload counters are not implemented.
+reported as actual transfer volume. Optional SM combine diagnostics count
+requested payload loads/stores; these are not hardware PCIe traffic counters.
 A host copy is shared, but each destination still consumes its own PCIe read
 bandwidth.
 
@@ -125,6 +126,36 @@ Each handle can be combined once and belongs to its context. Zero-input ranks
 still receive work; zero-receive ranks still participate in combine. Healthy
 `close()` is collective and must run before destroying the caller's process
 groups. After failure, restart the worker group instead of reusing the context.
+
+### Optional combine diagnostics
+
+For `host_sm`, start and stop a bounded capture at completed request boundaries:
+
+```python
+ep.start_combine_profile(max_operations=1024)
+# Submit the workload normally. An optional CPU-only label can be set once
+# per forward with ep.set_combine_profile_label({"phase": "EXTEND"}).
+run_workload(ep)
+report = ep.stop_combine_profile()
+```
+
+The start call preallocates counters; the stop call bulk-copies them after one
+transport-stream fence. No per-layer CPU readback or collective is added.
+Excess operations run uninstrumented and increment `dropped_operations`.
+`read_combine_profile()` returns the completed report without another fence.
+The report contains native field names, operation labels, and one row per
+channel. Diagnostic timing adds CTA barriers and must be compared with an
+uninstrumented run before interpreting its overhead.
+
+Nine exclusive phases partition each channel's elapsed time: local routing,
+send metadata, send payload, publication/fence, peer polling, receive metadata,
+receive payload, ACK publication, and other control. A second view classifies
+iterations with no cursor or frame progress as waiting for ready, credit, both,
+or final drain. This view overlaps the phase totals and must not be added to
+them. Init/final-reduction kernels require separate trace measurement. Raw GPU
+timestamps are device-local; channel times must not be summed as wall latency.
+Use `benchmarks.replay --transport host_sm --profile-combine` to validate the
+counter invariants and requested bytes against independently generated routes.
 
 ## Validation
 

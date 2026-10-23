@@ -259,3 +259,158 @@ def test_host_sm_error_in_last_channel_aborts_the_operation_and_stays_sticky():
         assert status.item() == 1
         assert count.item() == 0
         assert torch.ones(2, device="cuda").sum().item() == 2
+
+
+_PROFILE_PHASES = (
+    "route_local_ns", "send_metadata_ns", "send_payload_ns", "publish_fence_ready_ns",
+    "peer_poll_ns", "receive_metadata_select_ns", "receive_payload_ns",
+    "ack_publish_ns", "other_control_ns",
+)
+_PROFILE_WAITS = (
+    "idle_wait_ready_ns", "idle_wait_credit_ns", "idle_wait_both_ns",
+    "idle_final_drain_ns", "idle_other_ns",
+)
+
+
+def _checked_profile(profile, status=0):
+    fields = native.host_sm_profile_fields()
+    assert len(set(fields)) == len(fields)
+    rows = [dict(zip(fields, values)) for values in profile.cpu().tolist()]
+    for row in rows:
+        assert row["status"] == status
+        assert row["elapsed_ns"] == row["end_ns"] - row["begin_ns"] > 0
+        assert sum(row[field] for field in _PROFILE_PHASES) == row["elapsed_ns"]
+        assert all(row[field] >= 0 for field in _PROFILE_PHASES + _PROFILE_WAITS)
+        # Wait durations classify idle iterations inside the phase durations;
+        # they are a second view of the same time, not additional elapsed time.
+        assert sum(row[field] for field in _PROFILE_WAITS) <= row["elapsed_ns"]
+        assert 0 <= row["completion_phase"] < len(_PROFILE_PHASES)
+        completed = row["idle_iterations"] + row["progress_iterations"]
+        assert completed <= row["loop_iterations"]
+        if status == 0:
+            assert completed == row["loop_iterations"]
+        for field in ("credit_blocked_progress_iterations", "ready_missing_progress_iterations"):
+            assert 0 <= row[field] <= row["progress_iterations"]
+        for field in ("first_publish_elapsed_ns", "first_receive_elapsed_ns",
+                      "first_payload_publish_elapsed_ns", "first_payload_receive_elapsed_ns"):
+            assert row[field] == -1 or 0 <= row[field] <= row["elapsed_ns"]
+        assert 0 <= row["last_progress_elapsed_ns"] <= row["elapsed_ns"]
+        assert row["payload_written_bytes"] == row["send_payload_rows"] * 8 * 2
+        assert row["payload_read_bytes"] == row["receive_payload_rows"] * 8 * 2
+    return rows
+
+
+def _profile_combine_inputs(pointers, tokens):
+    # Padding deliberately contains nonzero data and invalid inverse entries.
+    # Only the device valid count may decide which input rows participate.
+    partial = torch.arange((tokens + 3) * 8, device="cuda").reshape(tokens + 3, 8).bfloat16()
+    inverse = torch.full((tokens + 3, 2), -1, dtype=torch.int64, device="cuda")
+    inverse[:tokens, 0] = 0
+    inverse[:tokens, 1] = torch.arange(tokens, device="cuda").flip(0)
+    count = torch.tensor([tokens], dtype=torch.int32, device="cuda")
+    output = torch.full((tokens + 1, 8), 42, dtype=torch.bfloat16, device="cuda")
+    scratch = torch.empty(pointers.numel(), tokens + 1, 8, dtype=torch.bfloat16, device="cuda")
+    status = torch.zeros(1, dtype=torch.int32, device="cuda")
+    return partial, inverse, count, output, scratch, status
+
+
+@pytest.mark.parametrize("channels,tokens", [(1, 0), (1, 1), (1, 17), (4, 0), (4, 1), (4, 17)])
+def test_host_sm_combine_profile_preserves_local_outputs_and_slot_reuse(channels, tokens):
+    if channels > 1 and native.host_sm_max_channels() < channels:
+        pytest.skip(f"device cannot safely run {channels} cooperative transport channels")
+    with arenas(topk=0, slots=1, chunk_rows=2, channels=channels) as (_, pointers):
+        partial, inverse, count, output, scratch, status = _profile_combine_inputs(pointers, tokens)
+        expected = torch.zeros_like(output)
+        expected[:tokens] = partial[:tokens].flip(0)
+        profile = torch.empty(channels, len(native.host_sm_profile_fields()), dtype=torch.int64, device="cuda")
+        for epoch in (1, 2, 3):
+            profile.fill_(-777)
+            native.host_sm_combine(partial, inverse, count, pointers, 0, epoch, 1, 2, 1000,
+                                   output, scratch, status, channels=channels,
+                                   profile=None if epoch == 1 else profile)
+            assert status.item() == 0
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            if epoch == 1:
+                assert (profile == -777).all().item()
+                continue
+            rows = _checked_profile(profile)
+            assert [row["local_rows"] for row in rows] == [
+                tokens * (channel + 1) // channels - tokens * channel // channels
+                for channel in range(channels)]
+            for row in rows:
+                assert row["send_payload_rows"] == row["receive_payload_rows"] == 0
+                assert row["send_frames"] == row["terminal_sent"] == 1
+                assert row["receive_frames"] == row["terminal_received"] == 0
+                assert row["first_publish_elapsed_ns"] >= 0
+                assert row["first_receive_elapsed_ns"] == -1
+                assert row["first_payload_publish_elapsed_ns"] == -1
+                assert row["first_payload_receive_elapsed_ns"] == -1
+
+
+@pytest.mark.parametrize("waiting", ["ready", "both", "drain"])
+def test_host_sm_combine_profile_accounts_missing_peer_waits_and_bytes(waiting):
+    tokens = 3 if waiting == "both" else 0
+    with arenas(world=2, topk=0, slots=1, chunk_rows=2) as (mappings, pointers):
+        partial, inverse, count, output, scratch, status = _profile_combine_inputs(pointers, tokens)
+        inverse[:tokens, 0] = 1
+        if waiting == "drain":
+            # The peer has finished sending, but never ACKs our terminal frame.
+            slot = 128
+            struct.pack_into("<i", mappings[1], slot + 512, -1)
+            struct.pack_into("<Q", mappings[1], slot + 520, 0)
+            struct.pack_into("<Q", mappings[1], slot, (1 << 32) | 1)
+        profile = torch.empty(1, len(native.host_sm_profile_fields()), dtype=torch.int64, device="cuda")
+        native.host_sm_combine(partial, inverse, count, pointers, 0, 1, 1, 2, 20,
+                               output, scratch, status, profile=profile)
+        assert status.item() == 3
+        row = _checked_profile(profile, status=3)[0]
+        field = "idle_final_drain_ns" if waiting == "drain" else f"idle_wait_{waiting}_ns"
+        assert row[field] > 0
+        assert row["idle_iterations"] > 0
+        assert row["local_rows"] == row["receive_payload_rows"] == 0
+        assert row["send_payload_rows"] == (2 if waiting == "both" else 0)
+        assert row["payload_written_bytes"] == (32 if waiting == "both" else 0)
+        assert row["send_frames"] == 1
+        assert row["terminal_sent"] == (0 if waiting == "both" else 1)
+        assert row["terminal_received"] == (1 if waiting == "drain" else 0)
+        assert torch.ones(2, device="cuda").sum().item() == 2
+
+
+def test_host_sm_combine_profile_records_invalid_inverse_failure():
+    with arenas(topk=0) as (_, pointers):
+        partial, inverse, count, output, scratch, status = _profile_combine_inputs(pointers, 1)
+        inverse[0, 0] = -1
+        profile = torch.empty(1, len(native.host_sm_profile_fields()), dtype=torch.int64, device="cuda")
+        native.host_sm_combine(partial, inverse, count, pointers, 0, 1, 2, 1, 1000,
+                               output, scratch, status, profile=profile)
+        assert status.item() == 1
+        row = _checked_profile(profile, status=1)[0]
+        assert row["local_rows"] == row["send_payload_rows"] == row["receive_payload_rows"] == 0
+        assert row["first_payload_publish_elapsed_ns"] == row["first_payload_receive_elapsed_ns"] == -1
+        assert torch.ones(2, device="cuda").sum().item() == 2
+
+
+@pytest.mark.parametrize("invalid", ["dtype", "device", "dimensions", "fields", "channels", "contiguity"])
+def test_host_sm_combine_rejects_invalid_profile_before_launch(invalid):
+    with arenas(topk=0) as (_, pointers):
+        partial, inverse, count, output, scratch, status = _profile_combine_inputs(pointers, 1)
+        fields = len(native.host_sm_profile_fields())
+        options = {"dtype": torch.int64, "device": "cuda"}
+        shape = (1, fields)
+        if invalid == "dtype":
+            options["dtype"] = torch.float32
+        elif invalid == "device":
+            options["device"] = "cpu"
+        elif invalid == "dimensions":
+            shape = (fields,)
+        elif invalid == "fields":
+            shape = (1, fields - 1)
+        elif invalid == "channels":
+            shape = (2, fields)
+        profile = (torch.empty(1, fields * 2, **options)[:, ::2] if invalid == "contiguity"
+                   else torch.empty(shape, **options))
+        with pytest.raises(RuntimeError, match="profile"):
+            native.host_sm_combine(partial, inverse, count, pointers, 0, 1, 2, 1, 1000,
+                                   output, scratch, status, profile=profile)
+        assert status.item() == 0
+        assert (output == 42).all().item()  # Init must not run after validation fails.

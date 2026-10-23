@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <map>
 #include <mutex>
+#include <string>
+#include <vector>
 #include <cub/block/block_scan.cuh>
 
 namespace {
@@ -21,6 +23,66 @@ constexpr int64_t kArenaHeader = 128;
 constexpr int64_t kSlotHeader = 640;
 constexpr int64_t kRowsOffset = 512;
 constexpr int64_t kIdentityOffset = 520;
+
+// Diagnostic schema v1. Times are GPU-local nanoseconds; begin/end must not be
+// compared across GPUs. The nine phase durations partition elapsed_ns exactly.
+// Idle durations are a SECOND, overlapping view of completed loop iterations:
+// only iterations with no cursor/frame progress are classified, exclusively.
+// Do not add idle durations to phase durations or sum channel times as latency.
+// Payload phases include GPU instructions and diagnostic CTA synchronization;
+// publication/ACK phases include system fences. None is pure PCIe wire time.
+// Initial setup is included in other_control. Final profile-record stores,
+// abort publication, and the separate init/finalize kernels are excluded.
+// A progress iteration advances the local cursor or publishes/consumes any
+// frame, including terminal/nonrecipient frames. Ready/credit flags are the
+// snapshots observed during that iteration, not a continuously sampled state.
+// Credit poll counts cover the next producer slot; final-drain slot checks are
+// in other_control and idle_final_drain, not in the credit poll counters.
+// Frames include terminals; rows/bytes count payload actually written/read,
+// exclude local bypass, and receive rows count only this rank's selected rows.
+// first_receive is first observed ready frame; first_payload_receive is the
+// start of the first selected payload read. Publish milestones follow release.
+// Missing milestones are -1. Error exits may leave an iteration unclassified;
+// phase partition and observed status are still written. completion_phase is
+// 0..8 in the nine-phase order below (the phase where completion is observed).
+enum ProfileField {
+  PBegin, PEnd, PElapsed,
+  PRouteLocal, PSendMetadata, PSendPayload, PPublish, PPeerPoll,
+  PReceiveMetadata, PReceivePayload, PAck, POther,
+  PIdleReady, PIdleCredit, PIdleBoth, PIdleDrain, PIdleOther,
+  PFirstPublish, PFirstReceive, PWrittenBytes, PReadBytes,
+  PSendFrames, PReceiveFrames, PSendRows, PReceiveRows, PLocalRows,
+  PIterations, PReadyPolls, PUnreadyObservations, PCreditPolls,
+  PCreditBlockedObservations, PIdleIterations, PCreditProgressIterations,
+  PUnreadyProgressIterations, PStatus, PCompletionPhase,
+  PFirstPayloadPublish, PFirstPayloadReceive, PTerminalSent,
+  PTerminalReceived, PProgressIterations, PLastProgress, PFieldCount
+};
+const std::vector<std::string> kProfileFields = {
+  "begin_ns", "end_ns", "elapsed_ns", "route_local_ns", "send_metadata_ns",
+  "send_payload_ns", "publish_fence_ready_ns", "peer_poll_ns",
+  "receive_metadata_select_ns", "receive_payload_ns", "ack_publish_ns",
+  "other_control_ns", "idle_wait_ready_ns", "idle_wait_credit_ns",
+  "idle_wait_both_ns", "idle_final_drain_ns", "idle_other_ns",
+  "first_publish_elapsed_ns", "first_receive_elapsed_ns", "payload_written_bytes",
+  "payload_read_bytes", "send_frames", "receive_frames", "send_payload_rows",
+  "receive_payload_rows", "local_rows", "loop_iterations", "peer_ready_polls",
+  "peer_unready_observations", "credit_polls", "credit_blocked_observations",
+  "idle_iterations", "credit_blocked_progress_iterations",
+  "ready_missing_progress_iterations", "status", "completion_phase",
+  "first_payload_publish_elapsed_ns", "first_payload_receive_elapsed_ns",
+  "terminal_sent", "terminal_received", "progress_iterations",
+  "last_progress_elapsed_ns"
+};
+
+template <bool Enabled> struct ProfileState {};
+template <> struct ProfileState<true> {
+  int64_t values[PFieldCount];
+  uint64_t mark, iteration_begin;
+  int phase;
+  bool progress, credit_missing, ready_missing;
+  int credit_blocked[kMaxRanks];
+};
 
 int64_t align_up(int64_t value, int64_t alignment) {
   return (value + alignment - 1) / alignment * alignment;
@@ -58,6 +120,92 @@ __device__ __forceinline__ uint64_t ticks_ns() {
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
   return value;
 }
+
+template <bool Enabled>
+__device__ __forceinline__ void profile_init(ProfileState<Enabled>& p) {
+  if constexpr (Enabled) {
+    if (threadIdx.x == 0) {
+      const uint64_t now = ticks_ns();
+      for (int i = 0; i < PFieldCount; ++i) p.values[i] = 0;
+      p.values[PBegin] = now;
+      p.values[PFirstPublish] = p.values[PFirstReceive] = -1;
+      p.values[PFirstPayloadPublish] = p.values[PFirstPayloadReceive] = -1;
+      p.phase = POther;
+      p.mark = now;
+    }
+  }
+}
+
+// Both barriers disappear entirely in the normal specialization. The first
+// closes the preceding CTA work; the second starts the next phase together.
+// Boundary overhead is intentionally present in diagnostic phase durations.
+template <bool Enabled>
+__device__ __forceinline__ void profile_phase(ProfileState<Enabled>& p, int phase) {
+  if constexpr (Enabled) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      const uint64_t now = ticks_ns();
+      p.values[p.phase] += now - p.mark;
+      p.phase = phase;
+      p.mark = now;
+    }
+    __syncthreads();
+  }
+}
+
+template <bool Enabled>
+__device__ __forceinline__ void profile_iteration_begin(ProfileState<Enabled>& p) {
+  if constexpr (Enabled) {
+    if (threadIdx.x == 0) {
+      p.iteration_begin = ticks_ns();
+      p.progress = p.credit_missing = p.ready_missing = false;
+      ++p.values[PIterations];
+    }
+  }
+}
+
+template <bool Enabled>
+__device__ __forceinline__ void profile_iteration_end(ProfileState<Enabled>& p,
+                                                      bool final_drain) {
+  if constexpr (Enabled) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      const uint64_t now = ticks_ns();
+      if (p.progress) {
+        ++p.values[PProgressIterations];
+        p.values[PCreditProgressIterations] += p.credit_missing;
+        p.values[PUnreadyProgressIterations] += p.ready_missing;
+        p.values[PLastProgress] = now - p.values[PBegin];
+      } else {
+        ++p.values[PIdleIterations];
+        const int field = final_drain ? PIdleDrain :
+            p.credit_missing && p.ready_missing ? PIdleBoth :
+            p.credit_missing ? PIdleCredit : p.ready_missing ? PIdleReady : PIdleOther;
+        p.values[field] += now - p.iteration_begin;
+      }
+    }
+    __syncthreads();
+  }
+}
+
+template <bool Enabled>
+__device__ __forceinline__ void profile_finish(ProfileState<Enabled>& p,
+                                               int64_t* output, int status) {
+  if constexpr (Enabled) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      const uint64_t now = ticks_ns();
+      p.values[p.phase] += now - p.mark;
+      p.values[PEnd] = now;
+      p.values[PElapsed] = now - p.values[PBegin];
+      p.values[PStatus] = status;
+      p.values[PCompletionPhase] = p.phase - PRouteLocal;
+      for (int i = 0; i < PFieldCount; ++i)
+        output[int64_t(blockIdx.x) * PFieldCount + i] = p.values[i];
+      __threadfence();
+    }
+  }
+}
 __device__ __forceinline__ uint64_t* control(char* p, int word) {
   return reinterpret_cast<uint64_t*>(p) + word;
 }
@@ -90,6 +238,7 @@ struct TransportArgs {
   int32_t* output_count;
   at::BFloat16* remote;
   int32_t* status;
+  int64_t* profile;
   int experts, world, rank, slots, chunk_rows, channels;
   int input_rows, hidden, topk, capacity;
   int64_t slot_stride, channel_stride;
@@ -145,7 +294,7 @@ __global__ void host_sm_finalize_kernel(TransportArgs a) {
 // 3 timeout, 4 peer abort, 5 operation identity mismatch. An error is sticky.
 // More than one channel requires a cooperative, all-resident launch. Separate
 // producer-only and receiver-only blocks would not provide this liveness.
-template <bool Combine, typename Id>
+template <bool Combine, typename Id, bool Profile = false>
 __global__ void host_sm_transport_kernel(TransportArgs a) {
   using Scan = cub::BlockScan<uint64_t, kThreads>;
   __shared__ typename Scan::TempStorage scan_storage;
@@ -156,6 +305,8 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
   __shared__ uint64_t masks[kThreads];
   __shared__ int num_local, num_remote, num_selected, output_base, complete;
   __shared__ uint64_t previous, start;
+  __shared__ ProfileState<Profile> profile;
+  profile_init(profile);
   const int tid = threadIdx.x, channel = blockIdx.x;
   char* own = reinterpret_cast<char*>(a.pointers[a.rank]) + channel * a.channel_stride;
   const Id* ids = static_cast<const Id*>(a.ids);
@@ -177,6 +328,8 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
   }
   __syncthreads();
   while (true) {
+    profile_iteration_begin(profile);
+    profile_phase(profile, PPeerPoll);
     // Check different peers concurrently; never spin on a blocked producer.
     if (tid < a.world) {
       auto* p = reinterpret_cast<uint64_t*>(a.pointers[tid] + channel * a.channel_stride);
@@ -191,8 +344,20 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
     __syncthreads();
     bool blocked = !producer_done && tid < a.world && tid != a.rank &&
                    acquire(control(send_slot, 1 + tid)) != previous;
+    if constexpr (Profile) {
+      if (tid < a.world) profile.credit_blocked[tid] = blocked;
+    }
     const int any_blocked = __syncthreads_or(blocked);
+    if constexpr (Profile) {
+      if (tid == 0) {
+        profile.credit_missing = any_blocked;
+        if (!producer_done) profile.values[PCreditPolls] += a.world - 1;
+        for (int peer = 0; peer < a.world; ++peer)
+          profile.values[PCreditBlockedObservations] += profile.credit_blocked[peer];
+      }
+    }
     if (!producer_done && !any_blocked) {
+      profile_phase(profile, PRouteLocal);
       const int batch = min(kThreads, min(a.chunk_rows, end - cursor));
       uint64_t mask = 0;
       int token = cursor + tid;
@@ -266,6 +431,10 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
             a.output_inverse[int64_t(output_base + tid) * 2 + 1] = cursor + local_rows[tid];
           }
         }
+        if constexpr (Profile) {
+          if (tid == 0) profile.values[PLocalRows] += num_local;
+        }
+        profile_phase(profile, PSendMetadata);
         if (tid < num_remote) {
           int source = remote_rows[tid];
           host_store64(send_slot + kSlotHeader + tid * 8, masks[source] & ~(uint64_t(1) << a.rank));
@@ -281,6 +450,7 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
                          __float_as_uint(expert >= 0 ? a.weights[int64_t(source) * a.topk + k] : 0.0f));
           }
         }
+        profile_phase(profile, PSendPayload);
         for (int64_t i = tid; i < int64_t(num_remote) * (a.hidden / 2); i += blockDim.x) {
           int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
           const uint32_t word = reinterpret_cast<const uint32_t*>(
@@ -288,6 +458,14 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
           host_store32(send_slot + x_offset + i * 4, word);
         }
         __syncthreads();
+        if constexpr (Profile) {
+          if (tid == 0) {
+            profile.values[PWrittenBytes] += int64_t(num_remote) * a.hidden * 2;
+            profile.values[PSendRows] += num_remote;
+            profile.progress |= batch != 0;
+          }
+        }
+        profile_phase(profile, PPublish);
         if (tid == 0) cursor += batch;
         __syncthreads();
         if (num_remote || cursor == end) {
@@ -301,11 +479,21 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
             release(control(send_slot, 0), (a.epoch << 32) | uint64_t(sent_chunks + 1));
             ++sent_chunks;
             if (!num_remote) producer_done = 1;
+            if constexpr (Profile) {
+              const int64_t elapsed = ticks_ns() - profile.values[PBegin];
+              if (profile.values[PFirstPublish] < 0) profile.values[PFirstPublish] = elapsed;
+              if (num_remote && profile.values[PFirstPayloadPublish] < 0)
+                profile.values[PFirstPayloadPublish] = elapsed;
+              ++profile.values[PSendFrames];
+              profile.values[PTerminalSent] += !num_remote;
+              profile.progress = true;
+            }
           }
         }
       }
     }
     __syncthreads();
+    profile_phase(profile, PPeerPoll);
     // Poll peers concurrently, then process each available chunk in parallel
     // tiles. ACK is published only after every thread has finished all reads.
     if (tid < a.world) {
@@ -325,13 +513,29 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
     __syncthreads();
     if (tid == 0) error = atomicAdd(a.status, 0);
     __syncthreads();
+    if constexpr (Profile) {
+      if (tid == 0) {
+        for (int peer = 0; peer < a.world; ++peer) {
+          if (peer_done[peer]) continue;
+          ++profile.values[PReadyPolls];
+          if (!received_rows[peer]) {
+            ++profile.values[PUnreadyObservations];
+            profile.ready_missing = true;
+          } else if (profile.values[PFirstReceive] < 0) {
+            profile.values[PFirstReceive] = ticks_ns() - profile.values[PBegin];
+          }
+        }
+      }
+    }
     if (error) break;
+    profile_phase(profile, POther);
     for (int peer = 0; peer < a.world; ++peer) {
       const int rows = received_rows[peer];
       if (!rows) continue;
       char* peer_base = reinterpret_cast<char*>(a.pointers[peer]) + channel * a.channel_stride;
       char* slot = peer_base + kArenaHeader + (peer_chunk[peer] % a.slots) * a.slot_stride;
       for (int tile = 0; tile < rows; tile += kThreads) {
+        profile_phase(profile, PReceiveMetadata);
         const int wire_row = tile + tid;
         bool selected = false;
         int token = 0;
@@ -355,6 +559,11 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
         }
         __syncthreads();
         if (error) break;
+        profile_phase(profile, PReceivePayload);
+        if constexpr (Profile) {
+          if (tid == 0 && num_selected && profile.values[PFirstPayloadReceive] < 0)
+            profile.values[PFirstPayloadReceive] = profile.mark - profile.values[PBegin];
+        }
         for (int64_t i = tid; i < int64_t(num_selected) * (a.hidden / 2); i += blockDim.x) {
           int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
           const int source = selected_rows[row];
@@ -381,16 +590,29 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
           }
         }
         __syncthreads();
+        if constexpr (Profile) {
+          if (tid == 0) {
+            profile.values[PReadBytes] += int64_t(num_selected) * a.hidden * 2;
+            profile.values[PReceiveRows] += num_selected;
+          }
+        }
       }
+      profile_phase(profile, PAck);
       __threadfence_system();
       __syncthreads();
       if (tid == 0) {
         release(control(slot, 1 + a.rank), (a.epoch << 32) | uint64_t(peer_chunk[peer] + 1));
         ++peer_chunk[peer];
         if (rows == -1) peer_done[peer] = 1;
+        if constexpr (Profile) {
+          ++profile.values[PReceiveFrames];
+          profile.values[PTerminalReceived] += rows == -1;
+          profile.progress = true;
+        }
       }
       __syncthreads();
       if (error) break;
+      profile_phase(profile, POther);
     }
     const int unfinished_peers = __syncthreads_or(tid < a.world && !peer_done[tid]);
     bool unacked = false;
@@ -409,9 +631,14 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
       error = atomicAdd(a.status, 0);
     }
     __syncthreads();
-    if (complete || error) break;
+    if (complete || error) {
+      profile_iteration_end(profile, producer_done && !unfinished_peers && outstanding);
+      break;
+    }
     __nanosleep(64);
+    profile_iteration_end(profile, producer_done && !unfinished_peers && outstanding);
   }
+  profile_finish(profile, a.profile, error);
   if (tid == 0 && error) {
     release(reinterpret_cast<uint64_t*>(own), uint64_t(error));
     if (host_load64(own + 16)) {
@@ -439,27 +666,28 @@ int max_channels_current_device() {
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&cooperative, cudaDevAttrCooperativeLaunch, device));
   if (!cooperative) { capacities.emplace(device, 0); return 0; }
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-  int a, b, c;
+  int a, b, c, diagnostic;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&a, host_sm_transport_kernel<false, int32_t>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, host_sm_transport_kernel<false, int64_t>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&c, host_sm_transport_kernel<true, int64_t>, kThreads, 0));
-  const int capacity = std::min(32, sms * std::min({a, b, c}));
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&diagnostic, host_sm_transport_kernel<true, int64_t, true>, kThreads, 0));
+  const int capacity = std::min(32, sms * std::min({a, b, c, diagnostic}));
   capacities.emplace(device, capacity);
   return capacity;
 }
 
-template <bool Combine, typename Id>
+template <bool Combine, typename Id, bool Profile = false>
 void launch_transport(TransportArgs args, cudaStream_t stream) {
   const int64_t elements = int64_t(args.capacity) * args.hidden * (Combine ? args.world : 1);
   const int blocks = int(std::max<int64_t>(1, std::min<int64_t>(4096, (elements + kThreads - 1) / kThreads)));
   host_sm_init_kernel<Combine><<<blocks, kThreads, 0, stream>>>(args);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   if (args.channels == 1) {
-    host_sm_transport_kernel<Combine, Id><<<1, kThreads, 0, stream>>>(args);
+    host_sm_transport_kernel<Combine, Id, Profile><<<1, kThreads, 0, stream>>>(args);
   } else {
     void* parameters[] = {&args};
     C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
-        reinterpret_cast<const void*>(host_sm_transport_kernel<Combine, Id>),
+        reinterpret_cast<const void*>(host_sm_transport_kernel<Combine, Id, Profile>),
         dim3(args.channels), dim3(kThreads), parameters, 0, stream));
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -502,6 +730,11 @@ void common_check(torch::Tensor input, torch::Tensor pointers, int64_t rank,
 
 int64_t host_sm_max_channels() {
   return max_channels_current_device();
+}
+
+std::vector<std::string> host_sm_profile_fields() {
+  TORCH_INTERNAL_ASSERT(kProfileFields.size() == PFieldCount);
+  return kProfileFields;
 }
 
 int64_t host_sm_arena_bytes(int64_t hidden, int64_t topk, int64_t slots,
@@ -564,7 +797,7 @@ void host_sm_dispatch_cuda(torch::Tensor input, torch::Tensor ids, torch::Tensor
 void host_sm_combine_cuda(torch::Tensor partial, torch::Tensor inverse, torch::Tensor count,
     torch::Tensor pointers, int64_t rank, int64_t epoch, int64_t slots, int64_t chunk_rows,
     int64_t timeout_ms, torch::Tensor output, torch::Tensor remote, torch::Tensor status,
-    int64_t identity, int64_t channels) {
+    int64_t identity, int64_t channels, c10::optional<torch::Tensor> profile) {
   common_check(partial, pointers, rank, epoch, slots, chunk_rows, timeout_ms, output, status, channels);
   tensor_check(inverse, at::kLong, 2, partial.device(), "inverse");
   TORCH_CHECK(inverse.size(0) == partial.size(0) && inverse.size(1) == 2, "invalid inverse shape");
@@ -573,6 +806,11 @@ void host_sm_combine_cuda(torch::Tensor partial, torch::Tensor inverse, torch::T
   tensor_check(remote, at::kBFloat16, 3, partial.device(), "remote accumulation");
   TORCH_CHECK(remote.size(0) == pointers.numel() && remote.size(1) == output.size(0) &&
               remote.size(2) == output.size(1), "invalid accumulation shape");
+  if (profile.has_value()) {
+    tensor_check(*profile, at::kLong, 2, partial.device(), "profile");
+    TORCH_CHECK(profile->size(0) == channels && profile->size(1) == PFieldCount,
+                "profile must have shape [channels, ", PFieldCount, "]");
+  }
   const c10::cuda::CUDAGuard guard(partial.device());
   TransportArgs a{};
   a.input = partial.data_ptr<at::BFloat16>();
@@ -582,6 +820,7 @@ void host_sm_combine_cuda(torch::Tensor partial, torch::Tensor inverse, torch::T
   a.output = output.data_ptr<at::BFloat16>();
   a.remote = remote.data_ptr<at::BFloat16>();
   a.status = status.data_ptr<int32_t>();
+  a.profile = profile.has_value() ? profile->data_ptr<int64_t>() : nullptr;
   a.world = pointers.numel(); a.rank = rank;
   a.slots = slots; a.chunk_rows = chunk_rows; a.channels = channels;
   a.input_rows = partial.size(0); a.hidden = partial.size(1); a.topk = 0; a.capacity = output.size(0);
@@ -590,5 +829,6 @@ void host_sm_combine_cuda(torch::Tensor partial, torch::Tensor inverse, torch::T
   a.channel_stride = channel_bytes(a.hidden, 0, slots, chunk_rows);
   a.epoch = epoch; a.timeout_ns = uint64_t(timeout_ms) * 1000000; a.identity = identity;
   const auto stream = c10::cuda::getCurrentCUDAStream(partial.get_device());
-  launch_transport<true, int64_t>(a, stream.stream());
+  if (profile.has_value()) launch_transport<true, int64_t, true>(a, stream.stream());
+  else launch_transport<true, int64_t>(a, stream.stream());
 }

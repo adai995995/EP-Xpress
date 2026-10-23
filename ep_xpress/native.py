@@ -200,6 +200,16 @@ def host_sm_max_channels() -> int:
     return load().host_sm_max_channels()
 
 
+def host_sm_profile_fields():
+    """Ordered int64 per-channel diagnostic fields for optional combine capture.
+
+    Timing fields ending in ``_ns`` use GPU globaltimer nanoseconds. Phase
+    durations and wait subsets must be interpreted using the native schema;
+    overlapping counters must not be summed into a wall-clock duration.
+    """
+    return list(load().host_sm_profile_fields())
+
+
 def host_sm_arena_bytes(hidden: int, topk: int, slots: int, chunk_rows: int, channels: int = 1) -> int:
     """Bytes for all lanes of one producer; topk=0 selects combine storage.
 
@@ -244,7 +254,7 @@ def host_sm_dispatch(
 
 def host_sm_combine(
     partial, inverse, count, pointers, rank, epoch, slots, chunk_rows, timeout_ms,
-    output, remote_accum, status, *, identity=0, channels=1,
+    output, remote_accum, status, *, identity=0, channels=1, profile=None,
 ) -> None:
     """Enqueue inverse-routed mapped-host combine without a CPU count read.
 
@@ -253,9 +263,13 @@ def host_sm_combine(
     in FP32, rounds to BF16, and adds the local BF16 partial. `partial`
     already includes routing weights. Arena and status lifetime rules are the
     same as host_sm_dispatch; combine uses separate arenas with topk=0.
+    Optional ``profile`` is a CUDA int64 [channels, field_count] output whose
+    columns follow host_sm_profile_fields(). None selects the uninstrumented
+    kernel variant. The caller retains its storage through completion and
+    reads it only at an explicit diagnostic boundary.
     """
     load().host_sm_combine(
         partial, inverse, count, pointers, rank, epoch, slots, chunk_rows,
         timeout_ms, output, remote_accum, status, _integer(identity, "identity"),
-        _integer(channels, "channels", 1),
+        _integer(channels, "channels", 1), profile,
     )

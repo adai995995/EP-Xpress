@@ -11,7 +11,7 @@ GPU loads/stores to registered shared host memory, not peer-memory transport.
 
 | Check | Result |
 |---|---|
-| Full suite including both native CUDA transports | 79 passed, 43 subtests passed; one optional source-patch test skipped remotely |
+| Full suite including both native CUDA transports and optional combine diagnostics | 104 passed, 43 subtests passed; one optional source-patch test skipped remotely |
 | Local adapter tests with the pinned SGLang source available | All 11 passed, including patch application |
 | Native four-channel partition tails, 1/3/4/5/17 tokens and one/two slots | Passed, including padding, int32 IDs, valid counts, and a shorter subsequent operation |
 | Native three-channel grid and rejection above the safe cooperative capacity | Passed; invalid launch leaves CUDA usable |
@@ -34,7 +34,16 @@ The seven routing cases include mixed traffic, uneven/empty ranks, local-only
 traffic, hotspots, all-empty operations, partial padding, and all-padding.
 The replay checks device inverse maps, exact BF16 activations and final output,
 and zero-filled receive padding. Artificially delayed runs validate progress,
-not communication performance. SM byte counters are not yet implemented.
+not communication performance. Optional SM combine counters measure requested
+payload read/write bytes, excluding metadata/control and local bypass. They
+are software counters, not measured PCIe link traffic.
+
+Optional native diagnostics passed local-only and empty C1/C4 output equality,
+repeated epochs, exact phase closure, idle-wait subset bounds, missing-peer
+timeouts, invalid inverse maps, and prelaunch buffer validation. CPU API tests
+cover bounded capture, dropped samples, immutable labels, repeated sessions,
+and a single bulk-readback fence at stop. Diagnostic phases include additional
+CTA synchronization; instrumented timings require an overhead control run.
 
 The distributed checks require the stated effective channel count, rather than
 silently accepting a single-channel fallback. All eight devices reported a

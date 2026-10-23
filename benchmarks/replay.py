@@ -182,6 +182,78 @@ def channel_configuration(context, world, args):
             "cooperative_channel_capacities": capacities}
 
 
+def check_combine_profile(context, rank, world, args, cases):
+    """Read diagnostics only after all captured operations have completed."""
+    report = context.stop_combine_profile()
+    assert report["status"] == 0 and not report["host_failed"]
+    expected_operations = [(iteration, case) for iteration in range(args.iterations) for case in cases]
+    assert report["captured_operations"] == len(expected_operations)
+    assert report["dropped_operations"] == 0
+    assert len(report["operations"]) == len(report["raw_counters"]) == len(expected_operations)
+    phases = (
+        "route_local_ns", "send_metadata_ns", "send_payload_ns", "publish_fence_ready_ns",
+        "peer_poll_ns", "receive_metadata_select_ns", "receive_payload_ns",
+        "ack_publish_ns", "other_control_ns",
+    )
+    waits = ("idle_wait_ready_ns", "idle_wait_credit_ns", "idle_wait_both_ns",
+             "idle_final_drain_ns", "idle_other_ns")
+    summaries = []
+    for (iteration, case), operation, counters in zip(
+            expected_operations, report["operations"], report["raw_counters"]):
+        assert operation["submitted"]
+        assert operation["tag"] == [iteration, case]
+        assert operation["label"] == {"iteration": iteration, "case": case}
+        assert operation["local_tokens"] == input_count(rank, world, args.tokens, case, iteration)
+        assert len(counters) == context.effective_channels
+        rows = [dict(zip(report["fields"], values)) for values in counters]
+        for row in rows:
+            assert row["status"] == 0
+            assert row["end_ns"] - row["begin_ns"] == row["elapsed_ns"] > 0
+            assert sum(row[field] for field in phases) == row["elapsed_ns"]
+            assert all(row[field] >= 0 for field in phases + waits)
+            assert sum(row[field] for field in waits) <= row["elapsed_ns"]
+            assert row["idle_iterations"] + row["progress_iterations"] == row["loop_iterations"]
+            assert row["credit_blocked_progress_iterations"] <= row["progress_iterations"]
+            assert row["ready_missing_progress_iterations"] <= row["progress_iterations"]
+            assert row["terminal_sent"] == 1
+            assert row["terminal_received"] == world - 1
+            assert row["send_frames"] >= row["terminal_sent"]
+            assert row["receive_frames"] >= row["terminal_received"]
+            assert row["payload_written_bytes"] == row["send_payload_rows"] * args.hidden * 2
+            assert row["payload_read_bytes"] == row["receive_payload_rows"] * args.hidden * 2
+            for field in ("first_publish_elapsed_ns", "first_receive_elapsed_ns",
+                          "first_payload_publish_elapsed_ns", "first_payload_receive_elapsed_ns"):
+                assert row[field] == -1 or 0 <= row[field] <= row["elapsed_ns"]
+            assert (row["first_payload_publish_elapsed_ns"] == -1) == (row["send_payload_rows"] == 0)
+            assert (row["first_payload_receive_elapsed_ns"] == -1) == (row["receive_payload_rows"] == 0)
+        # Reconstruct the fixture's routing on CPU after timing, independently
+        # of device counters and the received inverse map. Deduplicate owners.
+        expected = {"local_rows": 0, "send_payload_rows": 0, "receive_payload_rows": 0}
+        for source in range(world):
+            _, ids, _ = inputs(source, world, args.tokens, 1, case, iteration, torch.device("cpu"))
+            for ids_row in ids.tolist():
+                owners = {expert // 4 for expert in ids_row if expert >= 0}
+                if source == rank:
+                    expected["local_rows"] += rank in owners
+                    expected["receive_payload_rows"] += len(owners - {rank})
+                else:
+                    expected["send_payload_rows"] += rank in owners
+        for field, value in expected.items():
+            assert sum(row[field] for row in rows) == value, (case, iteration, field, value)
+        summaries.append({
+            "case": case, "iteration": iteration, **expected,
+            "payload_written_bytes": sum(row["payload_written_bytes"] for row in rows),
+            "payload_read_bytes": sum(row["payload_read_bytes"] for row in rows),
+            "send_frames": sum(row["send_frames"] for row in rows),
+            "receive_frames": sum(row["receive_frames"] for row in rows),
+            "cta_elapsed_ns_min": min(row["elapsed_ns"] for row in rows),
+            "cta_elapsed_ns_max": max(row["elapsed_ns"] for row in rows),
+            "phase_partition_verified": True, "idle_subsets_verified": True,
+        })
+    return {"rank": rank, "channels": context.effective_channels,
+            "captured_operations": report["captured_operations"], "operations": summaries}
+
+
 def run(args):
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -193,6 +265,7 @@ def run(args):
                     chunk_bytes=args.chunk_bytes, slots=args.slots,
                     timeout_seconds=args.timeout, transport=args.transport, channels=args.channels)
     totals = []
+    profile_summaries = None
     cases = args.cases.split(",")
     if args.expect_error:
         with Context(dist.group.WORLD, [owner for owner in range(world) for _ in range(4)],
@@ -208,10 +281,14 @@ def run(args):
     with Context(dist.group.WORLD, [owner for owner in range(world) for _ in range(4)],
                  config, device=device) as context:
         channel_info = channel_configuration(context, world, args)
+        if args.profile_combine:
+            context.start_combine_profile(max_operations=args.iterations * len(cases))
         for iteration in range(args.iterations):
             for case in cases:
                 x, ids, weights = inputs(rank, world, args.tokens, args.hidden, case, iteration, device,
                                         id_dtype=getattr(torch, args.id_dtype))
+                if args.profile_combine:
+                    context.set_combine_profile_label({"iteration": iteration, "case": case})
                 torch.cuda.synchronize()
                 dist.barrier()
                 start = time.perf_counter()
@@ -270,6 +347,15 @@ def run(args):
                     else:
                         raise AssertionError("consumed handle was accepted")
 
+        if args.profile_combine:
+            summary = check_combine_profile(context, rank, world, args, cases)
+            profile_summaries = [None] * world
+            dist.all_gather_object(profile_summaries, summary)
+            for index in range(args.iterations * len(cases)):
+                operations = [item["operations"][index] for item in profile_summaries]
+                assert sum(item["payload_written_bytes"] for item in operations) == sum(
+                    item["payload_read_bytes"] for item in operations)
+
         # Keep two dispatch handles alive and combine them in reverse order.
         if args.check_handles:
             first_x, first_ids, first_weights = inputs(
@@ -314,6 +400,11 @@ def run(args):
                           "routing_id_dtype": args.id_dtype,
                           "artificial_delay_rank": args.delay_rank,
                           "artificial_delay_ms_per_phase": args.delay_ms,
+                          "combine_diagnostics_enabled": args.profile_combine,
+                          "combine_diagnostics": profile_summaries,
+                          "timing_caveat": ("Instrumented diagnostic replay; CTA barriers and timers add overhead. "
+                                            "Wait subsets overlap phase timings; device clocks are not compared."
+                                            if args.profile_combine else None),
                           "results": totals}, indent=2), flush=True)
     dist.destroy_process_group()
 
@@ -333,6 +424,8 @@ def main():
     parser.add_argument("--require-channels", type=int,
                         help="Fail if bootstrap falls back to a different active channel count")
     parser.add_argument("--id-dtype", choices=("int32", "int64"), default="int64")
+    parser.add_argument("--profile-combine", action="store_true",
+                        help="Capture bounded combine diagnostics and validate payload accounting after replay")
     parser.add_argument("--expect-error", choices=(
         "capacity", "invalid-id", "nonfinite-weight", "mismatch-tag", "mismatch-handle"))
     parser.add_argument("--delay-rank", type=int, default=-1,
@@ -346,6 +439,8 @@ def main():
         parser.error("unknown replay case")
     if args.expect_error and (args.transport != "host_sm" or args.tokens < 1):
         parser.error("--expect-error requires host_sm and at least one input token")
+    if args.profile_combine and (args.transport != "host_sm" or args.expect_error or args.iterations < 1):
+        parser.error("--profile-combine requires a successful host_sm replay with positive iterations")
     if args.channels < 1 or (args.transport != "host_sm" and args.channels != 1):
         parser.error("--channels must be positive; multiple channels require host_sm")
     if args.require_channels is not None and not 1 <= args.require_channels <= args.channels:

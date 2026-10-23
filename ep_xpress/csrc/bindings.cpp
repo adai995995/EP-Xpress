@@ -7,12 +7,15 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <string>
+#include <vector>
 
 void add_partial_cuda(torch::Tensor accum, torch::Tensor partial,
                       torch::Tensor token_indices);
 torch::Tensor finish_combine_cuda(torch::Tensor remote, torch::Tensor local);
 
 int64_t host_sm_max_channels();
+std::vector<std::string> host_sm_profile_fields();
 int64_t host_sm_arena_bytes(int64_t hidden, int64_t topk, int64_t slots, int64_t chunk_rows, int64_t channels);
 void host_sm_dispatch_cuda(torch::Tensor input, torch::Tensor ids, torch::Tensor weights,
     torch::Tensor expert_rank, torch::Tensor expert_local, torch::Tensor pointers,
@@ -21,7 +24,8 @@ void host_sm_dispatch_cuda(torch::Tensor input, torch::Tensor ids, torch::Tensor
     torch::Tensor inverse, torch::Tensor count, torch::Tensor status, int64_t identity, int64_t channels);
 void host_sm_combine_cuda(torch::Tensor partial, torch::Tensor inverse, torch::Tensor count,
     torch::Tensor pointers, int64_t rank, int64_t epoch, int64_t slots, int64_t chunk_rows,
-    int64_t timeout_ms, torch::Tensor output, torch::Tensor remote, torch::Tensor status, int64_t identity, int64_t channels);
+    int64_t timeout_ms, torch::Tensor output, torch::Tensor remote, torch::Tensor status,
+    int64_t identity, int64_t channels, c10::optional<torch::Tensor> profile);
 
 namespace {
 
@@ -144,9 +148,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("register_host", &register_host);
   module.def("register_mapped_host", &register_mapped_host);
   module.def("host_sm_max_channels", &host_sm_max_channels);
+  module.def("host_sm_profile_fields", &host_sm_profile_fields);
   module.def("host_sm_arena_bytes", &host_sm_arena_bytes);
   module.def("host_sm_dispatch", &host_sm_dispatch_cuda);
-  module.def("host_sm_combine", &host_sm_combine_cuda);
+  module.def("host_sm_combine", &host_sm_combine_cuda,
+      pybind11::arg("partial"), pybind11::arg("inverse"), pybind11::arg("count"),
+      pybind11::arg("pointers"), pybind11::arg("rank"), pybind11::arg("epoch"),
+      pybind11::arg("slots"), pybind11::arg("chunk_rows"), pybind11::arg("timeout_ms"),
+      pybind11::arg("output"), pybind11::arg("remote"), pybind11::arg("status"),
+      pybind11::arg("identity"), pybind11::arg("channels"),
+      pybind11::arg("profile") = pybind11::none());
   module.def("unregister_host", &unregister_host);
   module.def("copy_d2h_async", &copy_d2h_async);
   module.def("add_partial", &add_partial);
