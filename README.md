@@ -160,7 +160,8 @@ both queues and optional mailboxes. Dispatch frame sizing is unchanged.
 
 `Config(combine_warp_specialization=True)` lets prepared pair-queue combine
 advance sending and receiving in independent four-warp groups within each
-256-thread CTA. The core default is `False`, which retains the sequential
+256-thread remote-peer CTA. Local copies retain the whole CTA. The core default
+is `False`, which retains the sequential
 send/receive implementation. The SGLang adapter enables this option by default
 with `EP_XPRESS_COMBINE_WARP_SPECIALIZATION=1`. It changes neither the grid,
 channel count, frame capacity nor fused decode execution. Separate group

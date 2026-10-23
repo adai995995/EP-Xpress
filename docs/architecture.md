@@ -222,7 +222,7 @@ peer CTA copies local partials directly to GPU output without host traffic.
 Core `Config.combine_warp_specialization` defaults to `False`; this retains
 the sequential send/receive loop. Setting it to `True` selects a prepared
 owner-list kernel with four Tx warps and four Rx warps in the same 256-thread
-CTA. The SGLang adapter enables it by default through
+remote-peer CTA. The SGLang adapter enables it by default through
 `EP_XPRESS_COMBINE_WARP_SPECIALIZATION=1`. The CTA grid, active channel count,
 frame capacity and fused decode mailbox kernel are unchanged.
 
@@ -391,7 +391,7 @@ dispatch's all-peer terminal handshake. Double slots and multiple active channel
 provide buffering and parallel progress; they do not establish overlap with
 expert GEMM or arbitrary cross-layer concurrency. Dispatch interleaves sends
 and receives within each channel CTA. Prepared pair-queue combine can assign
-independent Tx/Rx warp groups within each pair CTA; the core default retains
+independent Tx/Rx warp groups within each remote-peer CTA; the core default retains
 the sequential loop. Neither configuration uses dedicated sender/receiver
 blocks or pipelines expert computation. The owner-list path
 removes combine's repeated inverse scans, but still performs per-frame

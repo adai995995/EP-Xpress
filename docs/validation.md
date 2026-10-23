@@ -2,8 +2,9 @@
 
 ## Independent Tx/Rx warp groups for pair combine
 
-The prepared pair-combine option gives each 256-thread CTA four sending and
-four receiving warps, with separate shared metadata and group barriers. The
+The prepared pair-combine option gives each remote-peer 256-thread CTA four
+sending and four receiving warps, with separate shared metadata and group
+barriers. Local copies retain the whole CTA. The
 frame ABI, CTA grid, final reduction and decode mailbox implementation are
 unchanged. The CUDA extension compiles successfully; all eight validation
 devices report a safe cooperative capacity of 32 channels at world size eight.
@@ -20,8 +21,20 @@ diagnostics-disabled setting.
 
 Python syntax, three focused local Config/adapter cases, and whitespace checks
 pass. The broader native suite was not repeated. Legacy phase counters are
-explicitly unavailable for the new concurrent kernel; disabling the option
-profiles the old sequential kernel, not the new execution.
+explicitly unavailable for the new concurrent kernel; disabling this option
+and decode fusion profiles the old sequential kernel, not the new execution.
+
+Runtime `3f5f644` also completes full-model SGLang inference at batches 1 and
+32 against a fresh default-NCCL baseline, with three measured repetitions per
+shape. Four-row frames, 32 allocated channels and the fused decode path are
+retained. Source, inputs, settings and host-only transport checks pass; all
+eight ranks report 32 effective channels and zero NVLink payload increments.
+All four short output checks match text and 29 token IDs. See the
+[warp experiment](model-performance.md#independent-send-and-receive-warp-experiment)
+for timings, first-token variability and numerical/attribution limits. A second
+full-model run changes only the warp switch to off; it passes the same checks
+and matches the enabled run's short sanity outputs and compared log
+probabilities exactly. No additional functional suite was run for that ablation.
 
 ## Decode workspace and fused mailbox combine
 

@@ -103,7 +103,7 @@ and general combine frame sizing/execution:
 | --- | --- | --- |
 | `EP_XPRESS_DECODE_WORKSPACE` | `1` | Cache communication tensors for eligible decode operations; `0` uses independent tensors per call. |
 | `EP_XPRESS_FUSED_DECODE` | `1` | Use mailbox receive/reduce fusion for eligible decode; `0` retains pair queues. |
-| `EP_XPRESS_COMBINE_WARP_SPECIALIZATION` | `1` | Give prepared non-fused combine four Tx warps and four Rx warps per CTA; `0` retains the sequential pair-queue kernel. |
+| `EP_XPRESS_COMBINE_WARP_SPECIALIZATION` | `1` | Give prepared non-fused combine four Tx warps and four Rx warps per remote-peer CTA; `0` retains the sequential pair-queue kernel. |
 | `EP_XPRESS_DECODE_MAX_TOKENS` | `64` | Reserve this many mailbox token slots per source rank and use it as the adapter's global-capacity eligibility bound. `0` disables both small-decode selections. |
 | `EP_XPRESS_COMBINE_FRAME_ROWS` | `0` | Fix rows per pair-queue frame independently of allocated channels. `0` restores the original split of the chunk budget across channels and peers. |
 
@@ -126,7 +126,8 @@ queue operations; they do not size the per-token decode mailboxes.
 Warp specialization applies to prepared non-fused combine, including prefill,
 while eligible decode keeps its fused mailbox path. It preserves 256 threads
 per CTA, the existing grid and channel policy, and the configured frame size.
-The Tx and Rx groups use independent shared metadata and 128-thread barriers.
+Local copies retain the whole CTA. The Tx and Rx groups use independent shared
+metadata and 128-thread barriers.
 Tx publishes READY after every writer fences; Rx publishes ACK after every
 reader finishes. Tx credit waits therefore leave Rx free to drain incoming
 frames. Both groups complete before the CTA exits. This is communication

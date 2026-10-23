@@ -4,8 +4,8 @@ These experiments run the complete Qwen3-30B-A3B-Instruct-2507 model through
 SGLang v0.5.21. They are distinct from the synthetic expert function in the
 standalone transport replay.
 
-The latest workspace, fused decode and independent-frame results are in
-[Decode workspace and fused receive experiment](#decode-workspace-and-fused-receive-experiment).
+The latest results are in
+[Independent send and receive warp experiment](#independent-send-and-receive-warp-experiment).
 Earlier sections describe earlier runtime revisions and their measurements.
 
 ## Matched configuration
@@ -862,3 +862,100 @@ all requested repetitions without reported runtime errors. No phase profiling
 or independent workspace-versus-fusion ablation was collected. These results
 support the combined changes on the tested host-only eager workload, not a
 claim of maximum PCIe utilization or performance on consumer GPUs.
+
+
+## Independent send and receive warp experiment
+
+Runtime `3f5f644` changes prepared prefill pair-combine execution. Each remote-peer
+256-thread CTA uses four warps for sending and four for receiving, with separate
+shared metadata and 128-thread named barriers. Local copies retain the whole CTA.
+Each group can progress its own direction while the other waits for pair-local
+READY or ACK. Publication fences,
+slot credits, terminal handshakes and the final CTA join remain necessary. This
+is concurrent progress within the kernel, not a measurement of PCIe full-duplex
+bandwidth or overlap with expert computation.
+
+The experiment retains four-row combine frames, 32 allocated channels, two
+slots and the 4-MiB dispatch chunk budget. All eight ranks negotiate 32 channels;
+adaptive channel selection is unchanged. The decode workspace cache and fused
+mailbox combine remain enabled with capacity 64; the new option does not replace
+the decode kernel or change its reduction order. Prefill retains the existing
+remote scratch and final reduction kernels.
+
+A fresh default-NCCL baseline and EP-Xpress use the same complete model, eight
+GPUs, BF16, TP/DP/EP8, Triton experts and eager execution described above. Both
+disable GPU peer transport and NVLink-dependent paths. Each shape uses 512 input
+and 32 output tokens, eight 16-token warmup batches and three timed repetitions.
+No profiler is active. The candidate explicitly sets
+`EP_XPRESS_COMBINE_WARP_SPECIALIZATION=1` and `EP_XPRESS_COMBINE_FRAME_ROWS=4`.
+
+### Full-model comparison
+
+Times are milliseconds. Brackets show the observed three-repeat range.
+Steady-window TPOT uses the interval from the last request's first token to
+the first request finishing: batch size times elapsed time, divided by observed
+token progress in that interval. It is distinct from the mean per-request TPOT
+used in the preceding section.
+
+| Backend | Concurrent requests | Completion median [min, max] | Change vs NCCL | Last TTFT | Steady-window TPOT |
+|---|---:|---:|---:|---:|---:|
+| Default NCCL | 1 | 3086.775 [3060.693, 3098.547] | — | 191.741 | 93.383 |
+| EP-Xpress, separate Tx/Rx warps | 1 | 2847.997 [2843.384, 2862.120] | -7.74% | 184.891 | 85.903 |
+| Default NCCL | 32 | 3399.117 [3367.655, 3404.603] | — | 560.912 | 91.176 |
+| EP-Xpress, separate Tx/Rx warps | 32 | 3503.642 [3323.057, 3573.695] | +3.08% | 728.857 | 89.096 |
+
+Single-request completion is lower than default NCCL. At batch 32 the decode
+window is 2.28% shorter per token, but the longer first-token window offsets this
+gain and the median completion is slower. These differences compare the whole
+EP-Xpress implementation with NCCL; they are not the incremental benefit of
+splitting sending and receiving warps. Decode keeps the previously fused path.
+
+The batch-32 candidate's last TTFT values are 573.303, 728.857 and 822.177 ms.
+Logs show different nonempty prefill distributions across ranks: some ranks
+accept all four requests together, while others split them as 1+3. The number
+of split ranks does not monotonically track TTFT. HTTP first-token timing
+includes arrival, scheduling and split prefills, so these three repetitions do
+not isolate kernel overlap, link utilization or the cause of the variation.
+
+Source hashes, configuration, hardware and matching-input checks pass without
+warnings or errors. NCCL logs show SHM only: 120 records for the baseline and
+60 for the candidate's remaining framework collectives, with zero P2P, NET or
+NVLS records. Hardware NVLink payload increments are zero on all eight GPUs;
+EP payloads use mapped host memory. All four short sanity prompts match text
+and all 29 token IDs; maximum common-prefix log-probability difference is
+0.218722. The separate focused CUDA checks match legacy combine outputs and
+remote scratch bit for bit, including repeated slot reuse. These are bounded
+correctness checks, not proof of equivalence for every full-model input.
+
+### Same-source warp-switch ablation
+
+A subsequent EP-only run keeps runtime `3f5f644`, its source manifest and every
+workload setting, changing only `EP_XPRESS_COMBINE_WARP_SPECIALIZATION` from
+`1` to `0`. It retains four-row frames, channel selection, workspace reuse and
+fused decode. The performance baseline remains the fresh default-NCCL run
+above; this switch comparison examines the new prefill execution choice.
+
+| Pair-combine execution | Concurrent requests | Completion median [min, max] | Last TTFT | Steady-window TPOT | Mean per-request TPOT |
+|---|---:|---:|---:|---:|---:|
+| Sequential, switch off | 1 | 2850.161 [2807.027, 2888.896] | 184.505 | 85.985 | 85.985 |
+| Separate Tx/Rx warps, switch on | 1 | 2847.997 [2843.384, 2862.120] | 184.891 | 85.903 | 85.903 |
+| Sequential, switch off | 32 | 3596.668 [3571.360, 3623.921] | 827.313 | 89.815 | 92.016 |
+| Separate Tx/Rx warps, switch on | 32 | 3503.642 [3323.057, 3573.695] | 728.857 | 89.096 | 89.865 |
+
+The single-request medians differ by only 0.08%, with overlapping ranges;
+this experiment shows no material additional single-request benefit from the
+warp split. The batch-32 median is 2.59% lower with the split, but first-token
+timing and prefill partitions vary between these sequentially run experiments.
+Decode uses the same fused kernel in both, so its small timing differences are
+not evidence of a decode implementation improvement. These measurements do not
+establish a stable incremental warp-split speedup. In particular, the enabled
+candidate remains 3.08% slower than default NCCL at batch 32 in the paired run.
+
+The switch-off run also passes configuration, matching-input, source and
+host-only transport checks. All ranks retain 32 channels and NVLink counters
+remain unchanged. Its four short sanity outputs match the switch-on run's
+text, all 29 token IDs and compared log probabilities exactly. No additional
+functional suite or kernel-phase profiling was run for this environment-only
+ablation. Both EP runs finish all requested repetitions without reported
+runtime errors; the adapter keeps the new path enabled, with the explicit
+switch available for further comparisons.
