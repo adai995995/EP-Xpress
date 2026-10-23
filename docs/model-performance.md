@@ -4,8 +4,8 @@ These experiments run the complete Qwen3-30B-A3B-Instruct-2507 model through
 SGLang v0.5.21. They are distinct from the synthetic expert function in the
 standalone transport replay.
 
-The latest results are in
-[Producer-local host-arena allocation](#producer-local-host-arena-allocation).
+The latest investigation is in
+[NUMA regression investigation](#numa-regression-investigation).
 Earlier sections describe earlier runtime revisions and their measurements.
 
 ## Matched configuration
@@ -1161,8 +1161,9 @@ observed before all requests receive their first token, not in the steady
 decode window. TTFT includes scheduling, so it is not pure prefill kernel time.
 
 The previous all-node-0 EP run completes in 2846.474 ms at batch 1 and
-3310.950 ms at batch 32. Producer-local placement changes these medians by
--0.86% and +57.74%, respectively. The single-request ranges overlap, so this
+3310.950 ms at batch 32. The later run's medians differ by
+-0.86% and +57.74%, respectively; this is not an isolated causal estimate of
+NUMA placement. The single-request ranges overlap, so this
 does not establish a material incremental single-request benefit. The new
 batch-32 range is entirely slower than the previous EP range, whereas fresh
 NCCL batch-32 completion changes by only +0.28%. The current producer-local
@@ -1182,7 +1183,8 @@ The confirmed change is physical producer-page placement. A plausible next
 question is how it changes cross-node GPU reads, writes and queue progress;
 producer-local allocation only localizes the producer side. This run does not
 separate those costs or establish that remote reads are the cause. No new
-kernel-phase profiling or additional placement experiments were performed.
+kernel-phase profiling or additional placement experiments were performed in
+that run. The follow-up investigation below revisits its interpretation.
 
 Both runs pass matched-input, configuration, source and host-only transport
 checks. All 47 tracked files match the frozen source before and after; the
@@ -1194,3 +1196,189 @@ all eight GPUs have zero NVLink payload increments. Four short output prompts
 match text and all 29 generated token IDs; common-prefix logprob differences
 remain at maximum 0.218722 and mean 0.014670. This is a limited sanity check,
 not full-model numerical equivalence. Experiment containers exit after the run.
+
+## NUMA regression investigation
+
+The preceding 57.74% batch-32 difference does not by itself establish a NUMA
+transport regression. A follow-up profiles both exact allocator revisions:
+`3e9f1d4` with all arenas on node 0, and `620fe82` with producer-local arenas.
+Both include the same tiled expert-alignment kernels. Their only runtime
+source difference is host-arena allocation; the older pre-alignment revision
+is not used as the control.
+
+The comparison retains the same eight GPUs, SGLang patch, model, BF16 precision,
+eager execution, four-row frames, 32 allocated channels, adaptive channels,
+prefill Tx/Rx warp separation and fused decode. Each service receives eight
+16-token warmup batches, followed by the same 32 concurrent 512-token requests
+with eight diagnostic output tokens. CPU and GPU tracing is enabled only for
+the diagnostic requests. Physical-page checks confirm all 155.53125 MiB on
+node 0 for the control and 77.765625 MiB on each node for producer allocation,
+with all 192 mapping views agreeing. Both runs pass source and host-only
+transport checks, including zero NVLink payload increments.
+The producer run additionally inspects compiler-cache filenames, modification
+times and small metadata files outside the request's Python execution path;
+this observer is not present in the initial all-node-0 run.
+
+### Long gaps also occur with the all-node-0 allocator
+
+Both runs execute two prefill forwards. The trace shows long gaps before the
+first use of the tiled alignment kernels in each forward. These gaps are
+not accounted for by the recorded local dispatch/combine kernel intervals.
+Their host or dependency cause is not identified by GPU gaps alone.
+
+| Diagnostic observation | All node 0 | Producer-local |
+|---|---:|---:|
+| Client last TTFT, ms | 2578.558 | 2514.051 |
+| First scatter's preceding GPU gap, across ranks/forwards, ms | 726.792–758.054 | 738.375–748.150 |
+
+These are profiled diagnostic timings, not replacement end-to-end performance
+results. Both diagnostic runs contain long gaps. The earlier large latency
+difference is not reflected in a comparable increase of recorded prefill
+communication-kernel durations in this comparison.
+
+The submitted input IDs match, but scheduler partitions differ. Only some
+rank-local prefill shapes overlap, and even those do not establish identical
+peer workloads or expert routing. Dispatch/combine durations include queue
+waiting and synchronization; they are not measurements of raw PCIe read/write
+latency. This trace therefore cannot establish a small residual NUMA benefit
+or penalty, nor separate payload transfer from polling inside those kernels.
+
+### Dynamic capacities and compilation coverage
+
+The large alignment path specializes all three kernels on `CAP`, with the
+prefix and scatter kernels also specializing on `TILES`. The adapter obtains
+its receive capacity from the scheduler's global token bound. Equal submitted
+requests can have different capacities when they arrive in different prefill
+groups. For example, the initial diagnostic runs split the 32 requests into
+15 plus 17 globally in the all-node-0 run, and 20 plus 12 in the producer run.
+The same model and request count therefore do not imply the same compiled
+specializations.
+
+The private runner starts each service with a fresh, per-worker Triton cache
+in tmpfs. Eight warmup batches cover the shapes actually encountered, not all
+possible later partitions. Kernel GPU execution time excludes CPU compilation;
+the earlier alignment percentage was measured on the pre-change implementation
+and cannot establish the first-use cost of the new tiled kernels.
+
+To distinguish backend compilation from disk-cache lookup and CUDA module
+loading, a second diagnostic uses Triton's compilation listener, CPU trace
+ranges, JIT cache-miss records and first-module-load records. It retains the
+actual prefill warp-specialized transport and records no per-launch data on the
+JIT cache-hit path. Events stay in memory until profiler stop. Three separate
+profile windows submit identical input IDs to the same service, flushing KV
+state between windows while retaining compiled kernels. Nested JIT-miss,
+compile and module-load durations are reported separately, never added together
+or summed across ranks as request latency.
+
+The all-node-0 service alone reproduces the latency jump:
+
+| Profile window | New alignment capacities | Backend compilations per worker | Backend compile interval union per worker, ms | Client last TTFT, ms |
+|---|---|---:|---:|---:|
+| 0 | None; all calls hit the in-memory cache | 0 | 0 | 555.030 |
+| 1 | 5120, 11264 | 6 | 2009.439–2031.682 | 2596.276 |
+| 2 | 2560, 13824 | 6 | 1989.777–2019.806 | 2610.269 |
+
+All three windows use identical submitted input IDs and retain the same
+all-node-0 page placement. Each cold window compiles three alignment kernels
+for two previously unseen capacities on each of eight workers. These are
+actual backend compilations according to Triton's `cache_hit=False` listener,
+not merely module loads or disk-cache reads. The first window records no JIT
+misses, backend compilations or first-module loads. All eight workers report
+complete probe installation and no dropped events.
+
+The CPU markers directly account for the long GPU gaps. For rank 0 in window
+1's first prefill, the scatter gap is 737.977 ms, of which 737.327 ms overlaps
+its backend compile range on the same process timeline. Prefix and histogram
+gaps are 167.952 and 49.866 ms, with 167.328 and 49.512 ms covered by their
+backend compilation. The second prefill's scatter gap is 758.777 ms, with
+758.102 ms covered. In the no-compilation window, this rank's two prefill GPU
+windows are 193.244 and 245.497 ms; their largest observed gaps are only 1.881
+and 1.257 ms. Workload partitions still differ, so these examples identify
+the source of the long gaps rather than an isolated transport speedup.
+
+About two seconds of per-worker CPU compilation accompany the two-second TTFT
+jump with no allocator change. The runtime's exact-capacity specialization is
+a real first-use serving cost, and the benchmark's warmup did not isolate it
+from placement effects. This evidence makes attribution of the earlier
+57.74% difference to NUMA alone unsupported. The historical unprofiled runs lack compilation
+markers, so their precise per-request compilation cost cannot be reconstructed.
+
+### Producer-local replication and remaining limits
+
+The producer-local service repeats the same three-window diagnostic with the
+same private probe and runner. All eight workers again report complete capture
+with no dropped events. It also exhibits both a fully cached path and a new
+capacity compilation path:
+
+| Allocation | Profile window | New backend compilations per worker | Client last TTFT, ms |
+|---|---:|---:|---:|
+| All node 0 | 0 | 0 | 555.030 |
+| All node 0 | 1 | 6 | 2596.276 |
+| All node 0 | 2 | 6 | 2610.269 |
+| Producer-local | 0 | 0 | 501.368 |
+| Producer-local | 1 | 6 | 2544.629 |
+| Producer-local | 2 | 0 | 502.948 |
+
+Producer window 1 introduces capacities 5632 and 10752. Backend compilation
+occupies 2017.721–2033.669 ms per worker; first module/launcher initialization
+occupies only 1.667–5.404 ms per worker. The latter is not the seconds-scale
+cause. Both cached producer windows record no JIT misses or first-module loads.
+
+Both allocations have approximately half-second TTFT with no compilation and
+approximately 2.5-second TTFT when the request introduces two new alignment
+capacities. The producer-local cached windows do not reproduce the earlier
+large latency regression. Different scheduler partitions, limited samples and
+profiler overhead prevent interpreting their smaller numerical difference as
+a measured NUMA speedup. These are eight-output-token diagnostic requests,
+not new unprofiled 32-output-token performance results or a fresh NCCL benchmark.
+
+Window 0 provides a closer warmed comparison: both versions have the same
+input hash, per-request DP-rank assignment and per-rank local prefill token
+counts. Distinct histogram grid sizes uniquely identify the two prefill groups
+on each rank. Their explicit token counts sum to global capacities 7168 and
+9216, with matching previously compiled capacities on all eight workers. This
+grouping does not rely on aligning different GPUs' clocks or assuming their
+forward ordinals identify the same work.
+
+The following values first accumulate the two prefill forwards on each rank,
+then report the median and observed range over the eight ranks, in milliseconds:
+
+| Warmed window-0 metric | All node 0 | Producer-local |
+|---|---:|---:|
+| GPU forward windows | 439.167 [438.741, 439.494] | 385.729 [385.333, 385.944] |
+| Dispatch kernel intervals | 171.931 [168.874, 187.628] | 163.830 [161.908, 176.763] |
+| Combine kernel intervals | 199.289 [195.904, 206.240] | 154.879 [152.922, 160.340] |
+| Observed GPU gaps | 15.867 [10.545, 16.462] | 14.145 [10.317, 16.514] |
+
+Combine intervals are shorter on every rank in this diagnostic sample; the
+large regression does not persist after controlling compilation and these
+scheduler shapes. This remains one profiled pair across separate service
+launches. Actual expert receive counts, complete routing and CPU load are not
+matched observations. It establishes neither a stable unprofiled speedup nor
+a PCIe bandwidth improvement. Independent component medians need not sum to
+the forward median, and other model operations are omitted from the table.
+Producer window 2 has different capacities and is not folded into this pair.
+
+The follow-up isolates a dominant CPU compilation cost. It does not separately
+measure the remaining cross-NUMA payload reads, writes, READY polling or ACK
+costs inside the communication kernels. Peer progress dependencies can propagate
+a worker's late kernel submission; longer communication intervals alone would
+not identify slower PCIe access. Physical page placement remains verified in
+both versions, but that observation does not establish its transport cost.
+
+No library kernel or allocator is changed during this investigation. The next
+implementation priority is to make exact `CAP`/`TILES` runtime scalars, prevent
+unnecessary scalar specialization, and precompile the finite geometry buckets
+that still require static tensor shapes. Actual tensor bounds and padding
+sentinels must remain tied to actual capacity. Merely rounding the kernel's
+capacity upward without allocating matching storage would violate the bounds
+contract. Subsequent NUMA comparisons should record cache-miss coverage and
+compare warmed execution before drawing conclusions about placement.
+
+All four diagnostic runs preserve their frozen source manifests and the pinned
+SGLang patch; the compiler-marked pair also matches private probe source hashes.
+The final two runs retain verified host-only NCCL transport and zero NVLink
+payload increments. Their before/after physical-page checks agree. Diagnostic
+containers are removed after trace collection, and the current producer-local
+runtime is restored. Raw traces and deployment details remain outside this
+repository.

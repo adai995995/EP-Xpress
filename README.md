@@ -127,9 +127,10 @@ from rank numbers or change process affinity. All producers finish allocation
 before any peer registers the shared pages. This initialization collective adds
 no synchronization to dispatch or combine. Verify physical placement with
 `/proc/<pid>/numa_maps`; CPU affinity alone is not proof of page placement.
-Producer-local placement is not a general speedup: the current full-model
-experiment regresses at batch 32; see the
-[measured placement results](docs/model-performance.md#producer-local-host-arena-allocation).
+Producer-local placement is not an established general speedup. A batch-32
+regression prompted a follow-up investigation of NUMA placement, dynamic
+prefill batches and first-use kernel compilation; see the
+[profiling investigation](docs/model-performance.md#numa-regression-investigation).
 
 For sequential, fixed-shape decode, the SM context also supports explicit
 workspace reuse and receive/reduce fusion:
