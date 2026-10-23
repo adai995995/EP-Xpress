@@ -15,9 +15,16 @@
   bypass the checks to publish sensitive information, including deleted content
   still present in history. Keep organization-specific deny patterns outside
   the repository and supply them through `EP_XPRESS_PRIVATE_PATTERNS_FILE`.
-- Test changed contracts and failure paths. For CUDA transport changes, run
-  native tests and distributed replay with multiple chunks, empty ranks, and
-  slot reuse. Synthetic replay timing is not model inference performance.
+- Prioritize full-model SGLang end-to-end performance measurements. For tuning
+  within an already validated execution path, proceed directly to the model
+  comparison rather than rerunning broad native or distributed functional suites.
+  Use only focused checks when a change creates a concrete correctness or hang
+  risk, especially routing, buffer lifetime, ACK/progress protocols, or interfaces.
+  Expand testing only when failures or unresolved concerns justify it. Synthetic
+  replay timing is not model inference performance.
+- The performance baseline is SGLang's default NCCL backend. Unless explicitly
+  requested otherwise, disable NVLink and GPU P2P for both candidates and baseline;
+  keep the GPU configuration and workload identical.
 - Keep comparisons on the same GPU configuration, dtype, routing trace, expert
   kernel, and Graph mode. Clearly distinguish tested functionality from planned
   optimization and unverified framework integration.
