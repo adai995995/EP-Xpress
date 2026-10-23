@@ -129,10 +129,14 @@ implementation follows CUDA's mapped-memory access constraints:
 [CUDA memory documentation](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/understanding-memory.html).
 
 Each frame also carries a stable fingerprint of its phase, optional API tag,
-and, for combine, originating dispatch operation. Peers check that identity on
-the GPU, including terminal frames. This detects inconsistent layer tags and
-handle order without a CPU collective. The fingerprint hashes only small API
-metadata; GPU routing IDs and weights are never read back for this check.
+and, for combine, originating dispatch operation. A receiver checks this
+operation identity on the first frame from each peer and channel, including
+when that first frame is an empty operation's terminal. Generation and
+sequence checks still apply to every frame. The identity is constant within
+the operation, so later frames do not repeat the host fingerprint read. This
+detects inconsistent layer tags and handle order without a CPU collective.
+The fingerprint hashes only small API metadata; GPU routing IDs and weights
+are never read back for this check.
 
 The dispatch producer reuses a slot only after all peer ACKs match its
 previous generation. Every peer acknowledges each header, including when its
@@ -185,13 +189,27 @@ shared cross-GPU atomic counter.
 waiting for device routing on the CPU. Input/output tensors and mapped arenas
 remain alive until their transport work completes. GPU status is sticky;
 invalid routes, insufficient receive capacity, or a timeout poison the context.
-`check()` is an explicit synchronizing validation boundary. CPU-readable abort
-words allow later submissions to reject a failure without reading GPU tensors.
+`check()` is an explicit synchronizing validation boundary. Normal submission
+and `wait()` do not scan mapped host error headers. GPU workers poll mapped
+abort headers at entry and periodically, rather than on every loop iteration;
+local GPU status checks and per-frame ready/credit checks remain. This reduces
+health-check traffic while allowing bounded polling delay before a peer abort
+is observed. Bounds checks, publication fences, ACK ordering, and stream
+dependencies still protect payload access and buffer lifetime. CPU-readable
+abort words are inspected at explicit validation or diagnostic boundaries.
+Once a failure is observed, later submissions reject the failed context.
 The SGLang adapter enables `fatal_errors`: a GPU transport error traps after
 publishing the abort flag, so the framework's normal output synchronization
 also catches a failure in its final layer. This requires worker restart. The
 standalone default keeps errors recoverable for inspection, but the failed
 communication context still must be destroyed.
+
+Static CPU configuration is resolved outside repeated layer calls: the
+adapter retains group information, expert placement, and its resolved
+context, while the context caches timeout conversion and native occupancy
+limits. Dynamic tensor shapes, scheduler-provided capacity, operation
+generations, and handle ownership are still checked when each operation is
+submitted. These metadata checks do not read routing tensors back to the CPU.
 
 Remaining limits include dispatch's all-peer header ACK traffic and draining
 each operation's queues before returning. Double slots and multiple channels

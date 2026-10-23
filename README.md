@@ -111,6 +111,14 @@ bound, the context reserves `world_size * max_tokens_per_rank` rows, which can
 be wasteful for decode. An undersized bound is an error, never silent truncation.
 The SGLang adapter obtains its bound from existing scheduler metadata.
 
+Normal submission and `wait()` do not scan host queue error headers. Use
+`check()` at a completed experiment/request boundary to inspect asynchronous
+errors. The GPU amortizes abort-header polling across loop iterations and
+checks operation identity on the first frame from each peer and channel.
+Required ready/credit checks, payload bounds, and slot-lifetime ordering remain
+in the transport. Static adapter group information and the resolved context
+are cached; dynamic input shapes and scheduler capacities are still checked.
+
 The SM backend batches routing and metadata access. `channels` is the number
 of logical work partitions, not a count of reserved SMs. Dispatch launches one
 CUDA block per channel; combine launches one block per `(channel, peer)`,

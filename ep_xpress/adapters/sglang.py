@@ -89,6 +89,7 @@ class HostEPDispatcher(BaseDispatcher):
         )
         self._expert_map = tuple(contiguous_expert_map(moe_runner_config.num_experts, size))
         self._context_key = (self._group, self._device, self._config, self._expert_map)
+        self._resolved_context = None
         self._layer_id = moe_runner_config.layer_id
         self._sequence = 0
         self._tickets = deque()
@@ -97,6 +98,8 @@ class HostEPDispatcher(BaseDispatcher):
     def _context(self):
         # Lazy creation avoids allocating CUDA resources during weight setup.
         # All EP ranks execute the same layer sequence in the supported path.
+        if self._resolved_context is not None:
+            return self._resolved_context
         if self._context_key not in _contexts:
             _contexts[self._context_key] = Context(
                 group=self._group,
@@ -110,13 +113,14 @@ class HostEPDispatcher(BaseDispatcher):
                     self._config.channels,
                     _contexts[self._context_key].effective_channels,
                 )
-        return _contexts[self._context_key]
+        self._resolved_context = _contexts[self._context_key]
+        return self._resolved_context
 
     def _check_eager(self):
         if self._failed:
             raise RuntimeError("EP-Xpress dispatcher failed; restart the worker group")
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("EP-Xpress currently requires eager execution")
+        # The transport validates capture before enqueueing. Avoid repeating
+        # the same CUDA query here on every dispatch and combine.
 
     def dispatch(self, hidden_states, topk_output):
         self._check_eager()

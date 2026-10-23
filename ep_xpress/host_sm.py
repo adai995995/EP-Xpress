@@ -116,7 +116,10 @@ class _DevicePending(Pending):
     def wait(self, stream=None, timeout=None):
         if timeout is not None:
             raise ValueError("host_sm wait is nonblocking; use Context.check_errors for a host fence")
-        self._context._check_aborted()
+        # Submission and wait stay free of host queue-header polling. Observe
+        # asynchronous transport errors at the explicit check_errors boundary.
+        if self._context._failure is not None:
+            raise RuntimeError("EP context is in a failed state") from self._context._failure
         with torch.cuda.device(self._device):
             consumer = stream or torch.cuda.current_stream(self._device)
             if consumer.device != self._device:
@@ -164,6 +167,7 @@ class HostSMContext(Context):
         if not 1 <= self.world_size <= 63:
             raise ValueError("supported EP group size is 1 through 63")
         self.config = config
+        self._timeout_ms = max(1, math.ceil(config.timeout_seconds * 1000))
         self.expert_to_rank = tuple(expert_to_rank)
         if not self.expert_to_rank or any(isinstance(r, bool) or not isinstance(r, int) or
                                          r < 0 or r >= self.world_size for r in self.expert_to_rank):
@@ -325,8 +329,8 @@ class HostSMContext(Context):
         """Wait for enqueued work and reject a sticky GPU error.
 
         This explicit host fence belongs at a validation/request boundary, not
-        between MoE layers. Submission also polls published host abort words
-        without synchronizing CUDA, so a failed context cannot be reused.
+        between MoE layers. Host queue headers are inspected only at explicit
+        validation/diagnostic boundaries, never on normal submission or wait.
         """
         with self._lock:
             if self._closed:
@@ -481,7 +485,8 @@ class HostSMContext(Context):
     def _begin(self, phase, stream):
         if self._closed:
             raise RuntimeError("Context is closed")
-        self._check_aborted()
+        if self._failure is not None:
+            raise RuntimeError("EP context is in a failed state") from self._failure
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("host_sm eager backend cannot be captured in a CUDA Graph")
         if self._unwaited >= self.config.max_pending_operations:
@@ -548,7 +553,7 @@ class HostSMContext(Context):
                     native.host_sm_dispatch(
                         x, ids, weights, self._expert_rank, self._expert_local, self._pointers["dispatch"],
                         self.rank, epoch, self.config.slots, self._channel_chunk_rows,
-                        max(1, math.ceil(self.config.timeout_seconds * 1000)),
+                        self._timeout_ms,
                         hidden, local_ids, weights_out, inverse, count, self._status, identity=identity,
                         channels=self.effective_channels)
                     handle = RouteHandle(self._id, self._counter, _DeviceRoute(inverse, count),
@@ -587,7 +592,7 @@ class HostSMContext(Context):
                     native.host_sm_combine(
                         partial, handle._plan.inverse, handle._plan.count, self._pointers["combine"],
                         self.rank, epoch, self.config.slots, self._combine_chunk_rows,
-                        max(1, math.ceil(self.config.timeout_seconds * 1000)), output, remote, self._status,
+                        self._timeout_ms, output, remote, self._status,
                         identity=identity, channels=self.effective_channels, profile=profile)
                     if profile_record is not None:
                         profile_record["submitted"] = True
