@@ -112,7 +112,7 @@
  
 --- a/python/sglang/srt/layers/moe/moe_runner/triton.py
 +++ b/python/sglang/srt/layers/moe/moe_runner/triton.py
-@@ -180,6 +180,16 @@
+@@ -180,6 +180,21 @@
          return MoeRunnerBackend.TRITON
  
  
@@ -123,9 +123,272 @@
 +    # A rank with no received tokens must still execute the matching combine.
 +    if dispatch_output.hidden_states.shape[0] == 0:
 +        return StandardCombineInput(hidden_states=dispatch_output.hidden_states)
++    if getattr(dispatch_output, "valid_count", None) is not None:
++        from ep_xpress.adapters.sglang_valid import fused_experts_valid_count
++
++        output = fused_experts_valid_count(dispatch_output, quant_info, runner_config)
++        return StandardCombineInput(hidden_states=output)
 +    return fused_experts_none_to_triton(dispatch_output, quant_info, runner_config)
 +
 +
  @register_fused_func("none", "triton")
  def fused_experts_none_to_triton(
      dispatch_output: StandardDispatchOutput,
+--- a/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py
++++ b/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py
+@@ -417,6 +417,7 @@
+     use_int4_w4a16: bool,
+     per_channel_quant: bool,
+     block_shape: Optional[List[int]],
++    valid_count: Optional[torch.Tensor] = None,
+ ):
+     """Resolve config, down_config, TMA flag, and aligned expert routing ids.
+ 
+@@ -468,9 +469,20 @@
+             "Down MoE TMA is enabled (USE_TMA=true in the down-projection config)."
+         )
+ 
+-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+-        topk_ids, config["BLOCK_SIZE_M"], E
+-    )
++    if valid_count is None:
++        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
++            topk_ids, config["BLOCK_SIZE_M"], E
++        )
++    else:
++        from ep_xpress.adapters.sglang_valid import align_valid_routes
++
++        # The count stays on device. The adapter uses ordinary route-major
++        # BF16 GEMMs and retains the same tuned GEMM configuration.
++        if up_moe_use_tma or down_moe_use_tma:
++            raise ValueError("EP-Xpress valid-count runner does not support TMA")
++        sorted_token_ids, expert_ids, num_tokens_post_padded = align_valid_routes(
++            topk_ids, valid_count, config["BLOCK_SIZE_M"], E
++        )
+ 
+     return (
+         config,
+@@ -525,6 +537,7 @@
+     gate_up_interleaved: bool = True,
+     a1_q: Optional[torch.Tensor] = None,
+     fuse_swiglu_interleaved: bool = False,
++    valid_count: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
+ 
+@@ -671,7 +684,14 @@
+         )
+ 
+     # Activation function with multiplication
+-    if fuse_swiglu_interleaved:
++    if valid_count is not None:
++        from sglang.kernels.ops.activation.activation import silu_and_mul_valid_count
++
++        silu_and_mul_valid_count(
++            intermediate_cache1.view(-1, N), intermediate_cache2,
++            topk_ids.view(-1), valid_count, topk,
++        )
++    elif fuse_swiglu_interleaved:
+         # silu(gate) * up was already applied by the up-GEMM epilogue.
+         pass
+     elif activation == "silu_rounded" and is_gated:
+@@ -837,7 +857,7 @@
+     # hooks.after_down can inspect/modify it before reduction. Non-unit routed
+     # scaling also needs the intermediate because the reduction applies it.
+     _use_intermediate = not no_combine and (
+-        topk != 1 or hooks or routed_scaling_factor not in (None, 1.0)
++        valid_count is not None or topk != 1 or hooks or routed_scaling_factor not in (None, 1.0)
+     )
+ 
+     out_slice = None
+@@ -893,7 +913,19 @@
+     if routed_scaling_factor is None:
+         routed_scaling_factor = 1.0
+ 
+-    if no_combine:
++    if valid_count is not None:
++        from ep_xpress.adapters.sglang_valid import sum_valid_routes
++
++        # Alignment omits nonlocal routes entirely; reduction must skip those
++        # slots instead of reading their uninitialized intermediate values.
++        sum_valid_routes(
++            intermediate_cache3, out_hidden_states, topk_ids, valid_count,
++            routed_scaling_factor,
++            round_before_scale=(
++                _use_moe_sum_reduce_torch_compile(num_tokens) and not is_arch_support_pdl()
++            ),
++        )
++    elif no_combine:
+         pass
+     elif _is_cuda or _is_musa:
+         if use_fused_moe_sum_all_reduce:
+@@ -1012,6 +1044,7 @@
+     gate_up_interleaved: bool = True,
+     a1_q: Optional[torch.Tensor] = None,
+     fuse_swiglu_interleaved: bool = False,
++    valid_count: Optional[torch.Tensor] = None,
+ ):
+     padded_size = padding_size
+     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
+@@ -1049,6 +1082,7 @@
+         use_int4_w4a16=use_int4_w4a16,
+         per_channel_quant=per_channel_quant,
+         block_shape=block_shape,
++        valid_count=valid_count,
+     )
+ 
+     return _fused_moe_kernel_sequence(
+@@ -1092,6 +1126,7 @@
+         gate_up_interleaved=gate_up_interleaved,
+         a1_q=a1_q,
+         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
++        valid_count=valid_count,
+     )
+ 
+ 
+--- a/python/sglang/kernels/ops/activation/activation.py
++++ b/python/sglang/kernels/ops/activation/activation.py
+@@ -43,6 +43,10 @@
+                 f"ActivationKernel<{args}>::run_activation_filtered",
+             ),
+             (
++                "run_activation_filtered_count",
++                f"ActivationKernel<{args}>::run_activation_filtered_count",
++            ),
++            (
+                 "run_unary_activation",
+                 f"ActivationKernel<{args}>::run_unary_activation",
+             ),
+@@ -225,3 +229,10 @@
+     expert_step: int = 1,
+ ) -> torch.Tensor:
+     return run_activation("gelu_tanh", input, out, expert_ids, expert_step)
++
++
++def silu_and_mul_valid_count(input, out, expert_ids, valid_count, topk):
++    """EP-Xpress variant using the original CUDA SiLU arithmetic."""
++    activation_module(input.dtype).run_activation_filtered_count(
++        input, out, expert_ids, valid_count, topk, "silu"
++    )
+--- a/python/sglang/kernels/jit/csrc/elementwise/activation.cuh
++++ b/python/sglang/kernels/jit/csrc/elementwise/activation.cuh
+@@ -53,6 +53,9 @@
+   // for per-token routing and BLOCK_SIZE_M for sorted/TMA routing.
+   const int32_t* __restrict__ expert_ids;
+   uint32_t expert_step;
++  const int32_t* valid_count;
++  const int64_t* valid_expert_ids;
++  uint32_t count_multiplier;
+ };
+ 
+ template <
+@@ -61,7 +64,8 @@
+     bool kUsePDL,
+     bool kFilterExpert,
+     bool kRoundActivation = false,
+-    bool kReuseInput = false>
++    bool kReuseInput = false,
++    bool kValidCount = false>
+ __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams params) {
+   using namespace device;
+   constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
+@@ -71,8 +75,17 @@
+   const auto token_id = tid / num_vecs;
+ 
+   if (token_id >= params.num_tokens) return;
++  if constexpr (kValidCount) {
++    // Count is produced by dispatch on the same stream. Keep the original
++    // activation arithmetic and avoid touching capacity-only rows.
++    if (token_id >= static_cast<uint32_t>(*params.valid_count) * params.count_multiplier) return;
++  }
+   if constexpr (kFilterExpert) {
+-    if (params.expert_ids[token_id / params.expert_step] == -1) return;
++    if constexpr (kValidCount) {
++      if (params.valid_expert_ids[token_id / params.expert_step] == -1) return;
++    } else {
++      if (params.expert_ids[token_id / params.expert_step] == -1) return;
++    }
+   }
+   const auto offset = tid % num_vecs;
+   const auto input_offset = token_id * (num_vecs * 2) + offset;
+@@ -132,21 +145,21 @@
+   using kernel_fn_t = decltype(&act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false>);
+   using unary_kernel_fn_t = decltype(&act_kernel<T, ActivationKind::kReLU2, kUsePDL>);
+ 
+-  template <ActivationKind kAct, bool kFilterExpert, bool kRoundActivation = false, bool kReuseInput = false>
++  template <ActivationKind kAct, bool kFilterExpert, bool kRoundActivation = false, bool kReuseInput = false, bool kValidCount = false>
+   static constexpr kernel_fn_t activation_kernel =
+-      act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert, kRoundActivation, kReuseInput>;
++      act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert, kRoundActivation, kReuseInput, kValidCount>;
+ 
+   static_assert(device::kMaxVecBytes % sizeof(T) == 0, "unsupported data type");
+ 
+-  template <bool kFilterExpert, bool kRoundActivation = false, bool kReuseInput = false>
++  template <bool kFilterExpert, bool kRoundActivation = false, bool kReuseInput = false, bool kValidCount = false>
+   static kernel_fn_t select_kernel(const std::string& type) {
+     using namespace host;
+     if (type == "silu") {
+-      return activation_kernel<ActivationKind::kSiLU, kFilterExpert, kRoundActivation, kReuseInput>;
++      return activation_kernel<ActivationKind::kSiLU, kFilterExpert, kRoundActivation, kReuseInput, kValidCount>;
+     } else if (type == "gelu") {
+-      return activation_kernel<ActivationKind::kGELU, kFilterExpert, kRoundActivation, kReuseInput>;
++      return activation_kernel<ActivationKind::kGELU, kFilterExpert, kRoundActivation, kReuseInput, kValidCount>;
+     } else if (type == "gelu_tanh") {
+-      return activation_kernel<ActivationKind::kGELUTanh, kFilterExpert, kRoundActivation, kReuseInput>;
++      return activation_kernel<ActivationKind::kGELUTanh, kFilterExpert, kRoundActivation, kReuseInput, kValidCount>;
+     } else {
+       Panic("unsupported activation type: ", type);
+     }
+@@ -159,7 +172,10 @@
+       const tvm::ffi::TensorView& out,
+       const std::string& type,
+       const int32_t* expert_ids,
+-      uint32_t expert_step) {
++      uint32_t expert_step,
++      const int32_t* valid_count = nullptr,
++      uint32_t count_multiplier = 1,
++      const int64_t* valid_expert_ids = nullptr) {
+     using namespace host;
+ 
+     auto N = SymbolicSize{"num_tokens"};
+@@ -198,10 +214,15 @@
+         .num_tokens = num_tokens,
+         .expert_ids = expert_ids,
+         .expert_step = expert_step,
++        .valid_count = valid_count,
++        .valid_expert_ids = valid_expert_ids,
++        .count_multiplier = count_multiplier,
+     };
+-    if (expert_ids != nullptr) {
++    if (expert_ids != nullptr || valid_expert_ids != nullptr) {
+       RuntimeCheck(expert_step > 0, "expert_step must be positive");
+-      const auto kernel = select_kernel<true, kRoundActivation, kReuseInput>(type);
++      const auto kernel = valid_count != nullptr
++          ? select_kernel<true, kRoundActivation, kReuseInput, true>(type)
++          : select_kernel<true, kRoundActivation, kReuseInput>(type);
+       LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+     } else {
+       const auto kernel = select_kernel<false, kRoundActivation, kReuseInput>(type);
+@@ -233,6 +254,22 @@
+     RuntimeCheck(is_type<int32_t>(expert_ids.dtype()), "expert_ids must have dtype int32");
+     RuntimeCheck(expert_step >= 1, "expert_step must be positive");
+     launch(input, out, type, static_cast<const int32_t*>(expert_ids.data_ptr()), static_cast<uint32_t>(expert_step));
++  }
++
++  static void run_activation_filtered_count(
++      const tvm::ffi::TensorView input,
++      const tvm::ffi::TensorView out,
++      const tvm::ffi::TensorView expert_ids,
++      const tvm::ffi::TensorView valid_count,
++      int64_t topk,
++      std::string type) {
++    using namespace host;
++    RuntimeCheck(is_type<int64_t>(expert_ids.dtype()), "expert ids must be int64");
++    RuntimeCheck(is_type<int32_t>(valid_count.dtype()) && valid_count.numel() == 1, "invalid device count");
++    RuntimeCheck(topk > 0, "topk must be positive");
++    launch(input, out, type, nullptr, 1,
++           static_cast<const int32_t*>(valid_count.data_ptr()), static_cast<uint32_t>(topk),
++           static_cast<const int64_t*>(expert_ids.data_ptr()));
+   }
+ 
+   template <ActivationKind kAct>

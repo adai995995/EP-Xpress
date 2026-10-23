@@ -48,6 +48,11 @@ class RouteHandle:
         """
         return getattr(self._plan, "inverse", None)
 
+    @property
+    def active_channels(self):
+        """Dispatch launch width retained for combine, or None for host_ce."""
+        return getattr(self._plan, "active_channels", None)
+
 
 @dataclass
 class DispatchBatch:
@@ -313,9 +318,12 @@ class Context:
             self._abort(error)
             raise
 
-    def dispatch_async(self, x, topk_ids, topk_weights, tag=None, stream=None, recv_capacity=None):
+    def dispatch_async(self, x, topk_ids, topk_weights, tag=None, stream=None, recv_capacity=None,
+                       active_channels=None):
         if recv_capacity is not None:
             raise ValueError("recv_capacity is only supported by host_sm")
+        if active_channels is not None:
+            raise ValueError("active_channels is only supported by host_sm")
         return self._submit(self._dispatch, (x, topk_ids, topk_weights), stream, tag)
 
     def _dispatch(self, inputs, operation, tag, _handle):

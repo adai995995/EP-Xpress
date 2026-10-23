@@ -94,6 +94,9 @@ class _MappedArena:
 class _DeviceRoute:
     inverse: torch.Tensor
     count: torch.Tensor
+    owner_rows: torch.Tensor
+    owner_counts: torch.Tensor
+    active_channels: int
 
 
 def _operation_identity(phase, tag, dispatch_operation=None):
@@ -106,12 +109,13 @@ def _operation_identity(phase, tag, dispatch_operation=None):
 class _DevicePending(Pending):
     """Enqueued CUDA completion; wait inserts a stream dependency only."""
 
-    def __init__(self, context, value, completed):
+    def __init__(self, context, value, completed, active_channels):
         self._context = context
         self._value = value
         self._completed = completed
         self._device = context.device
         self._waited = False
+        self._active_channels = active_channels
 
     def wait(self, stream=None, timeout=None):
         if timeout is not None:
@@ -127,7 +131,8 @@ class _DevicePending(Pending):
             consumer.wait_event(self._completed)
             if isinstance(self._value, DispatchBatch):
                 tensors = (self._value.hidden, self._value.local_ids, self._value.weights,
-                           self._value.valid_count, self._value.handle.inverse_map)
+                           self._value.valid_count, self._value.handle.inverse_map,
+                           self._value.handle._plan.owner_rows, self._value.handle._plan.owner_counts)
             else:
                 tensors = (self._value,)
             for tensor in tensors:
@@ -146,7 +151,8 @@ class _DevicePending(Pending):
     def metrics(self):
         # Byte counters require device instrumentation. Do not report inferred
         # values as measured PCIe traffic or reuse host_ce progress statistics.
-        return {"transport": "host_sm", "channels": self._context.effective_channels}
+        return {"transport": "host_sm", "channels": self._active_channels,
+                "allocated_channels": self._context.effective_channels}
 
 
 class HostSMContext(Context):
@@ -425,10 +431,14 @@ class HostSMContext(Context):
             "dispatch_operation": handle.operation,
             "tag": copy.deepcopy(tag), "label": self._combine_profile_label,
             "local_tokens": handle.local_token_count,
-            "received_capacity": handle.received_count, "submitted": False,
+            "received_capacity": handle.received_count,
+            "active_channels": handle.active_channels, "submitted": False,
+            "counter_rows": [{"channel": channel, "peer": peer}
+                             for channel in range(handle.active_channels)
+                             for peer in range(self.world_size)],
         }
         session["operations"].append(record)
-        return session["counters"][index], record
+        return session["counters"][index, :handle.active_channels * self.world_size], record
 
     def stop_combine_profile(self):
         """Finish capture and bulk-read GPU counters at a completed boundary.
@@ -437,6 +447,8 @@ class HostSMContext(Context):
         synchronization. No Gloo operation is involved. The report retains raw
         per-(channel, peer) rows in native field order; wait counters overlap phase
         counters, and timings are diagnostic kernel residency, not wire time.
+        Each operation's counter_rows describes its own active grid. Inactive
+        allocated channels are omitted from that operation's raw_counters.
         Fatal CUDA failures may prevent readout and require worker restart.
         """
         with self._lock, torch.cuda.device(self.device):
@@ -455,18 +467,20 @@ class HostSMContext(Context):
                 session["status_readout"].copy_(self._status, non_blocking=True)
             self._work_stream.synchronize()
             result = {
-                "schema_version": 2, "transport": "host_sm", "rank": self.rank,
+                "schema_version": 3, "transport": "host_sm", "rank": self.rank,
                 "world_size": self.world_size, "queue_layout": "rank_pair",
                 "channels": self.effective_channels, "fields": session["fields"],
                 "counter_rows": [{"channel": channel, "peer": peer}
                                  for channel in range(self.effective_channels)
                                  for peer in range(self.world_size)],
+                "row_layout": "raw_counters[i] follows operations[i].counter_rows; top-level rows describe allocation",
                 "max_operations": session["max_operations"], "captured_operations": used,
                 "dropped_operations": session["dropped_operations"],
                 "status": int(session["status_readout"].tolist()[0]),
                 "host_failed": self._failure is not None,
                 "operations": session["operations"],
-                "raw_counters": session["readout"][:used].tolist(),
+                "raw_counters": [session["readout"][index, :operation["active_channels"] * self.world_size].tolist()
+                                 for index, operation in enumerate(session["operations"])],
                 "scope": "combine transport kernels only; excludes initialization and final reduction",
                 "timing": {
                     "unit": "nanoseconds for fields ending in _ns",
@@ -514,11 +528,11 @@ class HostSMContext(Context):
         self._work_stream.wait_stream(producer)
         return self._epochs[phase]
 
-    def _finish(self, value):
+    def _finish(self, value, active_channels):
         completed = torch.cuda.Event()
         completed.record(self._work_stream)
         self._unwaited += 1
-        return _DevicePending(self, value, completed)
+        return _DevicePending(self, value, completed, active_channels)
 
     def _validate_dispatch(self, x, ids, weights):
         # Keep only the public contract and CPU-known allocation bounds here.
@@ -531,13 +545,19 @@ class HostSMContext(Context):
         if x.requires_grad or weights.requires_grad:
             raise ValueError("dispatch accepts inference tensors only")
 
-    def dispatch_async(self, x, topk_ids, topk_weights, tag=None, stream=None, recv_capacity=None):
+    def dispatch_async(self, x, topk_ids, topk_weights, tag=None, stream=None, recv_capacity=None,
+                       active_channels=None):
         """Enqueue routed dispatch without reading routes or counts on the CPU.
 
         recv_capacity is a CPU-known upper bound on received rows, normally the
         sum of scheduler-known input rows across ranks. If omitted, use the
         configured group maximum. A too-small bound poisons the context; it
         never silently drops rows. Output padding has IDs -1 and zero weights.
+
+        active_channels is a CPU-known launch width in [1, effective_channels].
+        All ranks must pass the same width for this dispatch. None uses every
+        allocated channel. The selected width is retained by the handle and
+        reused by combine; queue layout and frame sizes remain unchanged.
         """
         with self._lock, torch.cuda.device(self.device):
             try:
@@ -546,6 +566,10 @@ class HostSMContext(Context):
                 if (isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 0 or
                         capacity > self._max_receive_capacity):
                     raise ValueError("recv_capacity must be an integer within the configured group capacity")
+                channels = self.effective_channels if active_channels is None else active_channels
+                if (isinstance(channels, bool) or not isinstance(channels, int) or
+                        not 1 <= channels <= self.effective_channels):
+                    raise ValueError("active_channels must be an integer within the allocated channel count")
                 identity = _operation_identity("dispatch", tag) if self.config.diagnostics else 0
                 epoch = self._begin("dispatch", stream)
                 for tensor in (x, topk_ids, topk_weights):
@@ -558,11 +582,15 @@ class HostSMContext(Context):
                     weights_out = torch.empty((capacity, self.config.topk), dtype=torch.float32, device=self.device)
                     inverse = torch.empty((capacity, 2), dtype=torch.int64, device=self.device)
                     count = torch.empty(1, dtype=torch.int32, device=self.device)
+                    owner_rows = torch.empty((self.world_size, capacity), dtype=torch.int32, device=self.device)
+                    owner_counts = torch.empty(self.world_size, dtype=torch.int32, device=self.device)
                     self._prepared.dispatch(x, ids, weights, epoch, hidden, local_ids,
-                                            weights_out, inverse, count, identity=identity)
-                    handle = RouteHandle(self._id, self._counter, _DeviceRoute(inverse, count),
+                                            weights_out, inverse, count, owner_rows, owner_counts,
+                                            active_channels=channels, identity=identity)
+                    handle = RouteHandle(self._id, self._counter,
+                                         _DeviceRoute(inverse, count, owner_rows, owner_counts, channels),
                                          x.shape[0], capacity, tag)
-                    return self._finish(DispatchBatch(hidden, local_ids, weights_out, handle, count))
+                    return self._finish(DispatchBatch(hidden, local_ids, weights_out, handle, count), channels)
             except BaseException as error:
                 self._abort(error)
                 raise
@@ -582,7 +610,8 @@ class HostSMContext(Context):
                     raise ValueError("partial must be an inference tensor")
                 identity = _operation_identity("combine", tag, handle.operation) if self.config.diagnostics else 0
                 epoch = self._begin("combine", stream)
-                for tensor in (partial, handle._plan.inverse, handle._plan.count):
+                for tensor in (partial, handle._plan.inverse, handle._plan.count,
+                               handle._plan.owner_rows, handle._plan.owner_counts):
                     tensor.record_stream(self._work_stream)
                 with torch.cuda.stream(self._work_stream), torch.no_grad():
                     output = torch.empty((handle.local_token_count, self.config.hidden_size),
@@ -591,11 +620,13 @@ class HostSMContext(Context):
                                          dtype=torch.bfloat16, device=self.device)
                     profile, profile_record = self._combine_profile_slice(handle, tag, epoch)
                     self._prepared.combine(partial, handle._plan.inverse, handle._plan.count,
-                                           epoch, output, remote, identity=identity, profile=profile)
+                                           handle._plan.owner_rows, handle._plan.owner_counts,
+                                           epoch, output, remote, active_channels=handle.active_channels,
+                                           identity=identity, profile=profile)
                     if profile_record is not None:
                         profile_record["submitted"] = True
                     handle._consumed = True
-                    return self._finish(output)
+                    return self._finish(output, handle.active_channels)
             except BaseException as error:
                 self._abort(error)
                 raise

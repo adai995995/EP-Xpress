@@ -8,6 +8,7 @@ from collections import deque
 from dataclasses import dataclass
 import logging
 import os
+from typing import NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -15,10 +16,12 @@ import torch.distributed as dist
 from ep_xpress import Config, Context
 from ep_xpress.adapters.sglang_config import (
     contiguous_expert_map,
+    select_active_channels,
+    validate_valid_count_runner,
     validate_runner_config,
 )
-from sglang.srt.layers.dp_attention import get_global_dp_buffer_len
-from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+from sglang.srt.layers.dp_attention import get_global_dp_buffer_len, get_is_extend_in_batch
+from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher, DispatchOutputFormat
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
     StandardDispatchOutput,
@@ -40,6 +43,20 @@ def close_contexts():
     for context in list(_contexts.values()):
         context.close()
     _contexts.clear()
+
+
+class HostSMDispatchOutput(NamedTuple):
+    """Standard expert input with a GPU count for the EP-Xpress runner."""
+
+    hidden_states: object
+    hidden_states_scale: object
+    topk_output: object
+    valid_count: object
+    hidden_states_pre_quant: object = None
+
+    @property
+    def format(self):
+        return DispatchOutputFormat.STANDARD
 
 
 @dataclass(frozen=True)
@@ -90,6 +107,19 @@ class HostEPDispatcher(BaseDispatcher):
             fatal_errors=transport == "host_sm",
             diagnostics=diagnostics == "1",
         )
+        adaptive = os.environ.get("EP_XPRESS_ADAPTIVE_CHANNELS", "1")
+        valid_count = os.environ.get("EP_XPRESS_VALID_COUNT", "1")
+        if adaptive not in ("0", "1") or valid_count not in ("0", "1"):
+            raise ValueError("EP_XPRESS_ADAPTIVE_CHANNELS and EP_XPRESS_VALID_COUNT must be 0 or 1")
+        self._adaptive_channels = adaptive == "1"
+        self._use_valid_count = transport == "host_sm" and valid_count == "1"
+        if self._use_valid_count:
+            validate_valid_count_runner(moe_runner_config)
+        self._prefill_channels = int(os.environ.get("EP_XPRESS_PREFILL_CHANNELS", "0"))
+        self._decode_channels = int(os.environ.get("EP_XPRESS_DECODE_CHANNELS", "0"))
+        for value in (self._prefill_channels, self._decode_channels):
+            if not 0 <= value <= self._config.channels:
+                raise ValueError("phase channel override must be 0 (auto) or within configured channels")
         self._expert_map = tuple(contiguous_expert_map(moe_runner_config.num_experts, size))
         self._context_key = (self._group, self._device, self._config, self._expert_map)
         self._resolved_context = None
@@ -146,7 +176,15 @@ class HostEPDispatcher(BaseDispatcher):
                 # after MAX_LEN/SUM_LEN padding. Reuse that exact CPU bound
                 # instead of validating and summing all rank counts per layer.
                 # Each source's input capacity is still checked by the core.
-                dispatch_options["recv_capacity"] = get_global_dp_buffer_len()
+                capacity = get_global_dp_buffer_len()
+                dispatch_options["recv_capacity"] = capacity
+                dispatch_options["active_channels"] = select_active_channels(
+                    capacity, is_extend=get_is_extend_in_batch(),
+                    allocated=self._context().effective_channels,
+                    adaptive=self._adaptive_channels,
+                    prefill_override=self._prefill_channels,
+                    decode_override=self._decode_channels,
+                )
             batch = self._context().dispatch_async(
                 hidden_states,
                 topk_output.topk_ids,
@@ -162,7 +200,9 @@ class HostEPDispatcher(BaseDispatcher):
             # weights; combine consumes only valid rows using its GPU handle.
             self._tickets.append(_Ticket(batch.handle, tag, rows))
             self._sequence += 1
-            return StandardDispatchOutput(
+            output_type = HostSMDispatchOutput if self._use_valid_count else StandardDispatchOutput
+            return output_type(
+                **({"valid_count": batch.valid_count} if self._use_valid_count else {}),
                 hidden_states=batch.hidden,
                 hidden_states_scale=None,
                 topk_output=StandardTopKOutput(

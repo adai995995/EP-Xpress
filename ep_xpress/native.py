@@ -247,6 +247,14 @@ def prepare_host_sm(
     always active. With diagnostics off, a missing peer requires external job
     cancellation. Fatal contexts trap on a device error and omit dispatch's
     otherwise error-only count-reset kernel.
+
+    Prepared dispatch also fills int32 ``owner_rows[world, capacity]`` and
+    ``owner_counts[world]``. These operation-scoped tensors retain the indices
+    used by combine without rescanning the inverse map. Both prepared methods
+    accept ``active_channels``: zero uses the allocated width, otherwise the
+    value must be in [1, channels]. The caller uses the same active width for
+    every rank and for the matching combine. Arena strides and frame capacities
+    remain those fixed at preparation time.
     """
     if not isinstance(diagnostics, bool) or not isinstance(fatal_errors, bool):
         raise TypeError("diagnostics and fatal_errors must be bools")

@@ -237,6 +237,8 @@ struct TransportArgs {
   float* output_weights;
   int64_t* output_inverse;
   int32_t* output_count;
+  int32_t* owner_rows;
+  int32_t* owner_counts;
   at::BFloat16* remote;
   int32_t* status;
   int64_t* profile;
@@ -248,6 +250,17 @@ struct TransportArgs {
   bool trusted_placement = false;
   bool fatal_errors = false;
 };
+
+// Notifications are independent of payload READY: only selected readers see a
+// new sequence. A reader never inspects another reader's mutable payload slot.
+__device__ __forceinline__ uint64_t* dispatch_notify(TransportArgs a, char* base,
+                                                    int slot, int reader) {
+  return reinterpret_cast<uint64_t*>(base + kArenaHeader + a.slots * a.slot_stride) +
+      slot * kMaxRanks + reader;
+}
+__device__ __forceinline__ uint64_t* dispatch_terminal(TransportArgs a, char* base) {
+  return dispatch_notify(a, base, a.slots, 0);
+}
 
 // These atomics address this GPU's VRAM only. Host synchronization words retain
 // exactly one GPU writer per producer/channel or consumer/channel.
@@ -269,6 +282,8 @@ __global__ void host_sm_init_kernel(TransportArgs a) {
   int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = int64_t(gridDim.x) * blockDim.x;
   if (!Combine && i == 0) *a.output_count = 0;
+  if (!Combine && a.owner_counts)
+    for (int64_t j = i; j < a.world; j += stride) a.owner_counts[j] = 0;
   for (int64_t j = i; j < int64_t(a.capacity) * a.hidden; j += stride)
     a.output[j] = at::BFloat16(0.0f);
   if (Combine) {
@@ -305,7 +320,7 @@ __global__ void host_sm_finalize_kernel(TransportArgs a) {
 // 3 timeout, 4 peer abort, 5 operation identity mismatch. An error is sticky.
 // More than one channel requires a cooperative, all-resident launch. Separate
 // producer-only and receiver-only blocks would not provide this liveness.
-template <bool Combine, typename Id, bool Profile = false>
+template <bool Combine, typename Id, bool Profile = false, bool Selective = false>
 __global__ void host_sm_transport_kernel(TransportArgs a) {
   using Scan = cub::BlockScan<uint64_t, kThreads>;
   __shared__ typename Scan::TempStorage scan_storage;
@@ -314,7 +329,10 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
   __shared__ int local_rows[kThreads], remote_rows[kThreads], selected_rows[kThreads];
   __shared__ int tokens[kThreads], selected_tokens[kThreads];
   __shared__ uint64_t masks[kThreads];
-  __shared__ int num_local, num_remote, num_selected, output_base, complete;
+  __shared__ int num_local, num_remote, num_selected, output_base, owner_base, complete;
+  __shared__ uint64_t slot_readers[64], frame_readers;
+  __shared__ uint64_t received_sequence[kMaxRanks];
+  __shared__ int received_slot[kMaxRanks], terminal_sent;
   __shared__ uint64_t previous, start;
   __shared__ ProfileState<Profile> profile;
   profile_init(profile);
@@ -330,13 +348,15 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
     if (n < 0 || n > a.input_rows) { fail(a.status, 1); n = 0; }
     cursor = int(int64_t(n) * channel / a.channels);
     end = int(int64_t(n) * (channel + 1) / a.channels);
-    producer_done = sent_chunks = 0;
+    producer_done = sent_chunks = terminal_sent = 0;
     start = a.diagnostics ? ticks_ns() : 0;
   }
   for (int peer = tid; peer < a.world; peer += blockDim.x) {
     peer_done[peer] = peer == a.rank;
     peer_chunk[peer] = 0;
   }
+  if constexpr (Selective)
+    for (int slot = tid; slot < a.slots; slot += blockDim.x) slot_readers[slot] = 0;
   __syncthreads();
   uint32_t iteration = 0;
   while (true) {
@@ -356,6 +376,7 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
     if (tid == 0) previous = producer_done ? 0 : acquire(control(send_slot, 0));
     __syncthreads();
     bool blocked = !producer_done && tid < a.world && tid != a.rank &&
+                   (!Selective || (slot_readers[sent_chunks % a.slots] & (uint64_t(1) << tid))) &&
                    acquire(control(send_slot, 1 + tid)) != previous;
     if constexpr (Profile) {
       if (tid < a.world) profile.credit_blocked[tid] = blocked;
@@ -419,7 +440,9 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
         num_local = uint32_t(aggregate);
         num_remote = uint32_t(aggregate >> 32);
         output_base = Combine || !num_local ? 0 : atomicAdd(a.output_count, num_local);
-        if (!Combine && int64_t(output_base) + num_local > a.capacity) fail(a.status, 2);
+        owner_base = !a.owner_counts || !num_local ? 0 : atomicAdd(a.owner_counts + a.rank, num_local);
+        if (!Combine && (int64_t(output_base) + num_local > a.capacity ||
+            (a.owner_counts && int64_t(owner_base) + num_local > a.capacity))) fail(a.status, 2);
         error = read_status(a.status);
       }
       __syncthreads();
@@ -445,6 +468,8 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
           if (tid < num_local) {
             a.output_inverse[int64_t(output_base + tid) * 2] = a.rank;
             a.output_inverse[int64_t(output_base + tid) * 2 + 1] = cursor + local_rows[tid];
+            if (a.owner_rows)
+              a.owner_rows[int64_t(a.rank) * a.capacity + owner_base + tid] = output_base + tid;
           }
         }
         if constexpr (Profile) {
@@ -484,10 +509,16 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
         profile_phase(profile, PPublish);
         if (tid == 0) cursor += batch;
         __syncthreads();
-        if (num_remote || cursor == end) {
+        if (num_remote || (!Selective && cursor == end)) {
           if (tid == 0) {
             host_store32(send_slot + kRowsOffset, num_remote ? num_remote : uint32_t(-1));
             if (a.diagnostics) host_store64(send_slot + kIdentityOffset, a.identity);
+            if constexpr (Selective) {
+              frame_readers = 0;
+              for (int r = 0; r < num_remote; ++r) frame_readers |= masks[remote_rows[r]];
+              frame_readers &= ~(uint64_t(1) << a.rank);
+              slot_readers[sent_chunks % a.slots] = frame_readers;
+            }
           }
           __threadfence_system();
           __syncthreads();
@@ -505,6 +536,15 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
               profile.progress = true;
             }
           }
+          if constexpr (Selective) {
+            __syncthreads();
+            if (tid < a.world && (frame_readers & (uint64_t(1) << tid)))
+              release(dispatch_notify(a, own, (sent_chunks - 1) % a.slots, tid),
+                      (a.epoch << 32) | uint64_t(sent_chunks));
+          }
+        }
+        if constexpr (Selective) {
+          if (tid == 0 && cursor == end) producer_done = 1;
         }
       }
     }
@@ -516,13 +556,36 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
       int rows = 0;
       if (!peer_done[tid]) {
         char* peer = reinterpret_cast<char*>(a.pointers[tid]) + channel * a.channel_stride;
-        char* slot = peer + kArenaHeader + (peer_chunk[tid] % a.slots) * a.slot_stride;
-        uint64_t expected = (a.epoch << 32) | uint64_t(peer_chunk[tid] + 1);
-        if (acquire(control(slot, 0)) == expected) {
+        char* slot = nullptr;
+        if constexpr (Selective) {
+          // Every live notification protects its slot until this reader ACKs.
+          // Nonreaders skip frame sequences without inspecting slot metadata.
+          for (int index = 0; index < a.slots; ++index) {
+            const uint64_t sequence = acquire(dispatch_notify(a, peer, index, a.rank));
+            char* candidate = peer + kArenaHeader + index * a.slot_stride;
+            if ((sequence >> 32) == a.epoch &&
+                sequence != acquire(control(candidate, 1 + a.rank))) {
+              slot = candidate;
+              received_slot[tid] = index;
+              received_sequence[tid] = sequence;
+              break;
+            }
+          }
+          if (!slot && acquire(dispatch_terminal(a, peer)) == (a.epoch << 32)) {
+            if (a.diagnostics && host_load64(peer + 24) != a.identity) fail(a.status, 5);
+            received_slot[tid] = -1;
+            rows = -1;
+          }
+        } else {
+          char* candidate = peer + kArenaHeader + (peer_chunk[tid] % a.slots) * a.slot_stride;
+          uint64_t expected = (a.epoch << 32) | uint64_t(peer_chunk[tid] + 1);
+          if (acquire(control(candidate, 0)) == expected) slot = candidate;
+        }
+        if (slot) {
           rows = int32_t(host_load32(slot + kRowsOffset));
           if (a.diagnostics && peer_chunk[tid] == 0 &&
               host_load64(slot + kIdentityOffset) != a.identity) fail(a.status, 5);
-          if (rows < -1 || rows == 0 || rows > a.chunk_rows) fail(a.status, 1);
+          if (rows < (Selective ? 1 : -1) || rows == 0 || rows > a.chunk_rows) fail(a.status, 1);
         }
       }
       received_rows[tid] = rows;
@@ -550,7 +613,9 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
       const int rows = received_rows[peer];
       if (!rows) continue;
       char* peer_base = reinterpret_cast<char*>(a.pointers[peer]) + channel * a.channel_stride;
-      char* slot = peer_base + kArenaHeader + (peer_chunk[peer] % a.slots) * a.slot_stride;
+      const int slot_index = Selective ? received_slot[peer] : peer_chunk[peer] % a.slots;
+      char* slot = slot_index < 0 ? nullptr :
+          peer_base + kArenaHeader + int64_t(slot_index) * a.slot_stride;
       for (int tile = 0; tile < rows; tile += kThreads) {
         profile_phase(profile, PReceiveMetadata);
         const int wire_row = tile + tid;
@@ -571,7 +636,9 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
         if (tid == 0) {
           num_selected = int(aggregate);
           output_base = Combine || !num_selected ? 0 : atomicAdd(a.output_count, num_selected);
-          if (!Combine && int64_t(output_base) + num_selected > a.capacity) fail(a.status, 2);
+          owner_base = !a.owner_counts || !num_selected ? 0 : atomicAdd(a.owner_counts + peer, num_selected);
+          if (!Combine && (int64_t(output_base) + num_selected > a.capacity ||
+              (a.owner_counts && int64_t(owner_base) + num_selected > a.capacity))) fail(a.status, 2);
           error = read_status(a.status);
         }
         __syncthreads();
@@ -604,6 +671,8 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
           if (tid < num_selected) {
             a.output_inverse[int64_t(output_base + tid) * 2] = peer;
             a.output_inverse[int64_t(output_base + tid) * 2 + 1] = selected_tokens[tid];
+            if (a.owner_rows)
+              a.owner_rows[int64_t(peer) * a.capacity + owner_base + tid] = output_base + tid;
           }
         }
         __syncthreads();
@@ -618,7 +687,10 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
       __threadfence_system();
       __syncthreads();
       if (tid == 0) {
-        release(control(slot, 1 + a.rank), (a.epoch << 32) | uint64_t(peer_chunk[peer] + 1));
+        if constexpr (Selective) {
+          if (rows == -1) release(dispatch_terminal(a, peer_base) + 1 + a.rank, a.epoch << 32);
+          else release(control(slot, 1 + a.rank), received_sequence[peer]);
+        } else release(control(slot, 1 + a.rank), (a.epoch << 32) | uint64_t(peer_chunk[peer] + 1));
         ++peer_chunk[peer];
         if (rows == -1) peer_done[peer] = 1;
         if constexpr (Profile) {
@@ -633,15 +705,31 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
     }
     const int unfinished_peers = __syncthreads_or(tid < a.world && !peer_done[tid]);
     bool unacked = false;
-    if (producer_done && !unfinished_peers) {
+    if (producer_done && (Selective || !unfinished_peers)) {
       for (int i = tid; i < a.slots * a.world; i += blockDim.x) {
         int peer = i % a.world;
         if (peer == a.rank) continue;
+        if constexpr (Selective)
+          if (!(slot_readers[i / a.world] & (uint64_t(1) << peer))) continue;
         char* slot = own + kArenaHeader + (i / a.world) * a.slot_stride;
         if (acquire(control(slot, 1 + peer)) != acquire(control(slot, 0))) unacked = true;
       }
     }
-    const int outstanding = __syncthreads_or(unacked);
+    int outstanding = __syncthreads_or(unacked);
+    if constexpr (Selective) {
+      // Publish end-of-operation only after every selected reader has released
+      // all payload slots. A separate terminal ACK protects epoch reuse, without
+      // making nonreaders part of payload-slot credits.
+      if (tid == 0 && producer_done && !outstanding && !terminal_sent) {
+        if (a.diagnostics) host_store64(own + 24, a.identity);
+        release(dispatch_terminal(a, own), a.epoch << 32);
+        terminal_sent = 1;
+      }
+      __syncthreads();
+      const bool terminal_unacked = terminal_sent && tid < a.world && tid != a.rank &&
+          acquire(dispatch_terminal(a, own) + 1 + tid) != (a.epoch << 32);
+      outstanding |= __syncthreads_or(terminal_unacked);
+    }
     if (tid == 0) {
       complete = producer_done && !unfinished_peers && !outstanding;
       if (!complete && check_health && ticks_ns() - start > a.timeout_ns) fail(a.status, 3);
@@ -667,7 +755,10 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
 
 int64_t channel_bytes(int64_t hidden, int64_t topk, int64_t slots, int64_t rows) {
   const int64_t row = align_up(16 + topk * 12 + hidden * 2, 16);
-  return align_up(kArenaHeader + slots * align_up(kSlotHeader + rows * row, 128), 4096);
+  // Selective dispatch notification words follow payload slots. The legacy
+  // dispatch path ignores the suffix; combine keeps its existing arena layout.
+  const int64_t notifications = topk ? (slots * kMaxRanks + kMaxRanks + 1) * 8 : 0;
+  return align_up(kArenaHeader + slots * align_up(kSlotHeader + rows * row, 128) + notifications, 4096);
 }
 
 // A combine CTA owns both directions of exactly one rank pair. Neither its
@@ -692,7 +783,7 @@ __global__ void host_sm_pair_combine_kernel(TransportArgs a) {
       (int64_t(channel) * a.world + a.rank) * a.channel_stride;
   const int64_t x_offset = payload_offset(a.chunk_rows, 0);
   if (tid == 0) {
-    int n = *a.input_count;
+    int n = a.owner_counts ? a.owner_counts[peer] : *a.input_count;
     if (n < 0 || n > a.input_rows) { fail(a.status, 1); n = 0; }
     cursor = int(int64_t(n) * channel / a.channels);
     end = int(int64_t(n) * (channel + 1) / a.channels);
@@ -727,38 +818,60 @@ __global__ void host_sm_pair_combine_kernel(TransportArgs a) {
     __syncthreads();
     if (!send_done && !complete) {
       profile_phase(profile, PRouteLocal);
-      const int batch = min(kThreads, end - cursor);
-      bool selected_here = false;
-      int token = 0;
-      if (tid < batch) {
-        const int64_t destination = a.input_inverse[int64_t(cursor + tid) * 2];
-        if (destination < 0 || destination >= a.world) fail(a.status, 1);
-        else if (destination == peer) {
-          // Only the target pair uses this inverse index; other peer CTAs
-          // neither reload nor revalidate it while scanning their own rows.
-          const int64_t index = a.input_inverse[int64_t(cursor + tid) * 2 + 1];
-          if (index < 0 || index > INT32_MAX) fail(a.status, 1);
+      const int limit = local ? kThreads : min(kThreads, a.chunk_rows);
+      const int batch = min(a.owner_rows ? limit : kThreads, end - cursor);
+      if (a.owner_rows) {
+        // Dispatch has already grouped compact row IDs by return owner. Each
+        // pair reads its exact contiguous subrange once, with no inverse scan.
+        if (tid < batch) {
+          const int row = a.owner_rows[int64_t(peer) * a.input_rows + cursor + tid];
+          if (row < 0 || row >= a.input_rows) fail(a.status, 1);
           else {
-            selected_here = true;
-            token = int(index);
-            if (local && token >= a.capacity) fail(a.status, 2);
+            const int64_t index = a.input_inverse[int64_t(row) * 2 + 1];
+            if (index < 0 || index > INT32_MAX ||
+                (a.diagnostics && a.input_inverse[int64_t(row) * 2] != peer)) fail(a.status, 1);
+            else {
+              selected[tid] = row;
+              tokens[tid] = int(index);
+              if (local && index >= a.capacity) fail(a.status, 2);
+            }
           }
         }
-      }
-      int prefix, total;
-      Scan(scan_storage).ExclusiveSum(int(selected_here), prefix, total);
-      const int limit = local ? kThreads : min(kThreads, a.chunk_rows);
-      if (selected_here && prefix < limit) {
-        selected[prefix] = cursor + tid;
-        tokens[prefix] = token;
-      }
-      __syncthreads();
-      if (tid == 0) {
-        count = min(total, limit);
-        // A dense tile may contain more rows than the bounded host slot.
-        // Keep the unsent suffix for this pair's next independent iteration.
-        next = total > limit ? selected[limit - 1] + 1 : cursor + batch;
-        error = read_status(a.status);
+        __syncthreads();
+        if (tid == 0) {
+          count = batch;
+          next = cursor + batch;
+          error = read_status(a.status);
+        }
+      } else {
+        // Preserve the direct raw API for callers that supply only inverse.
+        bool selected_here = false;
+        int token = 0;
+        if (tid < batch) {
+          const int64_t destination = a.input_inverse[int64_t(cursor + tid) * 2];
+          if (destination < 0 || destination >= a.world) fail(a.status, 1);
+          else if (destination == peer) {
+            const int64_t index = a.input_inverse[int64_t(cursor + tid) * 2 + 1];
+            if (index < 0 || index > INT32_MAX) fail(a.status, 1);
+            else {
+              selected_here = true;
+              token = int(index);
+              if (local && token >= a.capacity) fail(a.status, 2);
+            }
+          }
+        }
+        int prefix, total;
+        Scan(scan_storage).ExclusiveSum(int(selected_here), prefix, total);
+        if (selected_here && prefix < limit) {
+          selected[prefix] = cursor + tid;
+          tokens[prefix] = token;
+        }
+        __syncthreads();
+        if (tid == 0) {
+          count = min(total, limit);
+          next = total > limit ? selected[limit - 1] + 1 : cursor + batch;
+          error = read_status(a.status);
+        }
       }
       __syncthreads();
       if (error) break;
@@ -923,17 +1036,20 @@ int max_channels_current_device(int world = 1) {
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&cooperative, cudaDevAttrCooperativeLaunch, device));
   if (!cooperative) { capacities.emplace(key, 0); return 0; }
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-  int a, b, c, diagnostic;
+  int a, b, c, diagnostic, selective_a, selective_b;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&a, host_sm_transport_kernel<false, int32_t>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, host_sm_transport_kernel<false, int64_t>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&c, host_sm_pair_combine_kernel<false>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&diagnostic, host_sm_pair_combine_kernel<true>, kThreads, 0));
-  const int capacity = std::min({32, sms * std::min(a, b), sms * std::min(c, diagnostic) / world});
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&selective_a, host_sm_transport_kernel<false, int32_t, false, true>, kThreads, 0));
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&selective_b, host_sm_transport_kernel<false, int64_t, false, true>, kThreads, 0));
+  const int capacity = std::min({32, sms * std::min({a, b, selective_a, selective_b}),
+                                 sms * std::min(c, diagnostic) / world});
   capacities.emplace(key, capacity);
   return capacity;
 }
 
-template <bool Combine, typename Id, bool Profile = false>
+template <bool Combine, typename Id, bool Profile = false, bool Selective = false>
 void launch_transport(TransportArgs args, cudaStream_t stream) {
   const int64_t elements = int64_t(args.capacity) * args.hidden * (Combine ? args.world : 1);
   const int blocks = int(std::max<int64_t>(1, std::min<int64_t>(4096, (elements + kThreads - 1) / kThreads)));
@@ -942,12 +1058,12 @@ void launch_transport(TransportArgs args, cudaStream_t stream) {
   const int lanes = args.channels * (Combine ? args.world : 1);
   if (lanes == 1) {
     if constexpr (Combine) host_sm_pair_combine_kernel<Profile><<<1, kThreads, 0, stream>>>(args);
-    else host_sm_transport_kernel<false, Id, Profile><<<1, kThreads, 0, stream>>>(args);
+    else host_sm_transport_kernel<false, Id, Profile, Selective><<<1, kThreads, 0, stream>>>(args);
   } else {
     void* parameters[] = {&args};
     const void* kernel;
     if constexpr (Combine) kernel = reinterpret_cast<const void*>(host_sm_pair_combine_kernel<Profile>);
-    else kernel = reinterpret_cast<const void*>(host_sm_transport_kernel<false, Id, Profile>);
+    else kernel = reinterpret_cast<const void*>(host_sm_transport_kernel<false, Id, Profile, Selective>);
     C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
         kernel, dim3(lanes), dim3(kThreads), parameters, 0, stream));
   }
@@ -1001,6 +1117,21 @@ void operation_check(const torch::Tensor& input, const torch::Tensor& output,
                   input.size(0) <= INT32_MAX && output.size(0) <= INT32_MAX,
               "invalid input or output shape for prepared transport");
   TORCH_CHECK(epoch > 0 && epoch < (int64_t(1) << 31), "invalid epoch");
+}
+
+void owner_check(const torch::Tensor& rows, const torch::Tensor& counts,
+                 const torch::Device& device, int world, int64_t capacity) {
+  tensor_check(rows, at::kInt, 2, device, "owner row indices");
+  tensor_check(counts, at::kInt, 1, device, "owner row counts");
+  TORCH_CHECK(rows.size(0) == world && rows.size(1) == capacity && counts.numel() == world,
+              "invalid owner row-index shape");
+}
+
+void active_channel_check(TransportArgs& a, int64_t requested) {
+  if (!requested) return;
+  TORCH_CHECK(requested >= 1 && requested <= a.channels,
+              "active_channels must not exceed the prepared channel allocation");
+  a.channels = int(requested);
 }
 
 cudaStream_t eager_stream(const torch::Device& device) {
@@ -1090,8 +1221,10 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
 void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Tensor weights,
     int64_t epoch, torch::Tensor output, torch::Tensor output_ids,
     torch::Tensor output_weights, torch::Tensor inverse, torch::Tensor count,
+    torch::Tensor owner_rows, torch::Tensor owner_counts, int64_t active_channels,
     int64_t identity) {
   auto a = impl_->dispatch;
+  active_channel_check(a, active_channels);
   const auto device = impl_->device;
   operation_check(input, output, device, a.hidden, epoch);
   TORCH_CHECK(identity >= 0, "invalid operation identity");
@@ -1109,22 +1242,26 @@ void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Ten
   TORCH_CHECK(inverse.size(0) == output.size(0) && inverse.size(1) == 2, "invalid inverse shape");
   tensor_check(count, at::kInt, 1, device, "count");
   TORCH_CHECK(count.numel() == 1, "count must contain one element");
+  owner_check(owner_rows, owner_counts, device, a.world, output.size(0));
   const c10::cuda::CUDAGuard guard(device);
   const auto stream = eager_stream(device);
   a.input = input.data_ptr<at::BFloat16>(); a.ids = ids.data_ptr();
   a.weights = weights.data_ptr<float>(); a.output = output.data_ptr<at::BFloat16>();
   a.output_ids = output_ids.data_ptr<int64_t>(); a.output_weights = output_weights.data_ptr<float>();
   a.output_inverse = inverse.data_ptr<int64_t>(); a.output_count = count.data_ptr<int32_t>();
+  a.owner_rows = owner_rows.data_ptr<int32_t>(); a.owner_counts = owner_counts.data_ptr<int32_t>();
   a.input_rows = int(input.size(0)); a.capacity = int(output.size(0));
   a.epoch = uint64_t(epoch); a.identity = uint64_t(identity);
-  if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t>(a, stream);
-  else launch_transport<false, int64_t>(a, stream);
+  if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t, false, true>(a, stream);
+  else launch_transport<false, int64_t, false, true>(a, stream);
 }
 
 void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch::Tensor count,
-    int64_t epoch, torch::Tensor output, torch::Tensor remote, int64_t identity,
+    torch::Tensor owner_rows, torch::Tensor owner_counts, int64_t epoch,
+    torch::Tensor output, torch::Tensor remote, int64_t active_channels, int64_t identity,
     c10::optional<torch::Tensor> profile) {
   auto a = impl_->combine;
+  active_channel_check(a, active_channels);
   const auto device = impl_->device;
   operation_check(partial, output, device, a.hidden, epoch);
   TORCH_CHECK(identity >= 0, "invalid operation identity");
@@ -1140,12 +1277,14 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
     TORCH_CHECK(profile->size(0) == a.channels * a.world && profile->size(1) == PFieldCount,
                 "profile must have shape [channels * world, ", PFieldCount, "]");
   }
+  owner_check(owner_rows, owner_counts, device, a.world, partial.size(0));
   const c10::cuda::CUDAGuard guard(device);
   const auto stream = eager_stream(device);
   a.input = partial.data_ptr<at::BFloat16>(); a.input_inverse = inverse.data_ptr<int64_t>();
   a.input_count = count.data_ptr<int32_t>(); a.output = output.data_ptr<at::BFloat16>();
   a.remote = remote.data_ptr<at::BFloat16>();
   a.profile = profile.has_value() ? profile->data_ptr<int64_t>() : nullptr;
+  a.owner_rows = owner_rows.data_ptr<int32_t>(); a.owner_counts = owner_counts.data_ptr<int32_t>();
   a.input_rows = int(partial.size(0)); a.capacity = int(output.size(0));
   a.epoch = uint64_t(epoch); a.identity = uint64_t(identity);
   if (profile.has_value()) launch_transport<true, int64_t, true>(a, stream);

@@ -47,6 +47,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.channel_chunk_rows(3), 3)
         one_lane = Config(128, 4, 32, transport="host_sm", chunk_bytes=2 * 256, channels=1)
         self.assertEqual(cfg.mapped_arena_bytes(4), 4 * one_lane.mapped_arena_bytes(4))
+        # The selective-reader READY and terminal-ACK suffix pushes this
+        # dispatch lane across the next page boundary; combine has no suffix.
+        self.assertEqual(cfg.mapped_arena_bytes(4), 4 * 8192)
         ce_one = Config(128, 4, 32, channels=1)
         ce_four = Config(128, 4, 32, channels=4)
         self.assertEqual(ce_one.pinned_working_set_bytes(8), ce_four.pinned_working_set_bytes(8))

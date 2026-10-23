@@ -61,8 +61,9 @@ def cpu_context(channels=4, fields=FIELDS, world=1):
         yield context
 
 
-def handle(operation=1):
-    return SimpleNamespace(operation=operation, local_token_count=3, received_count=8)
+def handle(operation=1, channels=4):
+    return SimpleNamespace(operation=operation, local_token_count=3, received_count=8,
+                           active_channels=channels)
 
 
 def test_disabled_profile_does_not_inspect_labels_or_allocate():
@@ -146,10 +147,10 @@ def test_combined_gpu_and_pinned_storage_is_bounded():
 def test_pair_profile_rows_are_explicit_and_budget_counts_every_peer():
     with cpu_context(channels=2, world=3) as context:
         context.start_combine_profile(1)
-        sample, _ = context._combine_profile_slice(handle(), None, 1)
+        sample, _ = context._combine_profile_slice(handle(channels=2), None, 1)
         assert sample.shape == (6, len(FIELDS))
         report = context.stop_combine_profile()
-        assert report["schema_version"] == 2
+        assert report["schema_version"] == 3
         assert report["queue_layout"] == "rank_pair"
         assert report["channels"] == 2
         assert report["world_size"] == 3
@@ -160,3 +161,21 @@ def test_pair_profile_rows_are_explicit_and_budget_counts_every_peer():
         with pytest.raises(ValueError, match="64 MiB budget"):
             context.start_combine_profile(2048)
         allocate.assert_not_called()
+
+
+def test_profile_counters_only_include_the_operation_active_grid():
+    with cpu_context(channels=8, world=2) as context:
+        context.start_combine_profile(3)
+        for index, channels in enumerate((8, 1, 4)):
+            sample, metadata = context._combine_profile_slice(handle(index, channels), None, index + 1)
+            assert sample.shape == (channels * 2, len(FIELDS))
+            sample.fill_(index + 1)
+            metadata["submitted"] = True
+        report = context.stop_combine_profile()
+    assert [len(rows) for rows in report["raw_counters"]] == [16, 2, 8]
+    for index, (operation, rows) in enumerate(zip(report["operations"], report["raw_counters"])):
+        assert len(operation["counter_rows"]) == len(rows)
+        assert rows == [[index + 1] * len(FIELDS)] * len(rows)
+        assert operation["counter_rows"] == [
+            {"channel": channel, "peer": peer}
+            for channel in range(operation["active_channels"]) for peer in range(2)]

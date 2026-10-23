@@ -12,7 +12,8 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from ep_xpress import Config, Context, native
-from ep_xpress.host_sm import HostSMContext, _MappedArena, _operation_identity
+from ep_xpress.context import DispatchBatch, RouteHandle
+from ep_xpress.host_sm import HostSMContext, _DevicePending, _DeviceRoute, _MappedArena, _operation_identity
 
 
 def test_context_factory_runs_selected_initializer_once():
@@ -171,9 +172,11 @@ def test_native_pair_allocator_and_capacity_pass_world_to_extension():
 @pytest.mark.parametrize("diagnostics", [False, True])
 def test_context_uses_prepared_operations_and_hashes_tags_only_when_enabled(diagnostics):
     context = object.__new__(HostSMContext)
-    context.config = Config(4, 2, 3, transport="host_sm", diagnostics=diagnostics)
+    context.config = Config(4, 2, 3, transport="host_sm", chunk_bytes=1024,
+                            diagnostics=diagnostics)
     context.device = torch.device("cuda", 0)
     context.world_size = 2
+    context.effective_channels = 4
     context._max_receive_capacity = 6
     context._id = "prepared-context"
     context._counter = 1
@@ -181,7 +184,7 @@ def test_context_uses_prepared_operations_and_hashes_tags_only_when_enabled(diag
     context._work_stream = object()
     context._prepared = Mock()
     context._begin = Mock(return_value=1)
-    context._finish = Mock(side_effect=lambda value: value)
+    context._finish = Mock(side_effect=lambda value, channels: value)
     context._abort = Mock()
     context._combine_profile = None
     x = torch.zeros((3, 4), dtype=torch.bfloat16)
@@ -210,11 +213,20 @@ def test_context_uses_prepared_operations_and_hashes_tags_only_when_enabled(diag
     assert dispatch.args[4] is batch.hidden
     assert dispatch.args[7] is batch.handle.inverse_map
     assert dispatch.args[8] is batch.valid_count
+    assert dispatch.args[9] is batch.handle._plan.owner_rows
+    assert dispatch.args[10] is batch.handle._plan.owner_counts
+    assert dispatch.kwargs["active_channels"] == 4
+    assert tuple(batch.handle._plan.owner_rows.shape) == (2, 5)
+    assert tuple(batch.handle._plan.owner_counts.shape) == (2,)
+    assert batch.handle._plan.owner_rows.dtype == batch.handle._plan.owner_counts.dtype == torch.int32
     assert combine.args[0] is batch.hidden
     assert combine.args[1] is batch.handle.inverse_map
     assert combine.args[2] is batch.valid_count
-    assert combine.args[3] == 1
-    assert combine.args[4] is result
+    assert combine.args[3] is batch.handle._plan.owner_rows
+    assert combine.args[4] is batch.handle._plan.owner_counts
+    assert combine.args[5] == 1
+    assert combine.args[6] is result
+    assert combine.kwargs["active_channels"] == 4
     assert tuple(result.shape) == (3, 4)
     assert batch.handle._consumed
     assert combine.kwargs["profile"] is None
@@ -226,3 +238,105 @@ def test_context_uses_prepared_operations_and_hashes_tags_only_when_enabled(diag
         identity.assert_not_called()
         assert dispatch.kwargs["identity"] == combine.kwargs["identity"] == 0
     context._abort.assert_not_called()
+
+
+def test_active_width_and_owner_lists_follow_each_handle_in_reverse_combine_order():
+    context = object.__new__(HostSMContext)
+    context.config = Config(4, 2, 3, transport="host_sm", chunk_bytes=1024, channels=32)
+    context.device = torch.device("cuda", 0)
+    context.world_size, context.effective_channels = 2, 32
+    context._max_receive_capacity = 6
+    context._id, context._counter = "active-context", 0
+    context._closed, context._failure, context._unwaited = False, None, 0
+    context._epochs = {"dispatch": 0, "combine": 0}
+    context._lock = threading.RLock()
+    context._work_stream = Mock()
+    context._prepared = Mock()
+    context._finish = Mock(side_effect=lambda value, channels: value)
+    context._abort = Mock()
+    context._combine_profile = None
+    x = torch.zeros((3, 4), dtype=torch.bfloat16)
+    ids = torch.zeros((3, 2), dtype=torch.int64)
+    weights = torch.ones((3, 2), dtype=torch.float32)
+    producer = SimpleNamespace(device=context.device)
+    empty, recorded = torch.empty, []
+
+    def cpu_empty(shape, **kwargs):
+        kwargs.pop("device", None)
+        return empty(shape, **kwargs)
+
+    def record_stream(tensor, stream):
+        recorded.append((id(tensor), stream))
+
+    with patch("ep_xpress.host_sm.torch.cuda.device", side_effect=lambda _: nullcontext()), \
+            patch("ep_xpress.host_sm.torch.cuda.stream", side_effect=lambda _: nullcontext()), \
+            patch("ep_xpress.host_sm.torch.cuda.is_current_stream_capturing", return_value=False), \
+            patch.object(torch.Tensor, "record_stream", new=record_stream), \
+            patch("ep_xpress.host_sm.torch.empty", side_effect=cpu_empty):
+        batches = [context.dispatch_async(x, ids, weights, stream=producer,
+                                          recv_capacity=5, active_channels=channels)
+                   for channels in (8, 1, 32)]
+        assert [batch.handle.operation for batch in batches] == [1, 2, 3]
+        assert [batch.handle.active_channels for batch in batches] == [8, 1, 32]
+        for batch in reversed(batches):
+            context.combine_async(batch.hidden, batch.handle, stream=producer)
+
+    assert context._epochs == {"dispatch": 3, "combine": 3}
+    assert [call.kwargs["active_channels"] for call in context._prepared.dispatch.call_args_list] == [8, 1, 32]
+    assert [call.kwargs["active_channels"] for call in context._prepared.combine.call_args_list] == [32, 1, 8]
+    assert len({id(batch.handle._plan.owner_rows) for batch in batches}) == 3
+    for epoch, (batch, call) in enumerate(zip(reversed(batches), context._prepared.combine.call_args_list), 1):
+        assert call.args[3] is batch.handle._plan.owner_rows
+        assert call.args[4] is batch.handle._plan.owner_counts
+        assert call.args[5] == epoch
+        assert (id(batch.handle._plan.owner_rows), context._work_stream) in recorded
+        assert (id(batch.handle._plan.owner_counts), context._work_stream) in recorded
+        assert batch.handle._consumed
+    context._abort.assert_not_called()
+
+
+@pytest.mark.parametrize("channels", [0, 33, True, 1.5])
+def test_invalid_active_width_rejected_before_epoch_or_allocation(channels):
+    context = object.__new__(HostSMContext)
+    context.config = Config(4, 2, 3, transport="host_sm", chunk_bytes=1024, channels=32)
+    context.device = torch.device("cuda", 0)
+    context.effective_channels, context._max_receive_capacity = 32, 6
+    context._lock, context._begin, context._abort = threading.RLock(), Mock(), Mock()
+    x = torch.zeros((3, 4), dtype=torch.bfloat16)
+    ids = torch.zeros((3, 2), dtype=torch.int64)
+    weights = torch.ones((3, 2), dtype=torch.float32)
+    with patch("ep_xpress.host_sm.torch.cuda.device", side_effect=lambda _: nullcontext()), \
+            patch("ep_xpress.host_sm.torch.empty") as allocate:
+        with pytest.raises(ValueError, match="active_channels"):
+            context.dispatch_async(x, ids, weights, active_channels=channels)
+    context._begin.assert_not_called()
+    allocate.assert_not_called()
+
+
+def test_pending_preserves_owner_tensor_stream_lifetimes_and_operation_width():
+    context = SimpleNamespace(device=torch.device("cuda", 0), effective_channels=32,
+                              _failure=None, _lock=threading.RLock(), _unwaited=1)
+    route = _DeviceRoute(torch.empty((5, 2), dtype=torch.int64),
+                         torch.empty(1, dtype=torch.int32),
+                         torch.empty((2, 5), dtype=torch.int32),
+                         torch.empty(2, dtype=torch.int32), 1)
+    handle = RouteHandle("pending-context", 1, route, 3, 5)
+    batch = DispatchBatch(torch.empty((5, 4), dtype=torch.bfloat16),
+                          torch.empty((5, 2), dtype=torch.int64),
+                          torch.empty((5, 2), dtype=torch.float32), handle, route.count)
+    completed, consumer = object(), Mock(device=context.device)
+    pending = _DevicePending(context, batch, completed, 1)
+    recorded = []
+
+    def record_stream(tensor, stream):
+        recorded.append((id(tensor), stream))
+
+    with patch("ep_xpress.host_sm.torch.cuda.device", side_effect=lambda _: nullcontext()), \
+            patch.object(torch.Tensor, "record_stream", new=record_stream):
+        assert pending.wait(stream=consumer) is batch
+        assert pending.wait(stream=consumer) is batch
+    assert context._unwaited == 0
+    assert (id(route.owner_rows), consumer) in recorded
+    assert (id(route.owner_counts), consumer) in recorded
+    assert all(call.args == (completed,) for call in consumer.wait_event.call_args_list)
+    assert pending.metrics == {"transport": "host_sm", "channels": 1, "allocated_channels": 32}

@@ -17,6 +17,7 @@ from collections import namedtuple
 import ep_xpress
 from ep_xpress.adapters.sglang_config import (
     contiguous_expert_map,
+    select_active_channels,
     receive_capacity_from_scheduler,
     validate_runner_config,
     validate_server_args,
@@ -46,7 +47,7 @@ class Tensor:
 
 
 @contextmanager
-def fake_adapter(rows=3, scheduler_counts=(2, 1)):
+def fake_adapter(rows=3, scheduler_counts=(2, 1), is_extend=False):
     calls = []
     topk_type = namedtuple("StandardTopKOutput", "topk_weights topk_ids router_logits")
     output_type = namedtuple("StandardDispatchOutput", "hidden_states hidden_states_scale topk_output")
@@ -104,13 +105,15 @@ def fake_adapter(rows=3, scheduler_counts=(2, 1)):
     for name in ("sglang", "sglang.srt", "sglang.srt.layers", "sglang.srt.layers.moe",
                  "sglang.srt.layers.moe.token_dispatcher"):
         module(name)
-    module("sglang.srt.layers.moe.token_dispatcher.base", BaseDispatcher=BaseDispatcher)
+    module("sglang.srt.layers.moe.token_dispatcher.base", BaseDispatcher=BaseDispatcher,
+           DispatchOutputFormat=SimpleNamespace(STANDARD="standard"))
     module("sglang.srt.layers.moe.token_dispatcher.standard",
            StandardCombineInput=combine_type, StandardDispatchOutput=output_type)
     module("sglang.srt.layers.moe.topk", StandardTopKOutput=topk_type,
            TopKOutputChecker=SimpleNamespace(format_is_standard=lambda value: isinstance(value, topk_type)))
     module("sglang.srt.layers.dp_attention",
-           get_global_dp_buffer_len=lambda: None if scheduler_counts is None else sum(scheduler_counts))
+           get_global_dp_buffer_len=lambda: None if scheduler_counts is None else sum(scheduler_counts),
+           get_is_extend_in_batch=lambda: is_extend)
     parallel = SimpleNamespace(tp_size=2, attn_dp_size=2, moe_ep_size=2, moe_ep_rank=0,
                                moe_ep_group=SimpleNamespace(cpu_group=object()))
     module("sglang.srt.runtime_context", get_parallel=lambda: parallel)
@@ -125,6 +128,16 @@ def fake_adapter(rows=3, scheduler_counts=(2, 1)):
 
 
 class AdapterValidationTest(unittest.TestCase):
+    def test_global_channel_policy(self):
+        for capacity, extend, expected in ((0, False, 1), (1, False, 1), (32, False, 4),
+                                           (257, False, 32), (3, True, 3), (512, True, 32)):
+            self.assertEqual(select_active_channels(capacity, is_extend=extend,
+                allocated=32, adaptive=True), expected)
+        self.assertEqual(select_active_channels(1, is_extend=False,
+            allocated=32, adaptive=False), 32)
+        self.assertEqual(select_active_channels(1, is_extend=False,
+            allocated=16, adaptive=True, decode_override=32), 16)
+
     def test_scheduler_capacity_bound(self):
         self.assertEqual(receive_capacity_from_scheduler(
             [3, 0], world_size=2, max_tokens_per_rank=4), 3)
@@ -182,6 +195,8 @@ class AdapterContractTest(unittest.TestCase):
                 self.assertEqual(fixture.calls[-1][2]["recv_capacity"], 7)
                 self.assertEqual(output.topk_output.router_logits.shape, (7, 0))
                 self.assertEqual(output.hidden_states.shape, (7, 16))
+                self.assertIs(output.valid_count, fixture.batch.valid_count)
+                self.assertEqual(fixture.calls[-1][2]["active_channels"], 1)
                 dispatcher.combine(fixture.combine(Tensor((7, 16))))
                 self.assertIs(fixture.calls[-1][1][1], fixture.batch.handle)
 
@@ -271,7 +286,8 @@ class SGLangPatchTest(unittest.TestCase):
             subprocess.run(["git", "apply", "--check", str(patch_file)], cwd=temporary, check=True, capture_output=True)
             subprocess.run(["git", "apply", str(patch_file)], cwd=temporary, check=True, capture_output=True)
             for file in files:
-                ast.parse((temporary / file).read_text())
+                if file.endswith(".py"):
+                    ast.parse((temporary / file).read_text())
 
 
 if __name__ == "__main__":

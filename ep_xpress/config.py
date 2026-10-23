@@ -20,7 +20,7 @@ class Config:
     combine_backend: str = "gpu"
     graph_mode: str = "eager"
     fatal_errors: bool = False
-    channels: int = 4  # host_sm lanes; ignored by host_ce
+    channels: int = 4  # allocated host_sm lanes; operations may activate a subset
     diagnostics: bool = False  # opt-in host_sm protocol diagnostics
 
     def __post_init__(self):
@@ -94,6 +94,9 @@ class Config:
         Kept in agreement with the native ABI and checked during bootstrap.
         Dispatch uses one queue per channel. Combine uses one queue per peer
         and channel, splitting the payload budget before page/header rounding.
+        Dispatch also reserves per-reader readiness and terminal-ACK words so
+        non-readers do not gate payload-slot reuse. Active launch width never
+        changes this initialized allocation or its frame size.
         """
         channels = self.channels if channels is None else channels
         if (isinstance(queue_peers, bool) or not isinstance(queue_peers, int) or
@@ -102,7 +105,9 @@ class Config:
         rows = self.combine_chunk_rows(channels, queue_peers)
         row_bytes = ((16 + topk * 12 + self.hidden_size * 2 + 15) // 16) * 16
         slot_bytes = ((640 + rows * row_bytes + 127) // 128) * 128
-        return channels * queue_peers * ((128 + self.slots * slot_bytes + 4095) // 4096) * 4096
+        notification_bytes = (self.slots * 63 + 64) * 8 if topk else 0
+        return channels * queue_peers * (
+            (128 + self.slots * slot_bytes + notification_bytes + 4095) // 4096) * 4096
 
     def pinned_working_set_bytes(self, world_size):
         """Shared rings plus all ranks' reusable private receive packs."""
