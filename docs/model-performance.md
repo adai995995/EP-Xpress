@@ -4,8 +4,8 @@ These experiments run the complete Qwen3-30B-A3B-Instruct-2507 model through
 SGLang v0.5.21. They are distinct from the synthetic expert function in the
 standalone transport replay.
 
-The latest submission-path cleanup and channel sweep are in
-[Prepared transport and channel-count experiment](#prepared-transport-and-channel-count-experiment).
+The latest owner-list, active-channel, selective-dispatch and GPU-count results
+are in [Owner-list and sparse-work experiment](#owner-list-and-sparse-work-experiment).
 Earlier sections describe earlier runtime revisions and their measurements.
 
 ## Matched configuration
@@ -649,8 +649,8 @@ There are concrete costs beyond payload traffic:
   communication deduplication has not also removed all capacity-sized expert
   preparation and output work.
 
-The next algorithmic priorities are to build GPU row-index lists by return
-owner once and consume those lists directly, reclaim dispatch payloads using
+For that revision, the next algorithmic priorities were to build GPU row-index
+lists by return owner once and consume those lists directly, reclaim dispatch payloads using
 only their actual readers, and choose different active channel counts for
 prefill and decode. Building return lists while dispatch creates inverse rows
 could avoid a separate route-planning pass without adding CPU route readbacks.
@@ -664,3 +664,96 @@ in both directions. Such a change must preserve independent progress and
 publication/slot-lifetime ordering. Buffer reuse and fewer eager launches
 remain useful, but older profiles found initialization/final reduction small relative to transport;
 that historical result does not identify the current revision's bottleneck.
+
+
+## Owner-list and sparse-work experiment
+
+Runtime `7b05797` implements four changes in the prepared host-SM path:
+
+1. Dispatch builds GPU row-index lists by return rank. Combine consumes these
+   lists directly instead of scanning inverse maps separately for each peer or
+   rescanning a suffix that did not fit the previous frame.
+2. Each handle carries an active channel count. The SGLang adapter uses common
+   scheduler metadata to select prefill and decode widths without a new
+   collective or CPU count readback. Explicit phase overrides are available.
+3. Dispatch publishes per-reader READY notifications and waits only for actual
+   readers when reusing a payload slot. All-peer terminal handshakes remain at
+   operation completion; publication fences and stream dependencies remain.
+4. An optional BF16 Triton expert path consumes the GPU receive count, omits
+   invalid routes from alignment, and skips unused activation/reduction rows.
+   It retains the original tuned GEMMs and CUDA SiLU arithmetic. Workspace
+   allocations and launch upper bounds remain based on receive capacity.
+
+The same eight-GPU, model, dtype, eager-mode, 512-input/32-output workload and
+host-only restrictions above apply. Both backends use the same updated pinned
+SGLang patch. Eight warmup batches generate 16 tokens; each measured shape has
+three repetitions. The candidate allocates 32 channels, two slots and a 4-MiB
+chunk budget with diagnostics disabled. Adaptive mode uses 32 active prefill
+channels for these inputs and `ceil(global_capacity / 8)` decode channels,
+bounded to 1 through 32. Frame sizes do not change with the active width.
+
+### Initial all-four comparison
+
+Times below are milliseconds. Brackets are the observed three-repeat range.
+
+| Backend | Concurrent requests | Completion median [min, max] | Change vs NCCL | Mean TTFT | Mean per-request TPOT |
+|---|---:|---:|---:|---:|---:|
+| Default NCCL | 1 | 3070.566 [3030.910, 3074.277] | — | 191.544 | 92.869 |
+| EP-Xpress, all four enabled | 1 | 2893.403 [2890.425, 2971.019] | -5.77% | 185.236 | 87.365 |
+| Default NCCL | 32 | 3434.193 [3397.490, 3462.598] | — | 441.536 | 95.502 |
+| EP-Xpress, all four enabled | 32 | 3441.940 [3370.109, 3687.773] | +0.23% | 592.161 | 94.153 |
+
+Single-request completion improves in this run. The 32-request result is
+approximately tied with NCCL, with a wider candidate range; it does not show a
+robust batch-32 speedup. Mean TTFT varies substantially across repetitions:
+434.321–575.995 ms for NCCL and 450.438–763.841 ms for EP-Xpress. The median last
+request's TTFT differs by 6.79%, smaller than the difference in mean TTFT.
+Server logs confirm that request arrival produced different prefill splits
+across repetitions and backends: some ranks processed four requests together,
+while others split them as 1+3, 2+2, or 3+1. These HTTP metrics include scheduling
+and split prefills; they do not isolate expert alignment or communication-kernel time.
+
+Configuration, input hashes, source provenance, hardware and host-only transport
+validation passed without warnings or errors. All ranks negotiated 32 allocated
+channels. NCCL logs show SHM only: 120 baseline records and 60 candidate records,
+with no P2P, NET or NVLS records. Hardware NVLink payload increments are zero on
+all eight GPUs. The EP payload itself uses mapped host memory. These are
+transport checks, not a PCIe bandwidth measurement. All four short sanity
+prompts match text and all 29 token IDs; the maximum common-prefix log-probability
+difference is 0.218722. This limited output check does not establish layer-wise
+numerical equivalence. No new kernel-phase profiling was collected.
+
+
+### Valid-count ablation
+
+A second EP-only run uses exactly the same source manifest, SGLang patch and
+settings, changing only `EP_XPRESS_VALID_COUNT=1` to `0`. It therefore retains
+owner lists, selective dispatch and adaptive channels, but uses the previous
+capacity-based Standard/Triton expert path. It is compared with the same fresh
+NCCL baseline above.
+
+| Valid-count path | Concurrent requests | Completion median [min, max] | Mean TTFT | Mean per-request TPOT |
+|---|---:|---:|---:|---:|
+| Enabled | 1 | 2893.403 [2890.425, 2971.019] | 185.236 | 87.365 |
+| Disabled | 1 | 3088.813 [3066.236, 3090.977] | 193.927 | 93.380 |
+| Enabled | 32 | 3441.940 [3370.109, 3687.773] | 592.161 | 94.153 |
+| Disabled | 32 | 3583.773 [3565.736, 3593.134] | 526.910 | 98.579 |
+
+Disabling the GPU-count expert path increases completion latency by 6.75% at
+batch 1 and 4.12% at batch 32 relative to the enabled run. The path remains
+enabled by default. The lower batch-32 mean TTFT with the path disabled does
+not isolate alignment cost: server logs show different prefill splits in this
+run as well. The complete decode interval and end-to-end result favor keeping
+it enabled. Configuration/source/hardware/transport validation again passes
+without warnings or errors; output token/text checks match, and NVLink payload
+counters remain unchanged. No additional native regression suite or kernel
+profiling was run for this environment-only ablation.
+
+These measurements support the combined implementation and the count-aware
+expert path on the tested workload. They do not independently measure the
+contribution of owner lists, selective ACKs, or adaptive channels. The batch-32
+result remains near parity with NCCL, not a demonstrated robust speedup. The
+large count-aware alignment still uses one CTA per expert and scans valid IDs
+per expert; tile-parallel alignment is a remaining implementation opportunity,
+not part of the tested runtime. Dense frame destination unions can also include
+all peers, so actual-reader ACKs need not remove a reader in every frame.

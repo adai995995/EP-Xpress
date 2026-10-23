@@ -1,5 +1,41 @@
 # Validation
 
+## GPU owner lists, selective dispatch, and count-aware experts
+
+Runtime `7b05797` builds return-owner lists during dispatch, lets each handle
+retain its active channel width, and reclaims dispatch payload slots after only
+actual readers acknowledge them. The SGLang adapter can pass its GPU receive
+count into the BF16 Triton expert path without a CPU scalar readback.
+
+Focused validation covered the new protocol and numerical contract:
+
+- A three-GPU check delayed an unrelated rank while two other ranks recycled
+  two slots across nine frames. Repeated active widths 1/2/1/2, owner-list
+  coverage, mixed and empty routes, weighted combine, and empty-operation
+  diagnostic identity checks passed.
+- Pending-handle lifetime and per-operation active-grid profile checks passed.
+  Seven prepared-operation and active-width interface cases passed after their
+  small-hidden-size fixtures specified an appropriately small chunk budget.
+- Nine GPU expert comparisons covered zero, partial, and full valid counts,
+  capacities 1/32/129/256, int64 expert IDs, and GPU int32 counts. Route coverage
+  and BF16 outputs matched the original runner with zero numeric tolerance.
+- The CUDA extension compiled successfully. Focused local configuration and
+  adapter checks, Python syntax, and patch application checks passed.
+
+Full-model inference completed at batches 1 and 32 with three repetitions per
+shape, followed by one environment-only valid-count ablation. Both use the same
+patched SGLang source as the default NCCL baseline. Source, input, configuration,
+hardware and host-only transport checks pass; all four short sanity prompts
+match text and all 29 token IDs. See the
+[owner-list experiment](model-performance.md#owner-list-and-sparse-work-experiment)
+for timings, prefill split variability and numerical limits.
+
+These checks target changed code; the broader historical suite below was not
+rerun. Payload credit independence does not remove the final all-peer terminal
+handshake, memory publication fences, or CUDA stream dependencies. Expert
+workspaces and launch upper bounds remain capacity-sized even when kernels
+skip inactive rows.
+
 ## Prepared transport revision
 
 Runtime `282437b` moves static native checks to initialization and defaults
@@ -156,9 +192,10 @@ Full SGLang startup and matched eager model runs with one, eight, and 32
 concurrent requests are documented in [the model comparison](model-performance.md).
 The sole performance baseline is SGLang's native NCCL backend. The earlier
 four- and 16-channel implementations were slower at all three shapes. The
-latest prepared-transport sweep observes roughly 2% lower latency at batch 1;
-its best tested configuration remains 5.0% slower at batch 32. Batch 8 was not
-remeasured. Short generated-output checks match
+latest owner-list/count-aware run observes 5.77% lower latency at batch 1 and
+approximately equal latency at batch 32 (+0.23%), with substantial batch-32
+variation. Disabling the count-aware expert path slows both shapes. Batch 8 was
+not remeasured. Short generated-output checks match
 token IDs, but do not replace a layer-wise numerical error study.
 
 Remaining validation and implementation work:

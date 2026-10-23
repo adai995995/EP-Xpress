@@ -76,8 +76,25 @@ expert runner and eager mode identical in the `--moe-a2a-backend none` baseline.
 the common cooperative-launch capacity once at initialization. Multi-rank
 operation requires cooperative launch support; the single-device path alone
 supports a noncooperative single-block fallback. The payload budget is split
-across channels,
-with row rounding and lane metadata included in the actual host-pool check.
+across allocated channels, with row rounding and lane metadata included in the
+actual host-pool check. Active channels can vary per operation without resizing
+these rings. By default, `EP_XPRESS_ADAPTIVE_CHANNELS=1` selects:
+
+- Prefill: `min(effective_channels, max(1, global_capacity))`.
+- Decode: `min(effective_channels, max(1, ceil(global_capacity / 8)))`.
+
+Both inputs are already shared scheduler metadata: `get_global_dp_buffer_len()`
+and `get_is_extend_in_batch()`. The latter reports whether any rank is extending;
+local token counts and local forward modes never choose the channel count. No
+new metadata collective or GPU-to-CPU count copy is introduced. Combine reuses
+the count stored in its matching dispatch handle.
+
+Set `EP_XPRESS_ADAPTIVE_CHANNELS=0` to use all effective channels in both phases.
+`EP_XPRESS_PREFILL_CHANNELS` and `EP_XPRESS_DECODE_CHANNELS` default to `0`, which
+uses the policy above. A positive phase override takes precedence over the
+adaptive switch, must not exceed `EP_XPRESS_CHANNELS`, and is clamped to the
+negotiated cooperative capacity. Set the same options on every rank.
+
 Model measurements and channel-count/prefill/decode tradeoffs are
 reported in [the performance comparison](../../docs/model-performance.md).
 Set the maximum tokens to cover the largest per-rank forward; the core fails
@@ -98,11 +115,26 @@ For `host_sm`, the adapter sizes each receive tensor from SGLang's existing
 `get_global_dp_buffer_len()`: the scheduler computes the sum of padded rank
 counts once per forward in the pinned revision. Rank deduplication bounds
 each destination by this sum. It does not copy routes or receive counts to the
-CPU. The actual valid count and inverse map remain on the GPU. Standard/Triton
-receives the full capacity, with unused IDs set to `-1`, weights and activations
-set to zero; combine reads only the valid prefix using the GPU handle. Padding
-can add expert-runner overhead, so this interface alone does not establish a
-performance improvement. A missing or invalid scheduler bound fails explicitly.
+CPU. The actual valid count and inverse map remain on the GPU. A missing or
+invalid scheduler bound fails explicitly.
+
+`EP_XPRESS_VALID_COUNT=1` is the default for `host_sm`. The adapter carries the
+GPU count into its BF16 Triton runner. Alignment only includes valid local
+routes, omitting capacity-only rows and the `-1` expert bucket. The original
+SGLang GEMMs retain their tuning and BF16 intermediates. The original CUDA SiLU
+arithmetic reads the count and local int64 IDs directly, avoiding the old ID
+conversion and skipping unused rows. Local reduction skips nonlocal slots and
+uses FP32 top-k accumulation; weights remain applied once in the down GEMM.
+The count-aware path supports gated SiLU without activation modifiers or fused
+interleaved SiLU weights, and ordinary route-major GEMMs without TMA.
+
+This keeps workspace allocations and launch upper bounds based on scheduler
+capacity. GPU checks skip inactive work; the CPU never reads the count to resize
+tensors or select an expert-kernel launch size. It does not claim dynamically
+smaller allocations or that every launched CTA performs useful work. Set
+`EP_XPRESS_VALID_COUNT=0` to use the previous Standard/Triton expert path for an
+ablation; unused IDs remain `-1`, weights and activations are zero, and combine
+still reads only the valid prefix. `host_ce` continues to use the original runner.
 The adapter enables fatal CUDA errors for this backend: a detected route or
 capacity failure aborts the worker's CUDA context and surfaces at SGLang's
 normal output synchronization. This also rejects a failed final MoE layer without
@@ -123,8 +155,9 @@ The context and host pool are shared by compatible layers on a process.
 Per-operation immutable tickets retain the handle until the matching combine.
 The first adapter rejects a second dispatch before combine; it does not silently
 overwrite a handle. Zero-capacity ranks skip GEMM but still execute combine.
-`host_sm` ranks with nonzero capacity and zero valid rows retain masked padding
-through the expert runner; the adapter never reads the device count to skip it.
+`host_sm` ranks with nonzero capacity and zero valid rows still enter the expert
+runner and matching combine. The default count-aware kernels exit without
+processing those rows; the adapter never reads the device count to skip a phase.
 
 For controlled worker shutdown, call
 `ep_xpress.adapters.sglang.close_contexts()` on every EP rank after forwards
@@ -134,12 +167,16 @@ restart the worker group rather than continuing with unmatched operations.
 
 ## Validation checklist
 
-1. Run the independent EP-Xpress distributed CUDA correctness tests.
-2. Start the patched SGLang with a small supported checkpoint and eager mode.
+1. Use focused checks for a changed protocol or interface. For the count-aware
+   runner, `python tests/check_sglang_valid_count.py` compares route coverage and
+   BF16 output bits with the original runner for zero, partial, and full counts.
+2. Start the patched SGLang with a supported checkpoint and eager mode.
 3. Check generated output against the same Standard/Triton baseline with fixed
    requests, seeds and precision. BF16 reduction order can change rounding;
    include layer-output error checks rather than text equality alone.
 4. Exercise uneven per-rank input, zero-token ranks, repeated decode steps and
    a prefill close to configured capacity.
-5. Profile actual H2D/D2H bytes, dispatch/combine time and end-to-end latency.
-   There is no measured SGLang speedup claim in this integration patch.
+5. Prioritize full-model latency against the default NCCL backend with matching
+   GPU configuration and transport restrictions. Profile communication only when
+   needed to explain a measured gap; standalone kernel timings are not model
+   performance. See the performance report for measured results and limitations.

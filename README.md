@@ -21,8 +21,10 @@ measured against the intended inference framework and workload.
 - No remote GPU pointers, GPU IPC, peer copies, or RDMA in either transport.
 - Bounded host rings with configurable slot count, immutable published chunks,
   generation IDs, consumer ACKs, and simultaneous send/receive progress.
-  `host_sm` dispatch shares each producer's payload among destinations;
-  combine uses independent queues for each directed rank pair and channel.
+  Prepared `host_sm` dispatch shares each producer's payload among its actual
+  readers and reclaims it using only their ACKs. Combine uses independent
+  queues for each directed rank pair and channel, with GPU owner row lists
+  generated during dispatch.
 - Operation-scoped inverse-route handles, already-weighted rank partials,
   deterministic rank-order FP32 remote accumulation, and BF16 results.
 - A dedicated Gloo control group with a bounded timeout. In `host_ce` it
@@ -105,7 +107,8 @@ with Context(group=ep_group, expert_to_rank=expert_owners, config=config) as ep:
 
 Here `batch.valid_count` stays on the GPU. Receive tensors have the requested
 capacity; unused rows have expert IDs `-1`, zero weights, and zero activations.
-The expert runner must support these masked rows. `wait()` inserts a CUDA event
+The expert runner must either honor the GPU valid count or support these
+masked rows. `wait()` inserts a CUDA event
 dependency without waiting for GPU routing on the CPU. Without an explicit
 bound, the context reserves `world_size * max_tokens_per_rank` rows, which can
 be wasteful for decode. An undersized bound is an error, never silent truncation.
@@ -124,22 +127,28 @@ and caches placement, queue layout and launch capacity once. Only changing
 tensor shapes/layouts and bounds are checked on each operation. The adapter
 reuses SGLang's CPU capacity already computed once per forward.
 
-The SM backend batches routing and metadata access. `channels` is the number
-of logical work partitions, not a count of reserved SMs. Dispatch launches one
-CUDA block per channel; combine launches one block per `(channel, peer)`,
-including a local-only block for the current rank. For example, four channels
-on eight ranks launch four dispatch blocks and 32 combine blocks per GPU.
-CUDA places those blocks on SMs according to resource availability.
+The SM backend batches routing and metadata access. `channels` is the allocated
+number of logical work partitions, not a count of reserved SMs. A dispatch may
+supply `active_channels` from 1 through `ep.effective_channels`; all ranks must
+use the same value. Omitting it uses the full allocation. The handle retains
+this width for combine. Dispatch launches one CUDA block per active channel;
+combine launches one block per `(active channel, peer)`, including a local-only
+block for the current rank. Four active channels on eight ranks therefore
+launch four dispatch blocks and 32 combine blocks per GPU. Arena addresses and
+frame sizes stay fixed when the active width changes. CUDA places those blocks
+on SMs according to resource availability.
 
 `channels` defaults to four. Initialization negotiates a common limit from
 dispatch and combine kernel occupancy, including the optional diagnostic
 kernel, and exposes it as `ep.effective_channels`. Multi-rank `host_sm`
 requires cooperative launch support so the whole communication grid can be
 resident. Each combine block progresses both directions of its rank pair:
-only that pair's receiver acknowledges its outgoing slots. Dispatch still
-requires every peer to acknowledge each shared chunk header. Full operation
-completion still drains all participating queues. The sole performance
-baseline is SGLang's default NCCL backend; see
+only that pair's receiver acknowledges its outgoing slots. Prepared dispatch
+publishes per-reader READY notifications for the union of a frame's target
+ranks, so unrelated ranks do not hold up payload-slot reuse. A separate terminal
+handshake with every peer protects operation completion and epoch reuse. The
+legacy raw native dispatch API retains its all-peer header ACK protocol.
+The sole performance baseline is SGLang's default NCCL backend; see
 [the protocol description](docs/architecture.md) and
 [full-model results](docs/model-performance.md).
 
@@ -164,10 +173,12 @@ The start call preallocates counters; the stop call bulk-copies them after one
 transport-stream fence. No per-layer CPU readback or collective is added.
 Excess operations run uninstrumented and increment `dropped_operations`.
 `read_combine_profile()` returns the completed report without another fence.
-Schema version 2 contains native field names, operation labels, and
-`channels * world_size` rows per operation. `counter_rows` explicitly maps
-each row to its `(channel, peer)` pair, including the local-only row. The
-capture size must fit the 64 MiB combined GPU-counter and pinned-readout
+Schema version 3 contains native field names, operation labels, and
+`active_channels * world_size` rows per operation. Each operation records its
+own `active_channels` and `counter_rows`, which map its raw rows to
+`(channel, peer)` pairs, including local-only rows. Top-level `channels` and
+`counter_rows` describe the allocation; inactive rows are omitted from each
+operation's raw counters. The capture size must fit the 64 MiB combined GPU-counter and pinned-readout
 budget; reduce `max_operations` for larger grids. Diagnostic timing adds CTA
 barriers and must be compared with an uninstrumented run before interpreting
 its overhead.

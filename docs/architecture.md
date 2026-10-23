@@ -81,6 +81,14 @@ thread read a small host record and synchronize the CTA for every token.
 The local-rank contribution bypasses host memory. Receivers compact selected
 rows into GPU output buffers using device-memory reservations. Output row
 order can vary across channels; the saved inverse map preserves token identity.
+At each receive reservation, the prepared path also appends output-row indices
+to a device-resident list for that row's source rank. Local bypass rows enter
+the current rank's list. This creates the return-owner index once during
+dispatch, without a later sort, route readback, or metadata collective. The
+handle retains `owner_rows: int32[world_size, receive_capacity]` and
+`owner_counts: int32[world_size]`, adding
+`4 * world_size * (receive_capacity + 1)` bytes of device storage per live
+handle. Only valid list entries are written; initialization clears the counts.
 Input expert IDs may be int32 or int64 without an intermediate cast kernel.
 
 Parallel initialization kernels clear output padding and combine scratch.
@@ -88,10 +96,13 @@ After communication, a parallel combine kernel performs deterministic
 rank-order reduction. These kernels are stream ordered, so communication
 blocks do not also serialize full-buffer initialization and final reduction.
 
-The channel count is agreed during bootstrap using the minimum safe kernel
-occupancy across the group. A channel is a logical work partition, not a
-reserved SM. Dispatch launches `channels` CTAs; combine launches
-`channels * world_size` CTAs, including one local-only CTA per channel. CUDA
+The allocated channel count is agreed during bootstrap using the minimum safe
+kernel occupancy across the group. A channel is a logical work partition, not
+a reserved SM. Each dispatch may choose a CPU-known `active_channels` in
+`[1, effective_channels]`; all ranks must agree on that choice. Omitting it uses
+the full allocation. The handle carries the active width into combine.
+Dispatch launches `active_channels` CTAs; combine launches
+`active_channels * world_size` CTAs, including one local-only CTA per channel. CUDA
 determines their placement, and several CTAs may reside on one SM. For
 multi-rank contexts, cooperative launch support is required even with one
 channel. The common channel limit accounts for the full combine grid and both
@@ -102,10 +113,12 @@ one-rank, one-channel context can use an ordinary one-block launch. There is
 no multi-device cooperative launch, GPU peer memory, TMA, or per-layer CPU
 capability exchange. See [CUDA cooperative launch requirements](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cooperative-groups.html).
 
-For dispatch, `chunk_bytes` is divided across channels, rounding up to whole
-rows. Combine divides it across both channels and peers. This keeps the
-payload budget approximately constant as queues are split, although row
-rounding, queue headers, and page alignment add overhead. Each queue has its
+For dispatch, `chunk_bytes` is divided across allocated channels, rounding up
+to whole rows. Combine divides it across both allocated channels and peers.
+This keeps the payload budget approximately constant as queues are split,
+although row rounding, queue headers, and page alignment add overhead.
+Changing an operation's active width changes its work partition and launch
+only: arena strides, row capacity per frame, and reserved memory stay fixed. Each queue has its
 own page-aligned arena and ring slots. Actual negotiated allocation is checked
 against the host-memory budget. Producer work batches contain at most 256 rows
 per published frame, even when a queue has room for more; the configured chunk
@@ -113,38 +126,63 @@ size is an upper bound.
 
 The caller supplies a CPU-known receive capacity, such as the sum of scheduler
 token counts. The exact received row count stays in a CUDA tensor, together
-with an inverse `[source rank, source token]` map. Unused receive rows are
-initialized to zero with expert IDs `-1`. The framework runs experts against
-this padded shape and must mask these IDs. No device count is read by the CPU
-to allocate an exact output shape. Combine consumes the saved inverse and
-count directly on the GPU.
+with an inverse `[source rank, source token]` map and the prepared path's owner
+lists. Unused receive rows are initialized to zero with expert IDs `-1`.
+An expert runner can consume the device count to skip padded work, or mask the
+unused rows when processing the full capacity. No device count is read by the
+CPU to allocate an exact output shape. Prepared combine consumes each owner's
+row list and count directly on the GPU; the inverse map supplies the original
+token index for each listed row.
 
-Each dispatch channel's slot has a producer-written generation and one
-consumer-written ACK per peer. A generation combines an operation epoch with
-a chunk number. Payload writers issue system fences before publishing;
-readers finish their loads before acknowledging. Synchronization uses
-naturally aligned, single-writer loads/stores with system acquire/release
+Each dispatch channel's payload slot has a producer-written generation and
+one consumer-written ACK per peer. Prepared dispatch additionally uses
+producer-written READY notifications indexed by `(slot, reader)`. A generation
+combines an operation epoch with a frame number. Payload writers issue system
+fences before publishing; readers finish their loads before acknowledging.
+Synchronization uses naturally aligned, single-writer loads/stores with system acquire/release
 semantics, not mapped-host atomic read-modify-write operations. The
 implementation follows CUDA's mapped-memory access constraints:
 [CUDA memory documentation](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/understanding-memory.html).
 
-With diagnostics enabled, each frame also carries a stable fingerprint of its
-phase, optional API tag and, for combine, originating dispatch operation. A
-receiver checks this identity on the first frame from each peer and channel, including
-when that first frame is an empty operation's terminal. Generation and
-sequence checks still apply to every frame. The identity is constant within
-the operation, so later frames do not repeat the host fingerprint read. This
-detects inconsistent layer tags and handle order without a CPU collective.
-The fingerprint hashes only small API metadata; GPU routing IDs and weights
-are never read back for this check.
+With diagnostics enabled, payload frames also carry a stable fingerprint of
+their phase, optional API tag and, for combine, originating dispatch operation.
+Prepared dispatch checks the first received payload identity and the separate
+terminal identity; even an empty operation therefore validates its tag.
+Combine and legacy raw dispatch check the first frame, including a terminal
+when the pair or operation has no payload. The identity stays constant within
+the operation. This detects inconsistent tags and handle order without a CPU
+collective; GPU routing IDs and weights are never read back for this check.
 
-The dispatch producer reuses a slot only after all peer ACKs match its
-previous generation. Every peer acknowledges each header, including when its
-rank is absent from the payload mask. An explicit terminal frame covers empty
-inputs. The CTA alternates producer work with receiver progress instead of
-waiting inside a blocked producer. Before returning, it consumes peer terminal
-frames and drains its own slot ACKs. This prevents one operation from
-overwriting a chunk that a delayed peer still needs.
+For each published dispatch frame, the producer takes the union of its remote
+destination masks and sends a READY notification only to those readers. The
+payload is still written once. Each reader polls its notifications across the
+bounded slots, accepts a current-epoch sequence different from its own ACK,
+reads the selected rows, and ACKs that sequence. A nonreader never inspects the
+frame's mutable metadata or payload. Readers do not require a contiguous
+sequence of every producer frame, so a skipped destination cannot lose its
+place when the producer reuses a slot.
+
+The producer retains each slot's last reader mask in CTA shared memory and
+reuses the slot after exactly those readers have acknowledged its generation.
+Per-reader single-writer records provide the logical remaining-reader count;
+no cross-GPU atomic decrement on host memory is required. Notification words
+follow the payload slots in each dispatch channel arena. The reserved suffix
+uses `8 * (63 * slots + 64)` bytes before page rounding, covering per-reader
+notifications plus terminal READY/ACK words at the maximum supported rank
+count. Terminal identity uses the existing arena header.
+
+After all its payload slots have been released, a producer publishes a
+separate terminal READY for the operation. Every peer consumes and ACKs this
+terminal, including ranks that read no payload. The CTA continues receiving
+while its outgoing payload or terminal is waiting. It returns only after
+consuming every peer's terminal and draining its own terminal ACKs. This final
+handshake protects epoch reuse and empty-input completion; it does not put
+unrelated peers back into payload-slot credits.
+
+The direct raw native dispatch API retains the earlier all-peer header ACK
+protocol and in-ring terminal frames. The Context and SGLang adapter use the
+prepared protocol described above. Both paths retain epoch checks, bounded
+queues, publication fences, and stream-lifetime ordering.
 
 ## Host-SM combine queues
 
@@ -160,8 +198,14 @@ GPU A sender -> host Q[A, B, channel] -> GPU B receiver
 GPU B sender -> host Q[B, A, channel] -> GPU A receiver
 ```
 
-One CTA on each GPU owns both directions of a `(channel, peer)` pair. Each
-pair has an independent input cursor, outgoing credit, and incoming sequence.
+One CTA on each GPU owns both directions of a `(channel, peer)` pair. In the
+prepared path, that peer's owner list is partitioned among active channels.
+The CTA reads the next bounded set of row indices directly, then obtains their
+original token indices from inverse. It does not scan other owners' rows or
+rescan an already inspected suffix when a host frame is smaller than a tile.
+The direct raw native combine API retains its inverse-scan implementation for
+callers that do not supply owner lists. Each pair has an independent input
+cursor, outgoing credit, and incoming sequence.
 If its outgoing ring is full, that CTA still checks and drains incoming data.
 Another pair's payload or ACK cannot block its cursor. CTAs for other peers
 advance independently, subject to shared GPU and PCIe resources. The local
@@ -176,14 +220,10 @@ does not expose early per-token completion or overlap expert GEMM with
 individual returned chunks. Source-indexed scratch and deterministic
 rank-order reduction are unchanged by queue arrival order.
 
-This split applies to combine only. Dispatch still shares one host payload
-among destinations and retains all-peer header ACKs. A future multicast
-reclamation scheme could count only the actual readers of each payload, but
-that is not implemented here. Such a count must be tied to a generation and
-advance only after each reader finishes; it cannot assume that atomic
-decrements to mapped host memory are coherent across GPUs. Per-reader,
-single-writer completion records can provide that logical count without a
-shared cross-GPU atomic counter.
+Combine keeps one payload queue per directed rank pair, while prepared
+dispatch shares a payload frame among its selected readers. Their queue
+layouts differ, but both reclaim payload slots using only actual consumers.
+Neither path currently exposes per-token completion to expert execution.
 
 `Pending.wait()` inserts an event dependency on the consuming stream without
 waiting for device routing on the CPU. Input/output tensors and mapped arenas
@@ -231,15 +271,16 @@ events and `record_stream` likewise carry required data dependencies. The
 producer and native work-stream capture guards check different streams and
 remain in place because CUDA Graph execution is not implemented.
 
-Remaining limits include dispatch's all-peer header ACK traffic and draining
-each operation's queues before returning. Double slots and multiple channels
+Remaining limits include draining each operation's queues before returning and
+the all-peer terminal handshake. Double slots and multiple active channels
 provide buffering and parallel progress; they do not establish overlap with
 expert GEMM or arbitrary cross-layer concurrency. Dispatch interleaves sends
 and receives within each channel CTA; combine does so within each pair CTA,
-rather than assigning dedicated sender/receiver blocks. Each combine pair
-also scans its channel's inverse-route range to select its own rows.
-Fixed-capacity padding has an expert-runner cost. These costs must be measured
-separately from removed CPU route planning and collectives.
+rather than assigning dedicated sender/receiver blocks. The owner-list path
+removes combine's repeated inverse scans, but still performs per-frame
+metadata, fence, and ACK work. Fixed-capacity allocations and expert runners
+that ignore the device valid count can also add work. These costs must be
+measured separately from removed CPU route planning and collectives.
 
 The design borrows GPU layout preparation, channel partitioning, and batched
 publication from [DeepEP v1.2.1 layout](https://github.com/deepseek-ai/DeepEP/blob/v1.2.1/csrc/kernels/layout.cu)
