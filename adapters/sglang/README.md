@@ -75,10 +75,11 @@ expert runner and eager mode identical in the `--moe-a2a-backend none` baseline.
 `EP_XPRESS_CHANNELS` requests parallel host-SM channels. The group negotiates
 the common cooperative-launch capacity once at initialization. Multi-rank
 operation requires cooperative launch support; the single-device path alone
-supports a noncooperative single-block fallback. The payload budget is split
-across allocated channels, with row rounding and lane metadata included in the
-actual host-pool check. Active channels can vary per operation without resizing
-these rings. By default, `EP_XPRESS_ADAPTIVE_CHANNELS=1` selects:
+supports a noncooperative single-block fallback. Dispatch divides its payload
+budget across allocated channels. Pair-queue combine has an independent frame
+row setting, described below. Row rounding and lane metadata are included in
+the actual host-pool check. Active channels can vary per operation without
+resizing these rings. By default, `EP_XPRESS_ADAPTIVE_CHANNELS=1` selects:
 
 - Prefill: `min(effective_channels, max(1, global_capacity))`.
 - Decode: `min(effective_channels, max(1, ceil(global_capacity / 8)))`.
@@ -95,12 +96,40 @@ uses the policy above. A positive phase override takes precedence over the
 adaptive switch, must not exceed `EP_XPRESS_CHANNELS`, and is clamped to the
 negotiated cooperative capacity. Set the same options on every rank.
 
+The following `host_sm` options select workspace reuse, bounded decode fusion
+and general combine frame sizing:
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `EP_XPRESS_DECODE_WORKSPACE` | `1` | Cache communication tensors for eligible decode operations; `0` uses independent tensors per call. |
+| `EP_XPRESS_FUSED_DECODE` | `1` | Use mailbox receive/reduce fusion for eligible decode; `0` retains pair queues. |
+| `EP_XPRESS_DECODE_MAX_TOKENS` | `64` | Reserve this many mailbox token slots per source rank and use it as the adapter's global-capacity eligibility bound. `0` disables both small-decode selections. |
+| `EP_XPRESS_COMBINE_FRAME_ROWS` | `16` | Fix rows per pair-queue frame independently of allocated channels. `0` restores the original split of the chunk budget across channels and peers. |
+
+The two switches accept `0` or `1`; both size settings accept integers from
+`0` through `256`. Core `Config.decode_max_tokens` and
+`Config.combine_frame_rows` default to `0`; the adapter explicitly supplies
+the values above. Workspace reuse and fusion can be ablated separately.
+
+Eligibility is identical on all ranks: no rank may be extending, and the
+global scheduler capacity must lie between zero and `DECODE_MAX_TOKENS`,
+with a positive configured limit. Using the global capacity is conservative:
+it also bounds every local source's token count without a new collective.
+Local token counts only select the shape of local cached storage. Prefill and
+larger decode continue using pair queues. Fixed frame rows apply to those
+queue operations; they do not size the per-token decode mailboxes.
+
+Increasing `COMBINE_FRAME_ROWS` may reduce the number of queue frames while
+increasing mapped host storage. With fixed rows, increasing allocated channels
+also increases storage rather than shrinking each frame. These defaults are
+configuration choices, not a claim of measured optimal performance.
+
 Model measurements and channel-count/prefill/decode tradeoffs are
 reported in [the performance comparison](../../docs/model-performance.md).
 Set the maximum tokens to cover the largest per-rank forward; the core fails
 explicitly if capacity is exceeded. These capacities are starting points,
 not measured optimal values. `EP_XPRESS_HOST_BUDGET_BYTES` limits the transport's
-pinned working set: mapped rings for `host_sm`, plus reusable private receive
+pinned working set: mapped rings and optional decode mailboxes for `host_sm`, plus reusable private receive
 packs for `host_ce`. Device staging and framework allocations are additional.
 
 ## Data ownership and lifecycle
@@ -158,6 +187,38 @@ overwrite a handle. Zero-capacity ranks skip GEMM but still execute combine.
 `host_sm` ranks with nonzero capacity and zero valid rows still enter the expert
 runner and matching combine. The default count-aware kernels exit without
 processing those rows; the adapter never reads the device count to skip a phase.
+
+For eligible decode, each layer keeps its own communication workspace cache,
+with at most four exact `(global capacity, local token count, fusion mode)`
+shapes. This is FIFO eviction: a hit reuses the existing tensors, while a fifth
+new shape removes the oldest inserted shape. Buffers are not shared across
+layers. They include dispatch data, route/owner indices, counts and combine
+output, plus scratch only for the queue path. This does not cache expert GEMM
+intermediates or remove every Python object allocation.
+
+Workspace output is borrowed until that workspace's next dispatch. SGLang's
+supported sequential forward waits on combine and queues every consumer on
+its forward stream before reuse. The core preserves those GPU stream
+dependencies and rejects reuse before the previous combine has been waited.
+No CPU event query or synchronization is added to the normal acquisition
+path. Direct library callers retaining an output must clone it or use separate
+workspaces. Ordinary calls without a workspace retain independent storage.
+
+Fused decode dispatch also records each source token's actual contributor
+mask and local row on the GPU. Its combine uses one kernel to publish outgoing
+partials, read actual contributors from fixed host mailboxes, reduce them and
+write final output. It skips the remote scratch clear/write and separate final
+reduction used by pair queues. The arithmetic remains ascending remote-rank
+FP32 accumulation, a BF16 round, then addition of the local BF16 partial and a
+final BF16 round; weights are not applied again. Each published contribution
+waits only for its destination's ACK. No unrelated rank ACK or terminal frame
+is required by mailbox combine. Dispatch's existing terminal handshake remains.
+
+The existing combine phase profiler supports pair queues only. For a profile
+run, set `EP_XPRESS_FUSED_DECODE=0` before worker startup; attempting to use
+fusion during a combine capture fails explicitly. Such a profile measures the
+queue path and cannot be used as a phase breakdown of fused decode. Protocol
+diagnostics controlled by `EP_XPRESS_DIAGNOSTICS` remain a separate option.
 
 For controlled worker shutdown, call
 `ep_xpress.adapters.sglang.close_contexts()` on every EP rank after forwards

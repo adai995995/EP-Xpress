@@ -24,7 +24,10 @@ measured against the intended inference framework and workload.
   Prepared `host_sm` dispatch shares each producer's payload among its actual
   readers and reclaims it using only their ACKs. Combine uses independent
   queues for each directed rank pair and channel, with GPU owner row lists
-  generated during dispatch.
+  generated during dispatch. An optional bounded decode path receives and
+  reduces directly from per-token host mailboxes in one combine kernel.
+- Explicitly borrowed decode workspaces reuse communication tensors. Generic
+  calls without a workspace retain operation-owned outputs and route storage.
 - Operation-scoped inverse-route handles, already-weighted rank partials,
   deterministic rank-order FP32 remote accumulation, and BF16 results.
 - A dedicated Gloo control group with a bounded timeout. In `host_ce` it
@@ -114,6 +117,45 @@ bound, the context reserves `world_size * max_tokens_per_rank` rows, which can
 be wasteful for decode. An undersized bound is an error, never silent truncation.
 The SGLang adapter obtains its bound from existing scheduler metadata.
 
+For sequential, fixed-shape decode, the SM context also supports explicit
+workspace reuse and receive/reduce fusion:
+
+```python
+import torch
+
+# Configure decode_max_tokens > 0 when constructing this host_sm context.
+forward_stream = torch.cuda.current_stream()
+workspace = ep.create_workspace(global_token_bound, x.shape[0], fused_combine=True)
+batch = ep.dispatch_async(x, topk_ids, topk_weights, workspace=workspace,
+                          fused_combine=True, stream=forward_stream).wait(stream=forward_stream)
+partial = expert_runner(batch.hidden, batch.local_ids, batch.weights)
+output = ep.combine_async(partial, batch.handle, stream=forward_stream).wait(stream=forward_stream)
+# Enqueue every consumer of output on forward_stream before reusing workspace.
+```
+
+Workspace-backed batches, outputs and tickets are borrowed until that
+workspace's next dispatch. Wait on its previous combine and enqueue all output
+consumers before reuse; clone any output that must survive reuse. A workspace
+has an exact receive capacity, local token count and fusion mode. Different
+outstanding operations need different workspaces. The default non-workspace API
+keeps independent storage. Fusion and reuse are independently selectable.
+
+`Config(decode_max_tokens=N)` reserves mapped return mailboxes for up to `N`
+source tokens per rank; `0` disables them, and supported positive values are
+1 through 256. `fused_combine=True` makes dispatch retain each source token's
+contributor mask and local row on the GPU. Combine then reads only actual remote
+contributors, accumulates in the existing numerical order, and writes output
+directly. It does not allocate remote scratch or launch its separate clear and
+final-reduction kernels. Only published contributions require ACKs; this
+combine path has no all-peer terminal frames. Dispatch's terminal handshake
+remains. Larger operations use the existing pair queues.
+
+`Config(combine_frame_rows=N)` sets rows per pair-queue frame independently of
+channel count, for `N` in 1 through 256. The default `0` retains the original
+split of `chunk_bytes` across channels and peers. Larger fixed frames consume
+more host memory as the allocated channel count grows; the host budget covers
+both queues and optional mailboxes. Dispatch frame sizing is unchanged.
+
 Normal submission and `wait()` do not scan host queue error headers. Use
 `check()` at a completed experiment/request boundary to inspect asynchronous
 errors. `Config(diagnostics=False)` is the default for `host_sm`: tag hashing,
@@ -132,17 +174,18 @@ number of logical work partitions, not a count of reserved SMs. A dispatch may
 supply `active_channels` from 1 through `ep.effective_channels`; all ranks must
 use the same value. Omitting it uses the full allocation. The handle retains
 this width for combine. Dispatch launches one CUDA block per active channel;
-combine launches one block per `(active channel, peer)`, including a local-only
+pair-queue combine launches one block per `(active channel, peer)`, including a local-only
 block for the current rank. Four active channels on eight ranks therefore
 launch four dispatch blocks and 32 combine blocks per GPU. Arena addresses and
 frame sizes stay fixed when the active width changes. CUDA places those blocks
-on SMs according to resource availability.
+on SMs according to resource availability. Fused mailbox combine instead
+launches one block per active channel.
 
 `channels` defaults to four. Initialization negotiates a common limit from
 dispatch and combine kernel occupancy, including the optional diagnostic
 kernel, and exposes it as `ep.effective_channels`. Multi-rank `host_sm`
 requires cooperative launch support so the whole communication grid can be
-resident. Each combine block progresses both directions of its rank pair:
+resident. Each pair-queue combine block progresses both directions of its rank pair:
 only that pair's receiver acknowledges its outgoing slots. Prepared dispatch
 publishes per-reader READY notifications for the union of a frame's target
 ranks, so unrelated ranks do not hold up payload-slot reuse. A separate terminal
@@ -168,6 +211,11 @@ ep.start_combine_profile(max_operations=64)
 run_workload(ep)
 report = ep.stop_combine_profile()
 ```
+
+This instrumentation supports pair-queue combine only. Do not submit
+`fused_combine=True` during a capture; the core rejects that combination. For
+SGLang diagnostics, set `EP_XPRESS_FUSED_DECODE=0` before starting the workers.
+Those profiles describe the queue path, not fused mailbox execution.
 
 The start call preallocates counters; the stop call bulk-copies them after one
 transport-stream fence. No per-layer CPU readback or collective is added.
@@ -238,10 +286,10 @@ replace full-model validation.
 
 ## Design boundaries
 
-Prefill and decode share routing and combine semantics. Future implementations
-may select different kernels and progress strategies without changing those
-semantics. Current options deliberately reject unimplemented CPU reduce and
-Graph modes instead of silently falling back.
+Prefill and decode share routing and numerical semantics. Bounded decode can
+select the mailbox combine kernel while prefill retains pair queues. Neither
+path overlaps expert GEMM with partially returned chunks. Current options
+reject unimplemented CPU reduce and Graph modes instead of silently falling back.
 
 The host budget covers shared rings plus reusable private pinned packs across
 the EP group. Device receive buffers, route metadata, allocator caches, and

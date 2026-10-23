@@ -10,7 +10,9 @@ Tensor and distributed bootstrap but never imports SGLang.
 `Config` defines capacity, chunk size, channel count, ring depth, memory budget, and timeout.
 `Context` owns persistent arenas and one CUDA device. `RouteHandle` identifies
 one dispatch and its inverse mapping. `Pending` retains completion state.
-Compatible layers reuse the same context; live handles remain independent.
+Compatible layers reuse the same context; ordinary live handles remain
+independent. Explicit workspaces provide a separate borrowed-storage contract
+for sequential inference.
 
 ## Transport selection
 
@@ -91,17 +93,18 @@ handle retains `owner_rows: int32[world_size, receive_capacity]` and
 handle. Only valid list entries are written; initialization clears the counts.
 Input expert IDs may be int32 or int64 without an intermediate cast kernel.
 
-Parallel initialization kernels clear output padding and combine scratch.
-After communication, a parallel combine kernel performs deterministic
-rank-order reduction. These kernels are stream ordered, so communication
-blocks do not also serialize full-buffer initialization and final reduction.
+Parallel initialization kernels clear output padding and pair-queue combine scratch.
+For pair queues, a parallel combine kernel after communication performs
+deterministic rank-order reduction. These kernels are stream ordered, so queue
+communication blocks do not also serialize full-buffer initialization and final
+reduction. The bounded decode mailbox path below fuses receive and reduction.
 
 The allocated channel count is agreed during bootstrap using the minimum safe
 kernel occupancy across the group. A channel is a logical work partition, not
 a reserved SM. Each dispatch may choose a CPU-known `active_channels` in
 `[1, effective_channels]`; all ranks must agree on that choice. Omitting it uses
 the full allocation. The handle carries the active width into combine.
-Dispatch launches `active_channels` CTAs; combine launches
+Dispatch launches `active_channels` CTAs; pair-queue combine launches
 `active_channels * world_size` CTAs, including one local-only CTA per channel. CUDA
 determines their placement, and several CTAs may reside on one SM. For
 multi-rank contexts, cooperative launch support is required even with one
@@ -114,9 +117,14 @@ no multi-device cooperative launch, GPU peer memory, TMA, or per-layer CPU
 capability exchange. See [CUDA cooperative launch requirements](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cooperative-groups.html).
 
 For dispatch, `chunk_bytes` is divided across allocated channels, rounding up
-to whole rows. Combine divides it across both allocated channels and peers.
-This keeps the payload budget approximately constant as queues are split,
-although row rounding, queue headers, and page alignment add overhead.
+to whole rows. With the default `combine_frame_rows=0`, pair-queue combine
+divides it across both allocated channels and peers. A positive
+`combine_frame_rows` in `[1, 256]` instead fixes the row capacity of each pair's
+frame independently of channel count. This lets prefill adjust parallelism
+without shrinking each frame. The original split keeps the payload budget
+approximately constant as queues are split; fixed rows instead make combine
+storage grow with allocated channels. Row rounding, queue headers and page
+alignment also contribute to the allocation.
 Changing an operation's active width changes its work partition and launch
 only: arena strides, row capacity per frame, and reserved memory stay fixed. Each queue has its
 own page-aligned arena and ring slots. Actual negotiated allocation is checked
@@ -186,7 +194,7 @@ queues, publication fences, and stream-lifetime ordering.
 
 ## Host-SM combine queues
 
-Combine uses separate source-owned rings indexed by `(channel, destination
+The general combine path uses separate source-owned rings indexed by `(channel, destination
 rank)`. Each directed queue has one producer and one consumer. Its slot has a
 producer-written generation and a single ACK word written only by that
 destination. A source can reuse a slot as soon as that consumer has copied
@@ -224,6 +232,89 @@ Combine keeps one payload queue per directed rank pair, while prepared
 dispatch shares a payload frame among its selected readers. Their queue
 layouts differ, but both reclaim payload slots using only actual consumers.
 Neither path currently exposes per-token completion to expert execution.
+
+## Bounded decode mailboxes
+
+`Config.decode_max_tokens` defaults to `0`, leaving this path disabled. A
+positive value in `[1, 256]` allocates a separate host mailbox arena per
+producer, with a fixed slot for every `(destination rank, source token)`.
+All processes map these CPU pages just as they map the general queues. One
+producer's allocation is page-rounded from
+`128 + world_size * decode_max_tokens * align128(32 + hidden_size * 2)` bytes.
+It is included in the group host budget and checked against the native ABI at
+bootstrap. Device route/output storage remains outside that host budget.
+
+The caller selects `dispatch_async(..., fused_combine=True)` consistently on
+all ranks. Dispatch writes two additional device arrays for each original
+source token: its target-rank mask and its compact local row, or `-1` if there
+is no local contribution. This adds no CPU route readback or metadata
+collective. The matching handle retains these arrays through combine.
+
+Fused combine launches one resident CTA per active channel, rather than one
+per channel and peer. Each CTA first publishes its partition of outgoing rows
+from the GPU owner lists into the destination's fixed token mailboxes. Payload
+writers fence before publishing READY for the current combine epoch. There
+is no wait for previous credits at this point: the preceding fused operation
+drained all of its published ACKs before returning on the same transport stream.
+
+The CTA then handles a partition of local source tokens. It waits only for
+contributors present in each token's saved mask, loads their host payloads,
+and accumulates them in ascending remote-rank order in FP32. It rounds the
+remote sum to BF16, adds the local BF16 partial if present, and rounds the
+output to BF16. This is the existing pair-queue arithmetic order, including
+the intermediate rounding. A dropped token produces zero. The receiver
+publishes each contributor's ACK only after all payload reads complete.
+
+Finally, each CTA drains only the ACKs for the contributions it published.
+Mailbox combine has no terminal frames or ACKs from unrelated ranks. Its
+output is produced in this one kernel, without clearing or writing
+rank-indexed remote GPU scratch and without a separate final-reduction launch.
+Dispatch still uses its required all-peer terminal handshake. Thus this change
+does not remove the operation ordering contract or provide early token-level
+completion to the expert runner.
+
+The native prepared operator requires increasing fused combine epochs and
+one serialized CUDA transport stream. An epoch belongs to the combine
+submission, not to its dispatch handle; independently allocated handles may
+still be combined in a consistent reverse order across ranks. GPU bounds,
+READY/ACK ordering and optional identity diagnostics remain active. Existing
+combine phase profiling does not instrument this kernel and explicitly rejects
+fusion; disable fusion to measure the pair-queue path.
+
+## Borrowed communication workspaces
+
+`Context.create_workspace(recv_capacity, local_tokens, fused_combine=...)` is a
+host-SM API for allocating exact-shape dispatch tensors, inverse/owner lists,
+device counts and combine output once. The legacy mode also allocates remote
+scratch; fused mode instead allocates the contributor masks and local-row
+array. `dispatch_async(..., workspace=workspace, fused_combine=...)` uses those
+tensors without repeated tensor allocations. This storage is for communication;
+expert GEMM intermediates remain the runner's responsibility.
+
+Workspace batches, outputs and tickets are borrowed until its next dispatch.
+The previous combine must have been waited, and all consumers of its output
+must have been enqueued on the wait stream before reuse. Retaining output
+across reuse requires a clone or a different workspace. A new dispatch
+invalidates the old workspace-backed tickets; an unconsumed route cannot be
+overwritten. Generic calls that omit a workspace continue to allocate
+independent storage and support outstanding handles.
+
+Reuse orders the transport stream after prior consumer streams using GPU
+dependencies only. The usual same-producer case uses the dependency already
+inserted at submission, without adding another wait event. Cross-stream
+consumers receive the additional required dependencies. There is no host event
+query, CPU count readback or stream synchronization in workspace acquisition.
+Tensor stream lifetimes also protect storage when a caller evicts a workspace.
+
+The SGLang adapter enables reuse only for globally selected small decode
+operations. Each layer owns a FIFO cache of at most four exact
+`(global capacity, local token count, fusion mode)` shapes. Layers share the
+transport context but not these output buffers, avoiding cross-layer residual
+aliases. Cache misses allocate once; eviction removes the oldest inserted
+shape, and cache hits do not change that order. Dynamic GPU valid counts still
+control meaningful rows within the scheduler capacity.
+
+## Submission and diagnostics
 
 `Pending.wait()` inserts an event dependency on the consuming stream without
 waiting for device routing on the CPU. Input/output tensors and mapped arenas
@@ -271,14 +362,17 @@ events and `record_stream` likewise carry required data dependencies. The
 producer and native work-stream capture guards check different streams and
 remain in place because CUDA Graph execution is not implemented.
 
-Remaining limits include draining each operation's queues before returning and
-the all-peer terminal handshake. Double slots and multiple active channels
+Remaining limits include draining published payload ACKs before returning and
+dispatch's all-peer terminal handshake. Double slots and multiple active channels
 provide buffering and parallel progress; they do not establish overlap with
 expert GEMM or arbitrary cross-layer concurrency. Dispatch interleaves sends
-and receives within each channel CTA; combine does so within each pair CTA,
+and receives within each channel CTA; pair-queue combine does so within each pair CTA,
 rather than assigning dedicated sender/receiver blocks. The owner-list path
 removes combine's repeated inverse scans, but still performs per-frame
-metadata, fence, and ACK work. Fixed-capacity allocations and expert runners
+metadata, fence, and ACK work. Mailbox combine replaces those frames with
+per-token notifications and still waits for each actual contributor. Reused
+communication buffers do not eliminate expert workspace allocation or every
+Python submission object. Fixed-capacity layouts and expert runners
 that ignore the device valid count can also add work. These costs must be
 measured separately from removed CPU route planning and collectives.
 
@@ -305,10 +399,12 @@ Native accumulation kernels use unique token indices for each rank's partial,
 so they need no inter-thread atomics. Calls on a shared accumulator are ordered
 on one stream. Context only uses the trusted fast path after route validation.
 
-The SM path receives remote partials into rank-indexed BF16 GPU scratch planes,
-then sums ranks in ascending order. Arrival order does not change the result.
-This scratch storage is additional device memory, separate from the bounded
-host rings. Routing weights are not applied again during combine.
+The SM pair-queue path receives remote partials into rank-indexed BF16 GPU
+scratch planes, then sums ranks in ascending order. The mailbox path loads
+those partials directly from host memory in the same arithmetic order. Arrival
+order does not change either result. Pair-queue scratch is additional device
+memory, separate from bounded host arenas. Routing weights are not applied
+again during combine.
 
 ## Memory and failure handling
 

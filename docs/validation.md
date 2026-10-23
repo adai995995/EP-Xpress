@@ -1,5 +1,28 @@
 # Validation
 
+## Decode workspace and fused mailbox combine
+
+Runtime `4356b6f` adds explicitly borrowed decode workspaces, a bounded host
+mailbox with fused receive/reduction, and independently configurable combine
+frame rows for the rank-pair path. The CUDA extension compiled successfully.
+
+Five focused checks passed in the offline CUDA environment:
+
+- One three-GPU protocol check covers sparse contributors, an unrelated rank
+  delayed until its peers finish, empty inputs, exact mailbox capacity,
+  changing active widths, repeated reuse and reverse-order dispatch handles.
+  Fused outputs match the original rank-pair combine bit for bit. Reusing a
+  combine submission epoch is rejected before launch.
+- Four CPU interface cases (including a two-mode parameterization) cover
+  borrowed storage reuse, consumer-stream dependencies, expired tickets,
+  incompatible workspaces and operation-owned fused outputs.
+
+Three focused local Config/adapter cases, Python syntax, and whitespace checks
+also pass. The GPU check enables protocol diagnostics; full-model timing uses
+the normal diagnostics-disabled setting. The broader historical suites were
+not rerun. These checks establish the changed protocol and storage contract;
+performance measurements are reported separately.
+
 ## GPU owner lists, selective dispatch, and count-aware experts
 
 Runtime `7b05797` builds return-owner lists during dispatch, lets each handle
