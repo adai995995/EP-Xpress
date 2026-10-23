@@ -4,6 +4,29 @@ from ep_xpress import Config
 
 
 class ConfigTests(unittest.TestCase):
+    def test_independent_combine_frames_and_decode_mailbox_budget(self):
+        cfg = Config(2048, 8, 16384, transport="host_sm", channels=32,
+                     chunk_bytes=4 << 20, combine_frame_rows=16, decode_max_tokens=64)
+        self.assertEqual(cfg.combine_chunk_rows(channels=1, queue_peers=8), 16)
+        self.assertEqual(cfg.combine_chunk_rows(channels=32, queue_peers=8), 16)
+        # Dispatch still splits its separate chunk budget across channels.
+        self.assertEqual(cfg.channel_chunk_rows(32), 32)
+        legacy = Config(2048, 8, 16384, transport="host_sm", channels=32, chunk_bytes=4 << 20)
+        self.assertEqual(cfg.mapped_arena_bytes(8), legacy.mapped_arena_bytes(8))
+        self.assertEqual(legacy.combine_chunk_rows(queue_peers=8), 4)
+        record = ((32 + 4096 + 127) // 128) * 128
+        mailbox = ((128 + 8 * 64 * record + 4095) // 4096) * 4096
+        self.assertEqual(cfg.mailbox_arena_bytes(8), mailbox)
+        self.assertEqual(cfg.pool_bytes(8), 8 * (cfg.mapped_arena_bytes(8) +
+                         cfg.mapped_arena_bytes(0, queue_peers=8) + mailbox))
+        self.assertLess(cfg.pool_bytes(8), cfg.host_pool_budget_bytes)
+        for field in ("combine_frame_rows", "decode_max_tokens"):
+            for value in (-1, 257, True):
+                with self.assertRaises(ValueError):
+                    Config(128, 4, 32, transport="host_sm", **{field: value})
+            with self.assertRaises(ValueError):
+                Config(128, 4, 32, transport="host_ce", **{field: 1})
+
     def test_aligned_budget_and_rows(self):
         cfg = Config(10, 2, 128, chunk_bytes=100, slots=2)
         self.assertEqual(cfg.chunk_rows, 5)

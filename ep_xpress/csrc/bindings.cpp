@@ -16,6 +16,7 @@ void add_partial_cuda(torch::Tensor accum, torch::Tensor partial,
 torch::Tensor finish_combine_cuda(torch::Tensor remote, torch::Tensor local);
 
 int64_t host_sm_max_channels(int64_t world);
+int64_t host_sm_mailbox_bytes(int64_t hidden, int64_t tokens, int64_t world);
 std::vector<std::string> host_sm_profile_fields();
 int64_t host_sm_arena_bytes(int64_t hidden, int64_t topk, int64_t slots, int64_t chunk_rows, int64_t channels, int64_t queue_peers);
 void host_sm_dispatch_cuda(torch::Tensor input, torch::Tensor ids, torch::Tensor weights,
@@ -152,31 +153,40 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
           pybind11::arg("epoch"), pybind11::arg("output"), pybind11::arg("output_ids"),
           pybind11::arg("output_weights"), pybind11::arg("inverse"), pybind11::arg("count"),
           pybind11::arg("owner_rows"), pybind11::arg("owner_counts"),
-          pybind11::arg("active_channels") = 0, pybind11::arg("identity") = 0)
+          pybind11::arg("active_channels") = 0, pybind11::arg("identity") = 0,
+          pybind11::arg("expected_ranks") = pybind11::none(),
+          pybind11::arg("local_rows") = pybind11::none())
       .def("combine", &PreparedHostSM::combine,
           pybind11::arg("partial"), pybind11::arg("inverse"), pybind11::arg("count"),
           pybind11::arg("owner_rows"), pybind11::arg("owner_counts"),
           pybind11::arg("epoch"), pybind11::arg("output"), pybind11::arg("remote"),
-          pybind11::arg("active_channels") = 0, pybind11::arg("identity") = 0, pybind11::arg("profile") = pybind11::none());
+          pybind11::arg("active_channels") = 0, pybind11::arg("identity") = 0, pybind11::arg("profile") = pybind11::none(),
+          pybind11::arg("expected_ranks") = pybind11::none(),
+          pybind11::arg("local_rows") = pybind11::none());
   module.def("prepare_host_sm", [](torch::Tensor expert_rank, torch::Tensor expert_local,
       torch::Tensor dispatch_pointers, torch::Tensor combine_pointers, torch::Tensor status,
       int64_t rank, int64_t hidden, int64_t topk, int64_t slots, int64_t dispatch_rows,
       int64_t combine_rows, int64_t timeout_ms, int64_t channels,
-      bool diagnostics, bool fatal_errors) {
+      bool diagnostics, bool fatal_errors, c10::optional<torch::Tensor> mailbox_pointers,
+      int64_t mailbox_tokens) {
     return std::make_shared<PreparedHostSM>(expert_rank, expert_local, dispatch_pointers,
         combine_pointers, status, rank, hidden, topk, slots, dispatch_rows, combine_rows,
-        timeout_ms, channels, diagnostics, fatal_errors);
+        timeout_ms, channels, diagnostics, fatal_errors, mailbox_pointers, mailbox_tokens);
   }, pybind11::arg("expert_rank"), pybind11::arg("expert_local"),
       pybind11::arg("dispatch_pointers"), pybind11::arg("combine_pointers"),
       pybind11::arg("status"), pybind11::arg("rank"), pybind11::arg("hidden"),
       pybind11::arg("topk"), pybind11::arg("slots"), pybind11::arg("dispatch_rows"),
       pybind11::arg("combine_rows"), pybind11::arg("timeout_ms"), pybind11::arg("channels"),
       pybind11::kw_only(), pybind11::arg("diagnostics") = false,
-      pybind11::arg("fatal_errors") = false);
+      pybind11::arg("fatal_errors") = false,
+      pybind11::arg("mailbox_pointers") = pybind11::none(),
+      pybind11::arg("mailbox_tokens") = 0);
   module.def("register_host", &register_host);
   module.def("register_mapped_host", &register_mapped_host);
   module.def("host_sm_max_channels", &host_sm_max_channels, pybind11::arg("world") = 1);
   module.def("host_sm_profile_fields", &host_sm_profile_fields);
+  module.def("host_sm_mailbox_bytes", &host_sm_mailbox_bytes,
+      pybind11::arg("hidden"), pybind11::arg("tokens"), pybind11::arg("world"));
   module.def("host_sm_arena_bytes", &host_sm_arena_bytes,
       pybind11::arg("hidden"), pybind11::arg("topk"), pybind11::arg("slots"),
       pybind11::arg("chunk_rows"), pybind11::arg("channels"),

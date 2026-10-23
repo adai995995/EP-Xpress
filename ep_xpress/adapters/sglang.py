@@ -95,6 +95,12 @@ class HostEPDispatcher(BaseDispatcher):
         diagnostics = os.environ.get("EP_XPRESS_DIAGNOSTICS", "0")
         if diagnostics not in ("0", "1"):
             raise ValueError("EP_XPRESS_DIAGNOSTICS must be 0 or 1")
+        decode_workspace = os.environ.get("EP_XPRESS_DECODE_WORKSPACE", "1")
+        fused_decode = os.environ.get("EP_XPRESS_FUSED_DECODE", "1")
+        if decode_workspace not in ("0", "1") or fused_decode not in ("0", "1"):
+            raise ValueError("EP_XPRESS_DECODE_WORKSPACE and EP_XPRESS_FUSED_DECODE must be 0 or 1")
+        self._reuse_decode_workspace = transport == "host_sm" and decode_workspace == "1"
+        self._fused_decode = transport == "host_sm" and fused_decode == "1"
         self._config = Config(
             hidden_size=moe_runner_config.hidden_size,
             topk=moe_runner_config.top_k,
@@ -106,6 +112,10 @@ class HostEPDispatcher(BaseDispatcher):
             transport=transport,
             fatal_errors=transport == "host_sm",
             diagnostics=diagnostics == "1",
+            combine_frame_rows=(int(os.environ.get("EP_XPRESS_COMBINE_FRAME_ROWS", "16"))
+                                if transport == "host_sm" else 0),
+            decode_max_tokens=(int(os.environ.get("EP_XPRESS_DECODE_MAX_TOKENS", "64"))
+                               if transport == "host_sm" else 0),
         )
         adaptive = os.environ.get("EP_XPRESS_ADAPTIVE_CHANNELS", "1")
         valid_count = os.environ.get("EP_XPRESS_VALID_COUNT", "1")
@@ -127,6 +137,10 @@ class HostEPDispatcher(BaseDispatcher):
         self._sequence = 0
         self._tickets = deque()
         self._failed = False
+        # Per-layer storage avoids aliasing another layer's residual/input.
+        # Values are borrowed until this layer reuses the same exact shape;
+        # SGLang queues all consumers on its forward stream before that reuse.
+        self._decode_workspaces = {}
 
     def _context(self):
         # Lazy creation avoids allocating CUDA resources during weight setup.
@@ -177,14 +191,36 @@ class HostEPDispatcher(BaseDispatcher):
                 # instead of validating and summing all rank counts per layer.
                 # Each source's input capacity is still checked by the core.
                 capacity = get_global_dp_buffer_len()
+                is_extend = get_is_extend_in_batch()
                 dispatch_options["recv_capacity"] = capacity
                 dispatch_options["active_channels"] = select_active_channels(
-                    capacity, is_extend=get_is_extend_in_batch(),
+                    capacity, is_extend=is_extend,
                     allocated=self._context().effective_channels,
                     adaptive=self._adaptive_channels,
                     prefill_override=self._prefill_channels,
                     decode_override=self._decode_channels,
                 )
+                # All ranks derive fusion from existing global CPU metadata.
+                # Local token counts only select a local workspace shape.
+                small_decode = (not is_extend and
+                                0 <= capacity <= self._config.decode_max_tokens and
+                                self._config.decode_max_tokens > 0)
+                fused = small_decode and self._fused_decode
+                dispatch_options["fused_combine"] = fused
+                if small_decode and self._reuse_decode_workspace:
+                    key = (capacity, hidden_states.shape[0], fused)
+                    workspace = self._decode_workspaces.get(key)
+                    if workspace is None:
+                        workspace = self._context().create_workspace(
+                            recv_capacity=capacity, local_tokens=hidden_states.shape[0],
+                            fused_combine=fused,
+                        )
+                        # Bound storage for dynamic serving batches. Outstanding
+                        # tensors retain their stream lifetimes on eviction.
+                        if len(self._decode_workspaces) == 4:
+                            self._decode_workspaces.pop(next(iter(self._decode_workspaces)))
+                        self._decode_workspaces[key] = workspace
+                    dispatch_options["workspace"] = workspace
             batch = self._context().dispatch_async(
                 hidden_states,
                 topk_output.topk_ids,

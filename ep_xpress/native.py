@@ -227,10 +227,18 @@ def host_sm_arena_bytes(hidden: int, topk: int, slots: int, chunk_rows: int,
     )
 
 
+def host_sm_mailbox_bytes(hidden: int, tokens: int, world: int) -> int:
+    """Bytes in one producer's bounded decode return mailbox arena."""
+    return load().host_sm_mailbox_bytes(
+        _integer(hidden, "hidden", 1), _integer(tokens, "tokens", 1),
+        _integer(world, "world", 1),
+    )
+
+
 def prepare_host_sm(
     expert_rank, expert_local, dispatch_pointers, combine_pointers, status,
     rank, hidden, topk, slots, dispatch_rows, combine_rows, timeout_ms, channels,
-    *, diagnostics=False, fatal_errors=False,
+    *, diagnostics=False, fatal_errors=False, mailbox_pointers=None, mailbox_tokens=0,
 ):
     """Validate and cache immutable GPU transport state during bootstrap.
 
@@ -255,6 +263,13 @@ def prepare_host_sm(
     value must be in [1, channels]. The caller uses the same active width for
     every rank and for the matching combine. Arena strides and frame capacities
     remain those fixed at preparation time.
+
+    Optional mailbox_pointers int64[world] enables bounded decode combine.
+    Prepared dispatch may then fill expected_ranks int64[local_tokens] and
+    local_rows int32[local_tokens]. Passing that matching state to combine
+    selects receive-and-reduce fusion with remote=None. Mailbox tokens bound
+    each source rank's token capacity; their host storage remains owned by the
+    context. Omitting these arguments preserves the rank-pair queue path.
     """
     if not isinstance(diagnostics, bool) or not isinstance(fatal_errors, bool):
         raise TypeError("diagnostics and fatal_errors must be bools")
@@ -266,6 +281,8 @@ def prepare_host_sm(
         _integer(combine_rows, "combine_rows", 1),
         _integer(timeout_ms, "timeout_ms", 1), _integer(channels, "channels", 1),
         diagnostics=diagnostics, fatal_errors=fatal_errors,
+        mailbox_pointers=mailbox_pointers,
+        mailbox_tokens=_integer(mailbox_tokens, "mailbox_tokens"),
     )
 
 

@@ -69,6 +69,11 @@ def fake_adapter(rows=3, scheduler_counts=(2, 1), is_extend=False):
             calls.append(("init", kwargs))
             self.effective_channels = kwargs["config"].channels
 
+        def create_workspace(self, **kwargs):
+            workspace = SimpleNamespace(**kwargs)
+            calls.append(("workspace", workspace))
+            return workspace
+
         def dispatch_async(self, *args, **kwargs):
             calls.append(("dispatch", args, kwargs))
             return Pending(batch)
@@ -174,6 +179,25 @@ class AdapterValidationTest(unittest.TestCase):
 
 
 class AdapterContractTest(unittest.TestCase):
+    def test_decode_workspace_reuse_and_prefill_fallback(self):
+        with patch.dict(os.environ, {"EP_XPRESS_TRANSPORT": "host_sm"}):
+            with fake_adapter(scheduler_counts=(2, 1)) as fixture:
+                dispatcher = fixture.module.HostEPDispatcher(runner_config())
+                topk = fixture.topk(object(), object(), object())
+                dispatcher.dispatch(Tensor((2, 16)), topk)
+                first = fixture.calls[-1][2]
+                self.assertTrue(first["fused_combine"])
+                workspace = first["workspace"]
+                dispatcher.combine(fixture.combine(Tensor((3, 16))))
+                dispatcher.dispatch(Tensor((2, 16)), topk)
+                self.assertIs(fixture.calls[-1][2]["workspace"], workspace)
+                dispatcher.combine(fixture.combine(Tensor((3, 16))))
+                fixture.module.get_is_extend_in_batch = lambda: True
+                dispatcher.dispatch(Tensor((2, 16)), topk)
+                self.assertFalse(fixture.calls[-1][2]["fused_combine"])
+                self.assertNotIn("workspace", fixture.calls[-1][2])
+                self.assertEqual(sum(c[0] == "workspace" for c in fixture.calls), 1)
+
     def test_host_sm_keeps_device_count_off_host_path(self):
         class DeviceCount:
             def __bool__(self):

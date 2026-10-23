@@ -340,3 +340,144 @@ def test_pending_preserves_owner_tensor_stream_lifetimes_and_operation_width():
     assert (id(route.owner_counts), consumer) in recorded
     assert all(call.args == (completed,) for call in consumer.wait_event.call_args_list)
     assert pending.metrics == {"transport": "host_sm", "channels": 1, "allocated_channels": 32}
+
+
+def _workspace_context():
+    context = object.__new__(HostSMContext)
+    context.config = Config(4, 2, 3, transport="host_sm", chunk_bytes=1024,
+                            channels=2, decode_max_tokens=3)
+    context.device = torch.device("cuda", 0)
+    context.world_size, context.effective_channels = 2, 2
+    context._max_receive_capacity = 6
+    context._id, context._counter = "workspace-context", 0
+    context._closed, context._failure, context._unwaited = False, None, 0
+    context._epochs = {"dispatch": 0, "combine": 0}
+    context._lock = threading.RLock()
+    context._work_stream = Mock()
+    context._prepared = Mock()
+    context._abort = Mock()
+    context._combine_profile = None
+    return context
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_borrowed_workspace_reuses_tensors_after_combine_wait_with_stream_dependencies(fused):
+    context = _workspace_context()
+    x = torch.zeros((3, 4), dtype=torch.bfloat16)
+    ids = torch.zeros((3, 2), dtype=torch.int64)
+    weights = torch.ones((3, 2), dtype=torch.float32)
+    producer, consumer = Mock(device=context.device), Mock(device=context.device)
+    empty = torch.empty
+
+    def cpu_empty(shape, **kwargs):
+        kwargs.pop("device", None)
+        return empty(shape, **kwargs)
+
+    with patch("ep_xpress.host_sm.torch.cuda.device", side_effect=lambda _: nullcontext()), \
+            patch("ep_xpress.host_sm.torch.cuda.stream", side_effect=lambda _: nullcontext()), \
+            patch("ep_xpress.host_sm.torch.cuda.is_current_stream_capturing", return_value=False), \
+            patch("ep_xpress.host_sm.torch.cuda.Event", side_effect=lambda: Mock()), \
+            patch.object(torch.Tensor, "record_stream"), \
+            patch("ep_xpress.host_sm.torch.empty", side_effect=cpu_empty) as allocate:
+        workspace = context.create_workspace(5, 3, fused_combine=fused)
+        allocated = allocate.call_count
+        first = context.dispatch_async(x, ids, weights, stream=producer, workspace=workspace,
+                                       fused_combine=fused)
+        first_batch = first.wait(stream=producer)
+        first_combine = context.combine_async(first_batch.hidden, first_batch.handle, stream=producer)
+        # Merely enqueueing combine is insufficient: output consumers must be
+        # attached before the explicitly borrowed storage can be overwritten.
+        epochs = context._epochs.copy()
+        with pytest.raises(RuntimeError, match="previous workspace combine"):
+            context.dispatch_async(x, ids, weights, stream=producer, workspace=workspace,
+                                   fused_combine=fused)
+        assert context._epochs == epochs
+        output = first_combine.wait(stream=consumer)
+        assert output is workspace.output
+        first_combine.wait(stream=producer)
+        context._work_stream.wait_stream.reset_mock()
+        second = context.dispatch_async(x, ids, weights, stream=producer, workspace=workspace,
+                                        fused_combine=fused)
+        second_batch = second.wait(stream=producer)
+        second_combine = context.combine_async(second_batch.hidden, second_batch.handle, stream=producer)
+        assert second_combine.wait(stream=producer) is output
+        assert allocate.call_count == allocated  # No subsequent tensor allocations.
+        assert first_batch.hidden is second_batch.hidden is workspace.hidden
+        assert first_batch.handle is not second_batch.handle
+        assert first_batch.handle._consumed and second_batch.handle._consumed
+        assert first_batch.handle.inverse_map is second_batch.handle.inverse_map
+        assert first_batch.handle._plan.owner_rows is second_batch.handle._plan.owner_rows
+        assert any(call.args == (consumer,) for call in context._work_stream.wait_stream.call_args_list)
+        with pytest.raises(RuntimeError, match="expired"):
+            first.wait(stream=producer)
+        with pytest.raises(RuntimeError, match="expired"):
+            _ = first_combine.done
+
+    dispatch, combine = context._prepared.dispatch.call_args, context._prepared.combine.call_args
+    assert combine.args[7] is workspace.remote
+    if fused:
+        assert workspace.remote is None
+        assert dispatch.kwargs["expected_ranks"] is combine.kwargs["expected_ranks"] is workspace.expected_ranks
+        assert dispatch.kwargs["local_rows"] is combine.kwargs["local_rows"] is workspace.local_rows
+    else:
+        assert tuple(workspace.remote.shape) == (2, 3, 4)
+        assert "expected_ranks" not in dispatch.kwargs and "expected_ranks" not in combine.kwargs
+
+
+def test_workspace_rejects_shape_mode_and_owner_before_submitting():
+    context = _workspace_context()
+    x = torch.zeros((3, 4), dtype=torch.bfloat16)
+    ids = torch.zeros((3, 2), dtype=torch.int64)
+    weights = torch.ones((3, 2), dtype=torch.float32)
+    empty = torch.empty
+
+    def cpu_empty(shape, **kwargs):
+        kwargs.pop("device", None)
+        return empty(shape, **kwargs)
+
+    with patch("ep_xpress.host_sm.torch.cuda.device", side_effect=lambda _: nullcontext()), \
+            patch("ep_xpress.host_sm.torch.cuda.stream", side_effect=lambda _: nullcontext()), \
+            patch("ep_xpress.host_sm.torch.cuda.is_current_stream_capturing", return_value=False), \
+            patch("ep_xpress.host_sm.torch.empty", side_effect=cpu_empty), \
+            patch.object(context, "_begin") as begin:
+        workspace = context.create_workspace(5, 3, fused_combine=True)
+        with pytest.raises(ValueError, match="shape or fused combine mode"):
+            context.dispatch_async(x, ids, weights, workspace=workspace)
+        with pytest.raises(ValueError, match="shape or fused combine mode"):
+            context.dispatch_async(x, ids, weights, recv_capacity=6, workspace=workspace, fused_combine=True)
+        workspace._context_id = "another-context"
+        with pytest.raises(ValueError, match="another context"):
+            context.dispatch_async(x, ids, weights, workspace=workspace, fused_combine=True)
+        with pytest.raises(ValueError, match="rank capacity"):
+            context.create_workspace(5, 4, fused_combine=True)
+        begin.assert_not_called()
+
+
+def test_fused_combine_without_workspace_keeps_operation_owned_output():
+    context = _workspace_context()
+    x = torch.zeros((3, 4), dtype=torch.bfloat16)
+    ids = torch.zeros((3, 2), dtype=torch.int64)
+    weights = torch.ones((3, 2), dtype=torch.float32)
+    producer = Mock(device=context.device)
+    empty = torch.empty
+
+    def cpu_empty(shape, **kwargs):
+        kwargs.pop("device", None)
+        return empty(shape, **kwargs)
+
+    with patch("ep_xpress.host_sm.torch.cuda.device", side_effect=lambda _: nullcontext()), \
+            patch("ep_xpress.host_sm.torch.cuda.stream", side_effect=lambda _: nullcontext()), \
+            patch("ep_xpress.host_sm.torch.cuda.is_current_stream_capturing", return_value=False), \
+            patch("ep_xpress.host_sm.torch.cuda.Event", side_effect=lambda: Mock()), \
+            patch.object(torch.Tensor, "record_stream"), \
+            patch("ep_xpress.host_sm.torch.empty", side_effect=cpu_empty):
+        batches = [context.dispatch_async(x, ids, weights, stream=producer, recv_capacity=5,
+                                          fused_combine=True).wait(stream=producer)
+                   for _ in range(2)]
+        outputs = [context.combine_async(batch.hidden, batch.handle, stream=producer).wait(stream=producer)
+                   for batch in reversed(batches)]
+        assert outputs[0] is not outputs[1]
+        assert batches[0].handle._plan.expected_ranks is not batches[1].handle._plan.expected_ranks
+        assert all(batch.handle._plan.workspace is None for batch in batches)
+        assert all(call.args[7] is None for call in context._prepared.combine.call_args_list)
+        assert [call.args[5] for call in context._prepared.combine.call_args_list] == [1, 2]

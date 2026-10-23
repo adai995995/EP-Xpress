@@ -230,6 +230,11 @@ struct TransportArgs {
   const int32_t* expert_rank;
   const int32_t* expert_local;
   const int64_t* pointers;
+  const int64_t* mailbox_pointers;
+  int64_t* expected_ranks;
+  int32_t* local_rows;
+  int mailbox_tokens;
+  int64_t mailbox_stride;
   const int64_t* input_inverse;
   const int32_t* input_count;
   at::BFloat16* output;
@@ -282,6 +287,8 @@ __global__ void host_sm_init_kernel(TransportArgs a) {
   int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = int64_t(gridDim.x) * blockDim.x;
   if (!Combine && i == 0) *a.output_count = 0;
+  if (!Combine && a.local_rows)
+    for (int64_t j = i; j < a.input_rows; j += stride) a.local_rows[j] = -1;
   if (!Combine && a.owner_counts)
     for (int64_t j = i; j < a.world; j += stride) a.owner_counts[j] = 0;
   for (int64_t j = i; j < int64_t(a.capacity) * a.hidden; j += stride)
@@ -427,6 +434,7 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
           }
         }
       }
+      if (!Combine && a.expected_ranks && tid < batch) a.expected_ranks[token] = int64_t(mask);
       masks[tid] = mask;
       tokens[tid] = token;
       const bool local = (mask & (uint64_t(1) << a.rank)) != 0;
@@ -468,6 +476,7 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
           if (tid < num_local) {
             a.output_inverse[int64_t(output_base + tid) * 2] = a.rank;
             a.output_inverse[int64_t(output_base + tid) * 2 + 1] = cursor + local_rows[tid];
+            if (a.local_rows) a.local_rows[cursor + local_rows[tid]] = output_base + tid;
             if (a.owner_rows)
               a.owner_rows[int64_t(a.rank) * a.capacity + owner_base + tid] = output_base + tid;
           }
@@ -1022,6 +1031,175 @@ __global__ void host_sm_pair_combine_kernel(TransportArgs a) {
   }
 }
 
+// Decode uses bounded, direct-address return mailboxes. A producer owns one
+// payload per (destination rank, original token); only that destination writes
+// its ACK. The preceding call drains every outgoing ACK before returning on
+// the serialized transport stream, so this call never waits for old credit
+// before sending. Every resident CTA publishes all its sends before waiting
+// for incoming data. No receive can be blocked behind a credit-waiting sender.
+__device__ __forceinline__ char* mailbox(TransportArgs a, int producer,
+                                       int destination, int token) {
+  return reinterpret_cast<char*>(a.mailbox_pointers[producer]) + kArenaHeader +
+      (int64_t(destination) * a.mailbox_tokens + token) * a.mailbox_stride;
+}
+
+__device__ __forceinline__ int mailbox_health(TransportArgs a, uint64_t start,
+                                              uint32_t iteration) {
+  if (a.diagnostics && (iteration & 255u) == 0) {
+    for (int peer = 0; peer < a.world; ++peer) {
+      auto* header = reinterpret_cast<uint64_t*>(a.mailbox_pointers[peer]);
+      if (acquire(header) || acquire(header + 1)) fail(a.status, 4);
+    }
+    if (ticks_ns() - start > a.timeout_ns) fail(a.status, 3);
+  }
+  return read_status(a.status);
+}
+
+__global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
+  __shared__ int begin, end, row, token, error, local_row, blocked;
+  __shared__ uint64_t readers;
+  const int tid = threadIdx.x, channel = blockIdx.x;
+  const uint64_t start = a.diagnostics ? ticks_ns() : 0;
+  if (tid == 0) error = read_status(a.status);
+  __syncthreads();
+
+  // No intermediate HBM copy or capacity-sized clear. All sends are bounded
+  // by dispatch's owner list; each payload is written exactly once.
+  for (int peer = 0; peer < a.world && !error; ++peer) {
+    if (peer == a.rank) continue;
+    if (tid == 0) {
+      int n = a.owner_counts[peer];
+      if (n < 0 || n > a.input_rows) { fail(a.status, 1); n = 0; }
+      begin = int(int64_t(n) * channel / a.channels);
+      end = int(int64_t(n) * (channel + 1) / a.channels);
+      error = read_status(a.status);
+    }
+    __syncthreads();
+    for (int index = begin; index < end && !error; ++index) {
+      if (tid == 0) {
+        row = a.owner_rows[int64_t(peer) * a.input_rows + index];
+        if (row < 0 || row >= a.input_rows) fail(a.status, 1);
+        else {
+          const int64_t original = a.input_inverse[int64_t(row) * 2 + 1];
+          if (original < 0 || original >= a.mailbox_tokens) fail(a.status, 2);
+          else token = int(original);
+          if (a.diagnostics && a.input_inverse[int64_t(row) * 2] != peer) fail(a.status, 1);
+        }
+        error = read_status(a.status);
+      }
+      __syncthreads();
+      if (error) break;
+      char* box = mailbox(a, a.rank, peer, token);
+      const auto* source = reinterpret_cast<const uint32_t*>(a.input + int64_t(row) * a.hidden);
+      for (int h = tid; h < a.hidden / 2; h += blockDim.x)
+        host_store32(box + 32 + int64_t(h) * 4, source[h]);
+      // All payload writers publish their system writes before READY's owner.
+      __threadfence_system();
+      __syncthreads();
+      if (tid == 0) {
+        if (a.diagnostics) host_store64(box + 16, a.identity);
+        release(control(box, 0), a.epoch);
+      }
+      __syncthreads();
+    }
+  }
+
+  // A token CTA waits only for its actual remote contributors, then performs
+  // the exact legacy arithmetic: ascending-rank FP32 sum -> BF16 -> add local
+  // BF16 -> BF16. The local compact row is provided by dispatch.
+  const int first = int(int64_t(a.capacity) * channel / a.channels);
+  const int last = int(int64_t(a.capacity) * (channel + 1) / a.channels);
+  for (int original = first; original < last && !error; ++original) {
+    if (tid == 0) {
+      readers = uint64_t(a.expected_ranks[original]);
+      local_row = a.local_rows[original];
+      if ((readers >> a.world) || local_row < -1 || local_row >= a.input_rows ||
+          bool(readers & (uint64_t(1) << a.rank)) != (local_row >= 0)) fail(a.status, 1);
+      error = read_status(a.status);
+    }
+    __syncthreads();
+    uint32_t iteration = 0;
+    do {
+      bool missing = false;
+      if (tid < a.world && tid != a.rank && (readers & (uint64_t(1) << tid)))
+        missing = acquire(control(mailbox(a, tid, a.rank, original), 0)) != a.epoch;
+      const int waiting = __syncthreads_or(missing);
+      if (tid == 0) {
+        blocked = waiting;
+        error = mailbox_health(a, start, iteration++);
+      }
+      __syncthreads();
+      if (blocked && !error) __nanosleep(64);
+    } while (blocked && !error);
+    if (error) break;
+    if (a.diagnostics && tid < a.world && tid != a.rank &&
+        (readers & (uint64_t(1) << tid)) &&
+        host_load64(mailbox(a, tid, a.rank, original) + 16) != a.identity) fail(a.status, 5);
+    __syncthreads();
+    if (tid == 0) error = read_status(a.status);
+    __syncthreads();
+    if (error) break;
+    for (int h = tid; h < a.hidden / 2; h += blockDim.x) {
+      float sum0 = 0.0f, sum1 = 0.0f;
+      for (int peer = 0; peer < a.world; ++peer) {
+        if (peer == a.rank) continue;
+        uint32_t bits = 0;
+        if (readers & (uint64_t(1) << peer))
+          bits = host_load32(mailbox(a, peer, a.rank, original) + 32 + int64_t(h) * 4);
+        const auto packed = *reinterpret_cast<const __nv_bfloat162*>(&bits);
+        const float2 value = __bfloat1622float2(packed);
+        sum0 += value.x;
+        sum1 += value.y;
+      }
+      const at::BFloat16 rounded0(sum0), rounded1(sum1);
+      const int64_t offset = int64_t(local_row) * a.hidden + h * 2;
+      const float local0 = local_row >= 0 ? float(a.input[offset]) : 0.0f;
+      const float local1 = local_row >= 0 ? float(a.input[offset + 1]) : 0.0f;
+      a.output[int64_t(original) * a.hidden + h * 2] = at::BFloat16(float(rounded0) + local0);
+      a.output[int64_t(original) * a.hidden + h * 2 + 1] = at::BFloat16(float(rounded1) + local1);
+    }
+    // ACK follows every reader's final host load, allowing safe next-call reuse.
+    __threadfence_system();
+    __syncthreads();
+    if (tid < a.world && tid != a.rank && (readers & (uint64_t(1) << tid)))
+      release(control(mailbox(a, tid, a.rank, original), 1), a.epoch);
+    __syncthreads();
+  }
+
+  // Each CTA drains only the rows it published. There is no terminal frame or
+  // all-rank ACK: a rank with no incoming/outgoing rows can finish immediately.
+  for (int peer = 0; peer < a.world && !error; ++peer) {
+    if (peer == a.rank) continue;
+    const int n = a.owner_counts[peer];  // Bounds were checked in the send phase.
+    const int first_send = int(int64_t(n) * channel / a.channels);
+    const int last_send = int(int64_t(n) * (channel + 1) / a.channels);
+    for (int index = first_send; index < last_send && !error; ++index) {
+      if (tid == 0) {
+        const int sent_row = a.owner_rows[int64_t(peer) * a.input_rows + index];
+        token = int(a.input_inverse[int64_t(sent_row) * 2 + 1]);
+      }
+      __syncthreads();
+      uint32_t iteration = 0;
+      do {
+        if (tid == 0) {
+          blocked = acquire(control(mailbox(a, a.rank, peer, token), 1)) != a.epoch;
+          error = mailbox_health(a, start, iteration++);
+        }
+        __syncthreads();
+        if (blocked && !error) __nanosleep(64);
+      } while (blocked && !error);
+    }
+  }
+  if (tid == 0 && error) {
+    auto* own = reinterpret_cast<uint64_t*>(a.mailbox_pointers[a.rank]);
+    release(own, uint64_t(error));
+    if (a.fatal_errors || acquire(own + 2)) {
+      __threadfence_system();
+      asm volatile("trap;");
+    }
+  }
+}
+
 int max_channels_current_device(int world = 1) {
   // Capability is fixed for this extension/device. Validate direct native
   // calls without repeating attribute and occupancy queries on every layer.
@@ -1036,14 +1214,15 @@ int max_channels_current_device(int world = 1) {
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&cooperative, cudaDevAttrCooperativeLaunch, device));
   if (!cooperative) { capacities.emplace(key, 0); return 0; }
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-  int a, b, c, diagnostic, selective_a, selective_b;
+  int a, b, c, diagnostic, selective_a, selective_b, mailbox_capacity;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&a, host_sm_transport_kernel<false, int32_t>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, host_sm_transport_kernel<false, int64_t>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&c, host_sm_pair_combine_kernel<false>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&diagnostic, host_sm_pair_combine_kernel<true>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&selective_a, host_sm_transport_kernel<false, int32_t, false, true>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&selective_b, host_sm_transport_kernel<false, int64_t, false, true>, kThreads, 0));
-  const int capacity = std::min({32, sms * std::min({a, b, selective_a, selective_b}),
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&mailbox_capacity, host_sm_mailbox_combine_kernel, kThreads, 0));
+  const int capacity = std::min({32, sms * std::min({a, b, selective_a, selective_b, mailbox_capacity}),
                                  sms * std::min(c, diagnostic) / world});
   capacities.emplace(key, capacity);
   return capacity;
@@ -1151,13 +1330,16 @@ struct PreparedHostSM::Impl {
   torch::Device device = torch::Device(torch::kCPU);
   TransportArgs dispatch{};
   TransportArgs combine{};
+  uint64_t last_mailbox_epoch = 0;
+  cudaStream_t mailbox_stream = nullptr;
 };
 
 PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_local,
     torch::Tensor dispatch_pointers, torch::Tensor combine_pointers,
     torch::Tensor status, int64_t rank, int64_t hidden, int64_t topk,
     int64_t slots, int64_t dispatch_rows, int64_t combine_rows,
-    int64_t timeout_ms, int64_t channels, bool diagnostics, bool fatal_errors) {
+    int64_t timeout_ms, int64_t channels, bool diagnostics, bool fatal_errors,
+    c10::optional<torch::Tensor> mailbox_pointers, int64_t mailbox_tokens) {
   TORCH_CHECK(status.is_cuda(), "status must be a CUDA tensor");
   const auto device = status.device();
   tensor_check(status, at::kInt, 1, device, "status");
@@ -1197,12 +1379,27 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
       TORCH_CHECK(address != 0 && address % 8 == 0, "invalid mapped arena address");
     }
   }
+  TORCH_CHECK(mailbox_pointers.has_value() == (mailbox_tokens > 0) &&
+                  mailbox_tokens >= 0 && mailbox_tokens <= 65536, "invalid mailbox configuration");
+  if (mailbox_pointers.has_value()) {
+    tensor_check(*mailbox_pointers, at::kLong, 1, device, "mailbox arena pointers");
+    TORCH_CHECK(mailbox_pointers->numel() == world, "invalid mailbox pointer count");
+    const auto cpu = mailbox_pointers->cpu();
+    for (int64_t i = 0; i < world; ++i) {
+      const auto address = uint64_t(cpu.data_ptr<int64_t>()[i]);
+      TORCH_CHECK(address != 0 && address % 8 == 0, "invalid mapped mailbox address");
+    }
+  }
   impl_ = std::make_shared<Impl>();
   impl_->retained = {expert_rank, expert_local, dispatch_pointers, combine_pointers, status};
+  if (mailbox_pointers.has_value()) impl_->retained.push_back(*mailbox_pointers);
   impl_->device = device;
   for (bool combine : {false, true}) {
     auto& a = combine ? impl_->combine : impl_->dispatch;
     a.pointers = (combine ? combine_pointers : dispatch_pointers).data_ptr<int64_t>();
+    a.mailbox_pointers = mailbox_pointers.has_value() ? mailbox_pointers->data_ptr<int64_t>() : nullptr;
+    a.mailbox_tokens = int(mailbox_tokens);
+    a.mailbox_stride = align_up(32 + hidden * 2, 128);
     a.expert_rank = expert_rank.data_ptr<int32_t>();
     a.expert_local = expert_local.data_ptr<int32_t>();
     a.status = status.data_ptr<int32_t>();
@@ -1222,7 +1419,8 @@ void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Ten
     int64_t epoch, torch::Tensor output, torch::Tensor output_ids,
     torch::Tensor output_weights, torch::Tensor inverse, torch::Tensor count,
     torch::Tensor owner_rows, torch::Tensor owner_counts, int64_t active_channels,
-    int64_t identity) {
+    int64_t identity, c10::optional<torch::Tensor> expected_ranks,
+    c10::optional<torch::Tensor> local_rows) {
   auto a = impl_->dispatch;
   active_channel_check(a, active_channels);
   const auto device = impl_->device;
@@ -1243,6 +1441,16 @@ void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Ten
   tensor_check(count, at::kInt, 1, device, "count");
   TORCH_CHECK(count.numel() == 1, "count must contain one element");
   owner_check(owner_rows, owner_counts, device, a.world, output.size(0));
+  TORCH_CHECK(expected_ranks.has_value() == local_rows.has_value(), "both fused routing tensors are required");
+  if (expected_ranks.has_value()) {
+    TORCH_CHECK(a.mailbox_pointers && input.size(0) <= a.mailbox_tokens, "input exceeds prepared mailbox capacity");
+    tensor_check(*expected_ranks, at::kLong, 1, device, "expected rank masks");
+    tensor_check(*local_rows, at::kInt, 1, device, "local compact rows");
+    TORCH_CHECK(expected_ranks->numel() == input.size(0) && local_rows->numel() == input.size(0),
+                "invalid fused routing shape");
+    a.expected_ranks = expected_ranks->data_ptr<int64_t>();
+    a.local_rows = local_rows->data_ptr<int32_t>();
+  }
   const c10::cuda::CUDAGuard guard(device);
   const auto stream = eager_stream(device);
   a.input = input.data_ptr<at::BFloat16>(); a.ids = ids.data_ptr();
@@ -1258,8 +1466,9 @@ void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Ten
 
 void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch::Tensor count,
     torch::Tensor owner_rows, torch::Tensor owner_counts, int64_t epoch,
-    torch::Tensor output, torch::Tensor remote, int64_t active_channels, int64_t identity,
-    c10::optional<torch::Tensor> profile) {
+    torch::Tensor output, c10::optional<torch::Tensor> remote, int64_t active_channels, int64_t identity,
+    c10::optional<torch::Tensor> profile, c10::optional<torch::Tensor> expected_ranks,
+    c10::optional<torch::Tensor> local_rows) {
   auto a = impl_->combine;
   active_channel_check(a, active_channels);
   const auto device = impl_->device;
@@ -1269,9 +1478,27 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
   TORCH_CHECK(inverse.size(0) == partial.size(0) && inverse.size(1) == 2, "invalid inverse shape");
   tensor_check(count, at::kInt, 1, device, "count");
   TORCH_CHECK(count.numel() == 1, "count must contain one element");
-  tensor_check(remote, at::kBFloat16, 3, device, "remote accumulation");
-  TORCH_CHECK(remote.size(0) == a.world && remote.size(1) == output.size(0) &&
-                  remote.size(2) == a.hidden, "invalid accumulation shape");
+  TORCH_CHECK(expected_ranks.has_value() == local_rows.has_value(), "both fused routing tensors are required");
+  const bool fused = expected_ranks.has_value();
+  if (fused) {
+    TORCH_CHECK(a.mailbox_pointers && output.size(0) <= a.mailbox_tokens,
+                "output exceeds prepared mailbox capacity");
+    TORCH_CHECK(!profile.has_value(), "mailbox combine does not support phase profiling");
+    TORCH_CHECK(uint64_t(epoch) > impl_->last_mailbox_epoch,
+                "mailbox combine epochs must increase on the serialized transport stream");
+    tensor_check(*expected_ranks, at::kLong, 1, device, "expected rank masks");
+    tensor_check(*local_rows, at::kInt, 1, device, "local compact rows");
+    TORCH_CHECK(expected_ranks->numel() == output.size(0) && local_rows->numel() == output.size(0),
+                "invalid fused routing shape");
+    a.expected_ranks = expected_ranks->data_ptr<int64_t>();
+    a.local_rows = local_rows->data_ptr<int32_t>();
+  } else {
+    TORCH_CHECK(remote.has_value(), "ring combine requires remote accumulation storage");
+    tensor_check(*remote, at::kBFloat16, 3, device, "remote accumulation");
+    TORCH_CHECK(remote->size(0) == a.world && remote->size(1) == output.size(0) &&
+                    remote->size(2) == a.hidden, "invalid accumulation shape");
+    a.remote = remote->data_ptr<at::BFloat16>();
+  }
   if (profile.has_value()) {
     tensor_check(*profile, at::kLong, 2, device, "profile");
     TORCH_CHECK(profile->size(0) == a.channels * a.world && profile->size(1) == PFieldCount,
@@ -1282,13 +1509,33 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
   const auto stream = eager_stream(device);
   a.input = partial.data_ptr<at::BFloat16>(); a.input_inverse = inverse.data_ptr<int64_t>();
   a.input_count = count.data_ptr<int32_t>(); a.output = output.data_ptr<at::BFloat16>();
-  a.remote = remote.data_ptr<at::BFloat16>();
   a.profile = profile.has_value() ? profile->data_ptr<int64_t>() : nullptr;
   a.owner_rows = owner_rows.data_ptr<int32_t>(); a.owner_counts = owner_counts.data_ptr<int32_t>();
   a.input_rows = int(partial.size(0)); a.capacity = int(output.size(0));
   a.epoch = uint64_t(epoch); a.identity = uint64_t(identity);
-  if (profile.has_value()) launch_transport<true, int64_t, true>(a, stream);
+  if (fused) {
+    TORCH_CHECK(!impl_->last_mailbox_epoch || impl_->mailbox_stream == stream,
+                "mailbox combine must use one serialized CUDA stream");
+    // No init/finalizer and no world-by-token device scratch for this path.
+    if (a.channels == 1) host_sm_mailbox_combine_kernel<<<1, kThreads, 0, stream>>>(a);
+    else {
+      void* parameters[] = {&a};
+      C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
+          reinterpret_cast<const void*>(host_sm_mailbox_combine_kernel),
+          dim3(a.channels), dim3(kThreads), parameters, 0, stream));
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    impl_->last_mailbox_epoch = uint64_t(epoch);
+    impl_->mailbox_stream = stream;
+  } else if (profile.has_value()) launch_transport<true, int64_t, true>(a, stream);
   else launch_transport<true, int64_t>(a, stream);
+}
+
+int64_t host_sm_mailbox_bytes(int64_t hidden, int64_t tokens, int64_t world) {
+  TORCH_CHECK(hidden > 0 && hidden <= INT32_MAX && hidden % 2 == 0 &&
+                  tokens > 0 && tokens <= 65536 && world > 0 && world <= kMaxRanks,
+              "invalid mailbox dimensions");
+  return align_up(kArenaHeader + world * tokens * align_up(32 + hidden * 2, 128), 4096);
 }
 
 int64_t host_sm_max_channels(int64_t world) {

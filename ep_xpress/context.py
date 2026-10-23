@@ -319,11 +319,13 @@ class Context:
             raise
 
     def dispatch_async(self, x, topk_ids, topk_weights, tag=None, stream=None, recv_capacity=None,
-                       active_channels=None):
+                       active_channels=None, workspace=None, fused_combine=False):
         if recv_capacity is not None:
             raise ValueError("recv_capacity is only supported by host_sm")
         if active_channels is not None:
             raise ValueError("active_channels is only supported by host_sm")
+        if workspace is not None or fused_combine is not False:
+            raise ValueError("borrowed workspaces and fused combine are only supported by host_sm")
         return self._submit(self._dispatch, (x, topk_ids, topk_weights), stream, tag)
 
     def _dispatch(self, inputs, operation, tag, _handle):

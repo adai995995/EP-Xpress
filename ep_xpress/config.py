@@ -22,6 +22,8 @@ class Config:
     fatal_errors: bool = False
     channels: int = 4  # allocated host_sm lanes; operations may activate a subset
     diagnostics: bool = False  # opt-in host_sm protocol diagnostics
+    combine_frame_rows: int = 0  # 0: split chunk budget; positive: rows per pair/frame
+    decode_max_tokens: int = 0  # 0: no decode mailbox; otherwise per-source capacity
 
     def __post_init__(self):
         if not isinstance(self.fatal_errors, bool):
@@ -39,6 +41,12 @@ class Config:
                 raise ValueError(f"{name} must be a positive integer")
         if self.channels > 32:
             raise ValueError("channels must be at most 32")
+        for name, maximum in (("combine_frame_rows", 256), ("decode_max_tokens", 256)):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+                raise ValueError(f"{name} must be an integer in [0, {maximum}]")
+            if value and self.transport != "host_sm":
+                raise ValueError(f"{name} is only supported by host_sm")
         if self.chunk_bytes < self.hidden_size * 2:
             raise ValueError("chunk_bytes must fit at least one BF16 row")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
@@ -72,7 +80,8 @@ class Config:
     def pool_bytes(self, world_size):
         if self.transport == "host_sm":
             return world_size * (self.mapped_arena_bytes(self.topk) +
-                                 self.mapped_arena_bytes(0, queue_peers=world_size))
+                                 self.mapped_arena_bytes(0, queue_peers=world_size) +
+                                 self.mailbox_arena_bytes(world_size))
         return 2 * world_size * self.slots * self.slot_bytes
 
     def channel_chunk_rows(self, channels=None):
@@ -81,12 +90,23 @@ class Config:
         return max(1, (self.chunk_rows + channels - 1) // channels)
 
     def combine_chunk_rows(self, channels=None, queue_peers=1):
-        """Split each channel's payload budget across independent peer queues."""
+        """Rows per pair/frame, independently configurable from channel count."""
         if (isinstance(queue_peers, bool) or not isinstance(queue_peers, int) or
                 not 1 <= queue_peers <= 63):
             raise ValueError("queue_peers must be an integer in [1, 63]")
+        if self.combine_frame_rows:
+            return self.combine_frame_rows
         rows = self.channel_chunk_rows(channels)
         return max(1, (rows + queue_peers - 1) // queue_peers)
+
+    def mailbox_arena_bytes(self, world_size):
+        """One producer's decode mailbox, matching the native mapped layout."""
+        if isinstance(world_size, bool) or not isinstance(world_size, int) or not 1 <= world_size <= 63:
+            raise ValueError("world_size must be an integer in [1, 63]")
+        if not self.decode_max_tokens:
+            return 0
+        token_bytes = ((32 + self.hidden_size * 2 + 127) // 128) * 128
+        return ((128 + world_size * self.decode_max_tokens * token_bytes + 4095) // 4096) * 4096
 
     def mapped_arena_bytes(self, topk, channels=None, queue_peers=1):
         """Mapped queue allocation including per-row metadata and control words.
@@ -102,7 +122,8 @@ class Config:
         if (isinstance(queue_peers, bool) or not isinstance(queue_peers, int) or
                 not 1 <= queue_peers <= 63 or (topk and queue_peers != 1)):
             raise ValueError("queue_peers must be in [1, 63] and dispatch requires one queue")
-        rows = self.combine_chunk_rows(channels, queue_peers)
+        rows = (self.channel_chunk_rows(channels) if topk else
+                self.combine_chunk_rows(channels, queue_peers))
         row_bytes = ((16 + topk * 12 + self.hidden_size * 2 + 15) // 16) * 16
         slot_bytes = ((640 + rows * row_bytes + 127) // 128) * 128
         notification_bytes = (self.slots * 63 + 64) * 8 if topk else 0

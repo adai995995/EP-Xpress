@@ -97,6 +97,61 @@ class _DeviceRoute:
     owner_rows: torch.Tensor
     owner_counts: torch.Tensor
     active_channels: int
+    expected_ranks: object = None
+    local_rows: object = None
+    workspace: object = None
+
+
+class HostSMWorkspace:
+    """Explicitly borrowed, fixed-shape storage for sequential inference.
+
+    Create with ``HostSMContext.create_workspace``. Dispatch batches, combine
+    outputs and pending tickets backed by this workspace are valid only until
+    its next dispatch. Enqueue all output consumers on the stream passed to
+    combine's ``wait`` before that next dispatch. Clone retained outputs, or
+    use a different workspace for operations whose lifetimes overlap. The
+    default API without a workspace continues to return independent storage.
+    """
+
+    def __init__(self, context, recv_capacity, local_tokens, fused_combine):
+        self._context_id = context._id
+        self.recv_capacity = recv_capacity
+        self.local_tokens = local_tokens
+        self.fused_combine = fused_combine
+        self._generation = 0
+        self._busy = False
+        self._consumer_streams = []
+        hidden, topk = context.config.hidden_size, context.config.topk
+        options = {"device": context.device}
+        self.hidden = torch.empty((recv_capacity, hidden), dtype=torch.bfloat16, **options)
+        self.local_ids = torch.empty((recv_capacity, topk), dtype=torch.int64, **options)
+        self.weights = torch.empty((recv_capacity, topk), dtype=torch.float32, **options)
+        self.inverse = torch.empty((recv_capacity, 2), dtype=torch.int64, **options)
+        self.count = torch.empty(1, dtype=torch.int32, **options)
+        self.owner_rows = torch.empty((context.world_size, recv_capacity), dtype=torch.int32, **options)
+        self.owner_counts = torch.empty(context.world_size, dtype=torch.int32, **options)
+        self.output = torch.empty((local_tokens, hidden), dtype=torch.bfloat16, **options)
+        self.remote = (None if fused_combine else torch.empty(
+            (context.world_size, local_tokens, hidden), dtype=torch.bfloat16, **options))
+        self.expected_ranks = (torch.empty(local_tokens, dtype=torch.int64, **options)
+                               if fused_combine else None)
+        self.local_rows = (torch.empty(local_tokens, dtype=torch.int32, **options)
+                           if fused_combine else None)
+
+    def _acquire(self, context, producer):
+        # These dependencies protect prior expert/output consumers, including
+        # a stream different from the producer supplied for this dispatch.
+        for consumer in self._consumer_streams:
+            if consumer != producer:  # _begin already ordered this producer.
+                context._work_stream.wait_stream(consumer)
+        self._consumer_streams.clear()
+        self._generation += 1
+        self._busy = True
+
+    def _combined(self, consumer):
+        if consumer not in self._consumer_streams:
+            self._consumer_streams.append(consumer)
+        self._busy = False
 
 
 def _operation_identity(phase, tag, dispatch_operation=None):
@@ -109,17 +164,27 @@ def _operation_identity(phase, tag, dispatch_operation=None):
 class _DevicePending(Pending):
     """Enqueued CUDA completion; wait inserts a stream dependency only."""
 
-    def __init__(self, context, value, completed, active_channels):
+    def __init__(self, context, value, completed, active_channels, workspace=None):
         self._context = context
         self._value = value
         self._completed = completed
         self._device = context.device
         self._waited = False
         self._active_channels = active_channels
+        self._workspace = (value.handle._plan.workspace
+                           if isinstance(value, DispatchBatch) else workspace)
+        self._workspace_generation = (self._workspace._generation
+                                      if self._workspace is not None else None)
+
+    def _check_workspace(self):
+        if (self._workspace is not None and
+                self._workspace._generation != self._workspace_generation):
+            raise RuntimeError("borrowed workspace ticket expired when the workspace was reused")
 
     def wait(self, stream=None, timeout=None):
         if timeout is not None:
             raise ValueError("host_sm wait is nonblocking; use Context.check_errors for a host fence")
+        self._check_workspace()
         # Submission and wait stay free of host queue-header polling. Observe
         # asynchronous transport errors at the explicit check_errors boundary.
         if self._context._failure is not None:
@@ -132,12 +197,16 @@ class _DevicePending(Pending):
             if isinstance(self._value, DispatchBatch):
                 tensors = (self._value.hidden, self._value.local_ids, self._value.weights,
                            self._value.valid_count, self._value.handle.inverse_map,
-                           self._value.handle._plan.owner_rows, self._value.handle._plan.owner_counts)
+                           self._value.handle._plan.owner_rows, self._value.handle._plan.owner_counts,
+                           self._value.handle._plan.expected_ranks, self._value.handle._plan.local_rows)
             else:
                 tensors = (self._value,)
             for tensor in tensors:
-                tensor.record_stream(consumer)
+                if tensor is not None:
+                    tensor.record_stream(consumer)
         with self._context._lock:
+            if self._workspace is not None and not isinstance(self._value, DispatchBatch):
+                self._workspace._combined(consumer)
             if not self._waited:
                 self._context._unwaited -= 1
                 self._waited = True
@@ -145,6 +214,7 @@ class _DevicePending(Pending):
 
     @property
     def done(self):
+        self._check_workspace()
         return self._completed.query()
 
     @property
@@ -206,6 +276,9 @@ class HostSMContext(Context):
         self._lock = threading.RLock()
         self._unwaited = 0
         self._arenas = {"dispatch": [], "combine": []}
+        self._mailbox_tokens = config.decode_max_tokens
+        if self._mailbox_tokens:
+            self._arenas["mailbox"] = []
         self._registered = []
         self._pointers = {}
         self._prepared = None
@@ -252,6 +325,12 @@ class HostSMContext(Context):
                    topk, self.effective_channels, queue_peers=self._queue_peers[phase])
                for phase, topk in (("dispatch", self.config.topk), ("combine", 0))):
             raise RuntimeError("mapped queue allocation ABI mismatch")
+        if self.config.decode_max_tokens:
+            with torch.cuda.device(self.device):
+                self._arena_sizes["mailbox"] = native.host_sm_mailbox_bytes(
+                    self.config.hidden_size, self.config.decode_max_tokens, self.world_size)
+            if self._arena_sizes["mailbox"] != self.config.mailbox_arena_bytes(self.world_size):
+                raise RuntimeError("mapped decode mailbox allocation ABI mismatch")
         self._pool_bytes = sum(self._arena_sizes.values()) * self.world_size
         if self._pool_bytes > self.config.host_pool_budget_bytes:
             raise ValueError("negotiated mapped host queues exceed host_pool_budget_bytes")
@@ -291,7 +370,8 @@ class HostSMContext(Context):
                         pointers = []
                         for peer in range(self.world_size):
                             arena = _MappedArena(self._root / f"{phase}-{peer}.arena", size,
-                                                 channels=self.effective_channels * self._queue_peers[phase])
+                                                 channels=(1 if phase == "mailbox" else
+                                                           self.effective_channels * self._queue_peers[phase]))
                             self._arenas[phase].append(arena)
                             if peer == self.rank and self.config.fatal_errors:
                                 # Bootstrap-only flag: native errors also trap,
@@ -315,7 +395,9 @@ class HostSMContext(Context):
                         self.config.hidden_size, self.config.topk, self.config.slots,
                         self._channel_chunk_rows, self._combine_chunk_rows,
                         self._timeout_ms, self.effective_channels,
-                        diagnostics=self.config.diagnostics, fatal_errors=self.config.fatal_errors)
+                        diagnostics=self.config.diagnostics, fatal_errors=self.config.fatal_errors,
+                        mailbox_pointers=self._pointers.get("mailbox"),
+                        mailbox_tokens=self.config.decode_max_tokens)
                 self._work_stream.synchronize()
         except Exception:
             init_error = "mapped queue registration or CUDA initialization failed"
@@ -528,11 +610,41 @@ class HostSMContext(Context):
         self._work_stream.wait_stream(producer)
         return self._epochs[phase]
 
-    def _finish(self, value, active_channels):
+    def _finish(self, value, active_channels, workspace=None):
         completed = torch.cuda.Event()
         completed.record(self._work_stream)
         self._unwaited += 1
-        return _DevicePending(self, value, completed, active_channels)
+        return _DevicePending(self, value, completed, active_channels, workspace=workspace)
+
+    def create_workspace(self, recv_capacity, local_tokens, *, fused_combine=False):
+        """Allocate exact-shape, explicitly borrowed dispatch/combine storage.
+
+        The caller owns the cache and its memory bound; this method does not
+        retain a pool in the context. Use only for sequential inference where
+        the previous output's consumers have been enqueued before reuse. No
+        CUDA event query, CPU count readback or stream fence is required.
+        """
+        with self._lock, torch.cuda.device(self.device):
+            if self._closed:
+                raise RuntimeError("Context is closed")
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("workspace allocation cannot be captured in a CUDA Graph")
+            self._validate_workspace_shape(recv_capacity, local_tokens, fused_combine)
+            with torch.cuda.stream(self._work_stream), torch.no_grad():
+                return HostSMWorkspace(self, recv_capacity, local_tokens, fused_combine)
+
+    def _validate_workspace_shape(self, capacity, local_tokens, fused_combine):
+        if (isinstance(capacity, bool) or not isinstance(capacity, int) or
+                not 0 <= capacity <= self._max_receive_capacity):
+            raise ValueError("recv_capacity must be an integer within the configured group capacity")
+        if (isinstance(local_tokens, bool) or not isinstance(local_tokens, int) or
+                not 0 <= local_tokens <= self.config.max_tokens_per_rank):
+            raise ValueError("local_tokens must be an integer within the configured rank capacity")
+        if not isinstance(fused_combine, bool):
+            raise ValueError("fused_combine must be a bool")
+        if fused_combine and (not self.config.decode_max_tokens or
+                              local_tokens > self.config.decode_max_tokens):
+            raise ValueError("fused combine requires local tokens within the configured decode mailbox capacity")
 
     def _validate_dispatch(self, x, ids, weights):
         # Keep only the public contract and CPU-known allocation bounds here.
@@ -546,7 +658,7 @@ class HostSMContext(Context):
             raise ValueError("dispatch accepts inference tensors only")
 
     def dispatch_async(self, x, topk_ids, topk_weights, tag=None, stream=None, recv_capacity=None,
-                       active_channels=None):
+                       active_channels=None, workspace=None, fused_combine=False):
         """Enqueue routed dispatch without reading routes or counts on the CPU.
 
         recv_capacity is a CPU-known upper bound on received rows, normally the
@@ -558,37 +670,67 @@ class HostSMContext(Context):
         All ranks must pass the same width for this dispatch. None uses every
         allocated channel. The selected width is retained by the handle and
         reused by combine; queue layout and frame sizes remain unchanged.
+
+        workspace explicitly borrows fixed-shape storage created by
+        create_workspace. Its previous combine must have been waited, and all
+        output consumers must already be enqueued, before another dispatch.
+        fused_combine selects bounded decode mailboxes independently of storage
+        reuse. All ranks must agree on that mode for the same operation.
         """
         with self._lock, torch.cuda.device(self.device):
             try:
                 self._validate_dispatch(x, topk_ids, topk_weights)
-                capacity = self._max_receive_capacity if recv_capacity is None else recv_capacity
-                if (isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 0 or
-                        capacity > self._max_receive_capacity):
-                    raise ValueError("recv_capacity must be an integer within the configured group capacity")
+                capacity = ((workspace.recv_capacity if isinstance(workspace, HostSMWorkspace)
+                             else self._max_receive_capacity) if recv_capacity is None else recv_capacity)
+                self._validate_workspace_shape(capacity, x.shape[0], fused_combine)
+                if workspace is not None:
+                    if not isinstance(workspace, HostSMWorkspace) or workspace._context_id != self._id:
+                        raise ValueError("workspace belongs to another context")
+                    if (workspace.recv_capacity, workspace.local_tokens, workspace.fused_combine) != (
+                            capacity, x.shape[0], fused_combine):
+                        raise ValueError("workspace shape or fused combine mode does not match dispatch")
+                    if workspace._busy:
+                        raise RuntimeError("wait on the previous workspace combine before reusing it")
+                if fused_combine and self._combine_profile is not None:
+                    raise ValueError("fused combine does not support combine profiling")
                 channels = self.effective_channels if active_channels is None else active_channels
                 if (isinstance(channels, bool) or not isinstance(channels, int) or
                         not 1 <= channels <= self.effective_channels):
                     raise ValueError("active_channels must be an integer within the allocated channel count")
                 identity = _operation_identity("dispatch", tag) if self.config.diagnostics else 0
                 epoch = self._begin("dispatch", stream)
+                if workspace is not None:
+                    workspace._acquire(self, stream or torch.cuda.current_stream(self.device))
                 for tensor in (x, topk_ids, topk_weights):
                     tensor.record_stream(self._work_stream)
                 with torch.cuda.stream(self._work_stream), torch.no_grad():
                     ids = topk_ids.contiguous()
                     weights = topk_weights.contiguous()
-                    hidden = torch.empty((capacity, self.config.hidden_size), dtype=torch.bfloat16, device=self.device)
-                    local_ids = torch.empty((capacity, self.config.topk), dtype=torch.int64, device=self.device)
-                    weights_out = torch.empty((capacity, self.config.topk), dtype=torch.float32, device=self.device)
-                    inverse = torch.empty((capacity, 2), dtype=torch.int64, device=self.device)
-                    count = torch.empty(1, dtype=torch.int32, device=self.device)
-                    owner_rows = torch.empty((self.world_size, capacity), dtype=torch.int32, device=self.device)
-                    owner_counts = torch.empty(self.world_size, dtype=torch.int32, device=self.device)
+                    if workspace is None:
+                        hidden = torch.empty((capacity, self.config.hidden_size), dtype=torch.bfloat16, device=self.device)
+                        local_ids = torch.empty((capacity, self.config.topk), dtype=torch.int64, device=self.device)
+                        weights_out = torch.empty((capacity, self.config.topk), dtype=torch.float32, device=self.device)
+                        inverse = torch.empty((capacity, 2), dtype=torch.int64, device=self.device)
+                        count = torch.empty(1, dtype=torch.int32, device=self.device)
+                        owner_rows = torch.empty((self.world_size, capacity), dtype=torch.int32, device=self.device)
+                        owner_counts = torch.empty(self.world_size, dtype=torch.int32, device=self.device)
+                        expected_ranks = (torch.empty(x.shape[0], dtype=torch.int64, device=self.device)
+                                          if fused_combine else None)
+                        local_rows = (torch.empty(x.shape[0], dtype=torch.int32, device=self.device)
+                                      if fused_combine else None)
+                    else:
+                        hidden, local_ids, weights_out = workspace.hidden, workspace.local_ids, workspace.weights
+                        inverse, count = workspace.inverse, workspace.count
+                        owner_rows, owner_counts = workspace.owner_rows, workspace.owner_counts
+                        expected_ranks, local_rows = workspace.expected_ranks, workspace.local_rows
+                    decode_options = ({"expected_ranks": expected_ranks, "local_rows": local_rows}
+                                      if fused_combine else {})
                     self._prepared.dispatch(x, ids, weights, epoch, hidden, local_ids,
                                             weights_out, inverse, count, owner_rows, owner_counts,
-                                            active_channels=channels, identity=identity)
+                                            active_channels=channels, identity=identity, **decode_options)
                     handle = RouteHandle(self._id, self._counter,
-                                         _DeviceRoute(inverse, count, owner_rows, owner_counts, channels),
+                                         _DeviceRoute(inverse, count, owner_rows, owner_counts, channels,
+                                                      expected_ranks, local_rows, workspace),
                                          x.shape[0], capacity, tag)
                     return self._finish(DispatchBatch(hidden, local_ids, weights_out, handle, count), channels)
             except BaseException as error:
@@ -608,25 +750,39 @@ class HostSMContext(Context):
             try:
                 if not isinstance(partial, torch.Tensor) or partial.requires_grad:
                     raise ValueError("partial must be an inference tensor")
+                fused_combine = handle._plan.expected_ranks is not None
+                workspace = handle._plan.workspace
+                if fused_combine and self._combine_profile is not None:
+                    raise ValueError("fused combine does not support combine profiling")
                 identity = _operation_identity("combine", tag, handle.operation) if self.config.diagnostics else 0
                 epoch = self._begin("combine", stream)
                 for tensor in (partial, handle._plan.inverse, handle._plan.count,
-                               handle._plan.owner_rows, handle._plan.owner_counts):
-                    tensor.record_stream(self._work_stream)
+                               handle._plan.owner_rows, handle._plan.owner_counts,
+                               handle._plan.expected_ranks, handle._plan.local_rows):
+                    if tensor is not None:
+                        tensor.record_stream(self._work_stream)
                 with torch.cuda.stream(self._work_stream), torch.no_grad():
-                    output = torch.empty((handle.local_token_count, self.config.hidden_size),
-                                         dtype=torch.bfloat16, device=self.device)
-                    remote = torch.empty((self.world_size, handle.local_token_count, self.config.hidden_size),
-                                         dtype=torch.bfloat16, device=self.device)
+                    if workspace is None:
+                        output = torch.empty((handle.local_token_count, self.config.hidden_size),
+                                             dtype=torch.bfloat16, device=self.device)
+                        remote = (None if fused_combine else torch.empty(
+                            (self.world_size, handle.local_token_count, self.config.hidden_size),
+                            dtype=torch.bfloat16, device=self.device))
+                    else:
+                        output, remote = workspace.output, workspace.remote
                     profile, profile_record = self._combine_profile_slice(handle, tag, epoch)
+                    decode_options = ({"expected_ranks": handle._plan.expected_ranks,
+                                       "local_rows": handle._plan.local_rows} if fused_combine else {})
                     self._prepared.combine(partial, handle._plan.inverse, handle._plan.count,
                                            handle._plan.owner_rows, handle._plan.owner_counts,
                                            epoch, output, remote, active_channels=handle.active_channels,
-                                           identity=identity, profile=profile)
+                                           identity=identity, profile=profile, **decode_options)
                     if profile_record is not None:
                         profile_record["submitted"] = True
                     handle._consumed = True
-                    return self._finish(output, handle.active_channels)
+                    if workspace is None:
+                        return self._finish(output, handle.active_channels)
+                    return self._finish(output, handle.active_channels, workspace=workspace)
             except BaseException as error:
                 self._abort(error)
                 raise
