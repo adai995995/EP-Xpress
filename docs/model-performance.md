@@ -1382,3 +1382,87 @@ payload increments. Their before/after physical-page checks agree. Diagnostic
 containers are removed after trace collection, and the current producer-local
 runtime is restored. Raw traces and deployment details remain outside this
 repository.
+
+
+## Runtime-capacity repair and current prefill group diagnostics
+
+The route alignment kernels now use non-specializing runtime CAP/TILES and a
+bounded prefix geometry independent of exact capacity. A focused CUDA check
+switches capacities 129, 5120, 5632, 7168, 9216, 10752, 11264 and 32769 after
+warming the first shape: each of the three large-route kernels retains exactly
+one in-memory variant for the fixed dtype/expert/block configuration. Fifteen
+alignment cases pass, including empty valid counts and crossing the prefix
+loop boundary; nine BF16 expert cases remain bitwise equal to the reference.
+Initial compilation and other static model configurations remain possible.
+
+The opt-in profiler now measures the actual warp-specialized prefill combine,
+plus dispatch, without reverting to the sequential combine implementation.
+Fused decode and idle operations continue unchanged and are excluded. Two
+focused multi-GPU warp tests pass with instrumentation alternating on/off,
+checking numerical results, payload byte counts and drained slots. Full-model
+capture completes on all eight workers without dropped operations or errors.
+The private runner uses a separate temporary filesystem after a full system
+filesystem interrupted an earlier diagnostic build; failed runs are excluded.
+
+For the batch-32 diagnostic, each rank executes 96 dispatches and 96 combines
+(two prefill forwards across 48 layers). The median per-rank/trial critical-CTA
+sum is 174.906 ms for dispatch and 160.375 ms for combine. The slowest CTA is
+selected independently per operation; these sums exclude init/final kernels
+and are not HTTP latency. Dispatch payload reads account for 93.403 ms of this
+view. Combine Rx reads account for 81.301 ms; Tx credit check/wait accounts for
+92.050 ms and overlaps Rx work. These quantities must not be added together.
+
+An alternative aggregation sums work over remote pair CTAs within each rank,
+then reports median fractions across ranks/trials. Within measured Tx phases,
+credit check/wait is 52.7%, payload writes 19.3%, READY publication/fence 19.2%,
+and final drain 7.2%. Within Rx phases, payload reads are 67.8%, READY check/wait
+19.5%, and ACK publication/fence 10.6%. Metadata accounts for the remainder.
+These are group-work fractions, not fractions of end-to-end latency. The
+four-row configuration sends a median 146659 frames per rank in this capture,
+including terminals. This motivates a frame-size ablation while holding
+channel count fixed. Counter bytes are requested payload accesses, not physical
+PCIe traffic. Instrumentation adds barriers; scheduler partitions also vary,
+so profiled on/off TTFT cannot isolate instrumentation overhead here.
+
+### Unprofiled full-model results after the repair
+
+The comparison keeps the same eight GPUs, BF16 model, pinned SGLang version,
+TP/DP/EP8, Triton experts, FlashInfer attention, eager execution and producer-local
+host allocation. All three configurations use identical prompt hashes for
+512 input / 32 output tokens, eight warmups per batch size and three measured
+repeats. The two EP runs differ only in combine frame rows (4 versus 16);
+allocated channels remain 32 and fused decode remains enabled. The NCCL
+baseline is the framework's `none` MoE communication backend. All runs verify
+SHM transport, no P2P/NVLS/NET channels and zero NVLink payload increments.
+
+Values below are median [min, max]. Decode TPS is the measured aggregate output
+rate between all requests receiving their first output and the first request
+finishing; prefill is excluded. TTFT includes HTTP and scheduling overhead.
+
+| Batch | Metric | Default NCCL | EP, 4-row frame | EP, 16-row frame |
+|---:|---|---:|---:|---:|
+| 1 | Mean request TTFT (ms) | 191.927 [191.459, 194.493] | 186.217 [183.962, 187.826] | 187.531 [184.888, 187.984] |
+| 1 | Last request TTFT (ms) | 191.927 [191.459, 194.493] | 186.217 [183.962, 187.826] | 187.531 [184.888, 187.984] |
+| 1 | Decode TPS | 10.765 [10.652, 10.769] | 11.677 [11.642, 11.839] | 11.669 [11.529, 11.736] |
+| 1 | Batch completion (ms) | 3071.167 [3070.628, 3104.803] | 2840.967 [2802.551, 2850.798] | 2844.215 [2826.439, 2877.059] |
+| 32 | Mean request TTFT (ms) | 574.743 [433.900, 605.554] | 517.590 [403.367, 534.611] | 424.643 [404.959, 526.324] |
+| 32 | Last request TTFT (ms) | 614.007 [542.036, 641.426] | 536.745 [480.571, 545.854] | 483.814 [478.065, 536.449] |
+| 32 | Decode TPS | 348.611 [345.112, 350.768] | 355.988 [350.545, 358.791] | 356.903 [354.567, 360.153] |
+| 32 | Batch completion (ms) | 3435.291 [3357.356, 3504.043] | 3307.957 [3287.186, 3319.251] | 3265.553 [3236.257, 3288.925] |
+
+The 16-row candidate improves median last-request TTFT by 2.29% at B1 and 21.20%
+at B32 versus this NCCL sample. Decode TPS improves by 8.40% and 2.38%,
+respectively. Relative to the repaired four-row path, B32 last-request TTFT
+falls from 536.745 to 483.814 ms; B1 and decode show no additional clear benefit.
+The TTFT ranges of the two EP configurations overlap. Three repetitions and
+uncontrolled scheduler partitions do not establish a stable 9.9% frame-only
+speedup. There is no after-tuning phase capture establishing a change in raw
+PCIe bandwidth. The larger frame is a measured candidate for this workload,
+not a universal default; `presets/host_sm_bf16_ep8.sh` beside the adapter README
+records its settings without changing the core library's defaults.
+
+Four short greedy full-model sanity prompts produce identical tokens and text
+between NCCL and the candidate. Log probabilities are not bitwise identical
+(maximum absolute difference 0.219 on the shared generated prefixes); this is
+not an exhaustive numerical-equivalence claim. Raw logs, traces, access details
+and deployment paths remain outside this repository.

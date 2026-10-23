@@ -274,7 +274,7 @@ def prepare_host_sm(
 
     combine_warp_specialization=True gives prepared pair queues independent
     128-thread send/receive groups. It preserves the grid and frame layout,
-    leaves fused mailbox combine unchanged, and rejects phase profiling.
+    leaves fused mailbox combine unchanged; opt-in profiling records overlapping group times.
     The default False keeps the sequential pair kernel and its profiler.
     """
     if not all(isinstance(value, bool) for value in

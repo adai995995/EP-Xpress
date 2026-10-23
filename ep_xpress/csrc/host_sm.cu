@@ -1052,7 +1052,25 @@ __device__ __forceinline__ void combine_group_health(
   }
 }
 
+// Diagnostic group clocks never synchronize Tx with Rx. Group durations
+// overlap: their sum is work time, not CTA elapsed time or PCIe wire time.
+template <bool Profile, int Group>
+__device__ __forceinline__ void group_profile_phase(ProfileState<Profile>& p, int phase) {
+  if constexpr (Profile) {
+    combine_group_sync<Group>();
+    if (threadIdx.x == (Group - 1) * kCombineGroupThreads) {
+      const uint64_t now = ticks_ns();
+      p.values[p.phase] += now - p.mark;
+      p.phase = phase;
+      p.mark = now;
+    }
+    combine_group_sync<Group>();
+  }
+}
+
+template <bool Profile = false>
 __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
+  __shared__ ProfileState<Profile> tx_profile, rx_profile;
   __shared__ int begin, end;
   __shared__ int send_rows[kThreads], send_tokens[kThreads], recv_tokens[kThreads];
   __shared__ int tx_error, tx_ready, tx_count, tx_complete, rx_error, rx_count;
@@ -1064,6 +1082,8 @@ __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
   char* other = reinterpret_cast<char*>(a.pointers[peer]) +
       (int64_t(channel) * a.world + a.rank) * a.channel_stride;
   const int64_t x_offset = payload_offset(a.chunk_rows, 0);
+  profile_init(tx_profile);
+  profile_init(rx_profile);
   if (tid == 0) {
     int n = a.owner_counts[peer];
     if (n < 0 || n > a.input_rows) { fail(a.status, 1); n = 0; }
@@ -1105,6 +1125,7 @@ __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
     bool terminal_sent = false;
     uint32_t iteration = 0;
     while (true) {
+      group_profile_phase<Profile, 1>(tx_profile, terminal_sent ? PIdleDrain : PIdleCredit);
       char* slot = own + kArenaHeader + (sent % a.slots) * a.slot_stride;
       if (tid == 0) {
         combine_group_health(a, own, other, start, iteration++);
@@ -1130,6 +1151,7 @@ __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
       combine_group_sync<1>();
       if (tx_error || tx_complete) break;
       if (!tx_ready) { combine_group_sync<1>(); __nanosleep(64); continue; }
+      group_profile_phase<Profile, 1>(tx_profile, PSendMetadata);
       const int count = tx_count;
       for (int i = tid; i < count; i += kCombineGroupThreads) {
         const int row = a.owner_rows[int64_t(peer) * a.input_rows + cursor + i];
@@ -1147,11 +1169,13 @@ __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
       if (tx_error) break;
       for (int i = tid; i < count; i += kCombineGroupThreads)
         host_store32(slot + kSlotHeader + i * 4, send_tokens[i]);
+      group_profile_phase<Profile, 1>(tx_profile, PSendPayload);
       for (int64_t i = tid; i < int64_t(count) * (a.hidden / 2); i += kCombineGroupThreads) {
         const int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
         host_store32(slot + x_offset + i * 4,
             reinterpret_cast<const uint32_t*>(a.input + int64_t(send_rows[row]) * a.hidden)[h]);
       }
+      group_profile_phase<Profile, 1>(tx_profile, PPublish);
       if (tid == 0) {
         host_store32(slot + kRowsOffset, count ? count : uint32_t(-1));
         if (a.diagnostics) host_store64(slot + kIdentityOffset, a.identity);
@@ -1161,11 +1185,17 @@ __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
       combine_group_sync<1>();
       ++sent;
       if (tid == 0) release(control(slot, 0), (a.epoch << 32) | uint64_t(sent));
+      if constexpr (Profile) if (tid == 0) {
+        tx_profile.values[PWrittenBytes] += int64_t(count) * a.hidden * 2;
+        tx_profile.values[PSendRows] += count;
+        ++tx_profile.values[PSendFrames];
+      }
       cursor += count;
       terminal_sent = count == 0;
       // Before another iteration can overwrite shared metadata, every writer
       // must have finished using it; the preceding group barrier provides this.
     }
+    group_profile_phase<Profile, 1>(tx_profile, POther);
   } else {
     // Rx owns separate metadata, so it can read and return credit while Tx is
     // writing a different slot or polling a full outgoing ring.
@@ -1173,6 +1203,7 @@ __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
     int received = 0;
     uint32_t iteration = 0;
     while (true) {
+      group_profile_phase<Profile, 2>(rx_profile, PIdleReady);
       char* slot = other + kArenaHeader + (received % a.slots) * a.slot_stride;
       if (lane == 0) {
         combine_group_health(a, own, other, start, iteration++);
@@ -1189,6 +1220,7 @@ __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
       if (rx_error) break;
       const int count = rx_count;
       if (!count) { combine_group_sync<2>(); __nanosleep(64); continue; }
+      group_profile_phase<Profile, 2>(rx_profile, PReceiveMetadata);
       for (int i = lane; i < count; i += kCombineGroupThreads) {
         const int token = int(host_load32(slot + kSlotHeader + i * 4));
         recv_tokens[i] = token;
@@ -1198,20 +1230,28 @@ __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
       if (lane == 0) rx_error = read_status(a.status);
       combine_group_sync<2>();
       if (rx_error) break;
+      group_profile_phase<Profile, 2>(rx_profile, PReceivePayload);
       for (int64_t i = lane; i < int64_t(count) * (a.hidden / 2); i += kCombineGroupThreads) {
         const int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
         auto* dst = reinterpret_cast<uint32_t*>(
             a.remote + (int64_t(peer) * a.capacity + recv_tokens[row]) * a.hidden);
         dst[h] = host_load32(slot + x_offset + i * 4);
       }
+      group_profile_phase<Profile, 2>(rx_profile, PAck);
       // Do not ACK until every reader has finished the host payload. This is
       // the same reuse boundary as the legacy pair kernel, scoped to Rx warps.
       __threadfence_system();
       combine_group_sync<2>();
       ++received;
       if (lane == 0) release(control(slot, 1), (a.epoch << 32) | uint64_t(received));
+      if constexpr (Profile) if (lane == 0) {
+        rx_profile.values[PReadBytes] += int64_t(max(0, count)) * a.hidden * 2;
+        rx_profile.values[PReceiveRows] += max(0, count);
+        ++rx_profile.values[PReceiveFrames];
+      }
       if (count == -1) break;
     }
+    group_profile_phase<Profile, 2>(rx_profile, POther);
   }
 
   // A completed group can wait here without occupying the other group's named
@@ -1219,6 +1259,19 @@ __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
   __syncthreads();
   if (tid == 0) {
     const int error = read_status(a.status);
+    if constexpr (Profile) {
+      const uint64_t now = ticks_ns();
+      auto* out = a.profile + int64_t(blockIdx.x) * PFieldCount;
+      for (int i = 0; i < PFieldCount; ++i)
+        out[i] = tx_profile.values[i] + rx_profile.values[i];
+      out[PBegin] = tx_profile.values[PBegin];
+      out[PEnd] = now;
+      out[PElapsed] = now - out[PBegin];
+      out[PStatus] = error;
+      out[PCompletionPhase] = -1;
+      out[PFirstPublish] = out[PFirstReceive] = -1;
+      out[PFirstPayloadPublish] = out[PFirstPayloadReceive] = -1;
+    }
     if (error) {
       release(control(own, 0), uint64_t(error));
       if (a.fatal_errors || host_load64(own + 16)) {
@@ -1420,7 +1473,7 @@ int max_channels_current_device(int world = 1) {
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&selective_a, host_sm_transport_kernel<false, int32_t, false, true>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&selective_b, host_sm_transport_kernel<false, int64_t, false, true>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&mailbox_capacity, host_sm_mailbox_combine_kernel, kThreads, 0));
-  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&warp_pair_capacity, host_sm_warp_pair_combine_kernel, kThreads, 0));
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&warp_pair_capacity, host_sm_warp_pair_combine_kernel<false>, kThreads, 0));
   const int capacity = std::min({32, sms * std::min({a, b, selective_a, selective_b, mailbox_capacity}),
                                  sms * std::min({c, diagnostic, warp_pair_capacity}) / world});
   capacities.emplace(key, capacity);
@@ -1435,13 +1488,13 @@ void launch_transport(TransportArgs args, cudaStream_t stream) {
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   const int lanes = args.channels * (Combine ? args.world : 1);
   if (lanes == 1) {
-    if constexpr (WarpCombine) host_sm_warp_pair_combine_kernel<<<1, kThreads, 0, stream>>>(args);
+    if constexpr (WarpCombine) host_sm_warp_pair_combine_kernel<Profile><<<1, kThreads, 0, stream>>>(args);
     else if constexpr (Combine) host_sm_pair_combine_kernel<Profile><<<1, kThreads, 0, stream>>>(args);
     else host_sm_transport_kernel<false, Id, Profile, Selective><<<1, kThreads, 0, stream>>>(args);
   } else {
     void* parameters[] = {&args};
     const void* kernel;
-    if constexpr (WarpCombine) kernel = reinterpret_cast<const void*>(host_sm_warp_pair_combine_kernel);
+    if constexpr (WarpCombine) kernel = reinterpret_cast<const void*>(host_sm_warp_pair_combine_kernel<Profile>);
     else if constexpr (Combine) kernel = reinterpret_cast<const void*>(host_sm_pair_combine_kernel<Profile>);
     else kernel = reinterpret_cast<const void*>(host_sm_transport_kernel<false, Id, Profile, Selective>);
     C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
@@ -1624,7 +1677,7 @@ void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Ten
     torch::Tensor output_weights, torch::Tensor inverse, torch::Tensor count,
     torch::Tensor owner_rows, torch::Tensor owner_counts, int64_t active_channels,
     int64_t identity, c10::optional<torch::Tensor> expected_ranks,
-    c10::optional<torch::Tensor> local_rows) {
+    c10::optional<torch::Tensor> local_rows, c10::optional<torch::Tensor> profile) {
   auto a = impl_->dispatch;
   active_channel_check(a, active_channels);
   const auto device = impl_->device;
@@ -1655,6 +1708,12 @@ void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Ten
     a.expected_ranks = expected_ranks->data_ptr<int64_t>();
     a.local_rows = local_rows->data_ptr<int32_t>();
   }
+  if (profile.has_value()) {
+    tensor_check(*profile, at::kLong, 2, device, "dispatch profile");
+    TORCH_CHECK(profile->size(0) == a.channels && profile->size(1) == PFieldCount,
+                "invalid dispatch profile shape");
+    a.profile = profile->data_ptr<int64_t>();
+  }
   const c10::cuda::CUDAGuard guard(device);
   const auto stream = eager_stream(device);
   a.input = input.data_ptr<at::BFloat16>(); a.ids = ids.data_ptr();
@@ -1664,7 +1723,10 @@ void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Ten
   a.owner_rows = owner_rows.data_ptr<int32_t>(); a.owner_counts = owner_counts.data_ptr<int32_t>();
   a.input_rows = int(input.size(0)); a.capacity = int(output.size(0));
   a.epoch = uint64_t(epoch); a.identity = uint64_t(identity);
-  if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t, false, true>(a, stream);
+  if (profile.has_value()) {
+    if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t, true, true>(a, stream);
+    else launch_transport<false, int64_t, true, true>(a, stream);
+  } else if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t, false, true>(a, stream);
   else launch_transport<false, int64_t, false, true>(a, stream);
 }
 
@@ -1732,9 +1794,8 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
     impl_->last_mailbox_epoch = uint64_t(epoch);
     impl_->mailbox_stream = stream;
   } else if (impl_->combine_warp_specialization) {
-    TORCH_CHECK(!profile.has_value(),
-                "warp-specialized prepared combine does not support phase profiling; explicitly disable combine_warp_specialization to profile the legacy kernel");
-    launch_transport<true, int64_t, false, false, true>(a, stream);
+    if (profile.has_value()) launch_transport<true, int64_t, true, false, true>(a, stream);
+    else launch_transport<true, int64_t, false, false, true>(a, stream);
   } else if (profile.has_value()) launch_transport<true, int64_t, true>(a, stream);
   else launch_transport<true, int64_t>(a, stream);
 }

@@ -97,9 +97,29 @@ def check_alignment_layout(device):
     return results
 
 
+def check_capacity_cache_reuse():
+    """New exact capacities must reuse all three warmed large-route kernels."""
+    from ep_xpress.adapters.sglang_valid import (
+        _route_tile_counts, _route_tile_prefix, _scatter_route_tiles,
+    )
+    kernels = (_route_tile_counts, _route_tile_prefix, _scatter_route_tiles)
+    baseline = None
+    for cap in (129, 5120, 5632, 7168, 9216, 10752, 11264, 32769):
+        ids = torch.zeros((cap, 8), dtype=torch.int64, device="cuda")
+        count = torch.tensor([cap], dtype=torch.int32, device="cuda")
+        align_valid_routes(ids, count, 32, 16)
+        torch.cuda.synchronize()
+        sizes = tuple(len(k.device_caches[torch.cuda.current_device()][0]) for k in kernels)
+        if baseline is None:
+            baseline = sizes
+        assert sizes == baseline, (cap, baseline, sizes)
+    return {"new_capacities_reuse_cache": True, "variants": baseline}
+
+
 def main():
     torch.manual_seed(173)
     device = "cuda"
+    cache_reuse = check_capacity_cache_reuse()
     alignment_results = check_alignment_layout(device)
     hidden, intermediate, experts, topk = 2048, 768, 16, 8
     w1 = torch.randn((experts, intermediate * 2, hidden), device=device, dtype=torch.bfloat16) * 0.02
@@ -142,7 +162,7 @@ def main():
             torch.testing.assert_close(candidate[:valid].view(torch.int16), reference[:valid].view(torch.int16), rtol=0, atol=0)
             results.append({"capacity": capacity, "valid": valid, "bitwise_equal": True,
                             "aligned_routes": actual.numel(), "padded_routes": padded_rows})
-    print(json.dumps({"status": "passed", "alignment_cases": alignment_results,
+    print(json.dumps({"status": "passed", "capacity_cache": cache_reuse, "alignment_cases": alignment_results,
                       "cases": results}, indent=2))
 
 

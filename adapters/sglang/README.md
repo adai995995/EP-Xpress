@@ -275,3 +275,12 @@ restart the worker group rather than continuing with unmatched operations.
    GPU configuration and transport restrictions. Profile communication only when
    needed to explain a measured gap; standalone kernel timings are not model
    performance. See the performance report for measured results and limitations.
+
+
+A measured BF16 EP8 host-SM candidate is available in
+[`presets/host_sm_bf16_ep8.sh`](presets/host_sm_bf16_ep8.sh). Source it before
+launching the patched server. It uses 16-row prefill combine frames and preserves
+the fused decode path. See [full-model results](../../docs/model-performance.md)
+for workload scope, TTFT/decode TPS and measurement limits. Core defaults are
+unchanged; use the same framework settings and host-only NCCL restrictions for
+both sides of a comparison.

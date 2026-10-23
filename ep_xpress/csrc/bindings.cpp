@@ -155,7 +155,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
           pybind11::arg("owner_rows"), pybind11::arg("owner_counts"),
           pybind11::arg("active_channels") = 0, pybind11::arg("identity") = 0,
           pybind11::arg("expected_ranks") = pybind11::none(),
-          pybind11::arg("local_rows") = pybind11::none())
+          pybind11::arg("local_rows") = pybind11::none(),
+          pybind11::arg("profile") = pybind11::none())
       .def("combine", &PreparedHostSM::combine,
           pybind11::arg("partial"), pybind11::arg("inverse"), pybind11::arg("count"),
           pybind11::arg("owner_rows"), pybind11::arg("owner_counts"),

@@ -28,6 +28,7 @@ class Stream:
 @contextmanager
 def cpu_context(channels=4, fields=FIELDS, world=1):
     context = object.__new__(HostSMContext)
+    context.config = SimpleNamespace(combine_warp_specialization=False)
     context.rank = 0
     context.world_size = world
     context.device = torch.device("cuda", 0)
@@ -150,7 +151,7 @@ def test_pair_profile_rows_are_explicit_and_budget_counts_every_peer():
         sample, _ = context._combine_profile_slice(handle(channels=2), None, 1)
         assert sample.shape == (6, len(FIELDS))
         report = context.stop_combine_profile()
-        assert report["schema_version"] == 3
+        assert report["schema_version"] == 4
         assert report["queue_layout"] == "rank_pair"
         assert report["channels"] == 2
         assert report["world_size"] == 3

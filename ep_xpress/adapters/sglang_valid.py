@@ -10,8 +10,8 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
-def _align_small(Ids, Count, Sorted, Experts, Padded, CAP: tl.constexpr,
+@triton.jit(do_not_specialize=['CAP'])
+def _align_small(Ids, Count, Sorted, Experts, Padded, CAP,
                  TOPK: tl.constexpr, E: tl.constexpr, EP: tl.constexpr,
                  BM: tl.constexpr, R: tl.constexpr, B: tl.constexpr):
     rows = tl.arange(0, R)
@@ -33,8 +33,8 @@ def _align_small(Ids, Count, Sorted, Experts, Padded, CAP: tl.constexpr,
              (blocks[:, None] < padded[None, :] // BM) & (experts[None, :] < E))
 
 
-@triton.jit
-def _route_tile_counts(Ids, Count, Counts, CAP: tl.constexpr,
+@triton.jit(do_not_specialize=['CAP'])
+def _route_tile_counts(Ids, Count, Counts, CAP,
                        TOPK: tl.constexpr, E: tl.constexpr,
                        EP: tl.constexpr, HP: tl.constexpr,
                        BLOCK: tl.constexpr):
@@ -53,11 +53,11 @@ def _route_tile_counts(Ids, Count, Counts, CAP: tl.constexpr,
         tl.store(Counts + tile * EP + es, counts, es < E)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=['CAP', 'TILES'])
 def _route_tile_prefix(Count, Counts, Offsets, Padded,
-                       CAP: tl.constexpr, TOPK: tl.constexpr,
+                       CAP, TOPK: tl.constexpr,
                        E: tl.constexpr, EP: tl.constexpr, BM: tl.constexpr,
-                       BLOCK: tl.constexpr, TILES: tl.constexpr,
+                       BLOCK: tl.constexpr, TILES,
                        PREFIX_TILES: tl.constexpr):
     n = tl.minimum(tl.maximum(tl.load(Count), 0), CAP) * TOPK
     active_tiles = tl.cdiv(n, BLOCK)
@@ -114,11 +114,11 @@ def _route_maximum(a, b):
     return tl.maximum(a, b)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=['CAP', 'TILES'])
 def _scatter_route_tiles(Ids, Count, Offsets, Sorted, Experts,
-                         CAP: tl.constexpr, TOPK: tl.constexpr,
+                         CAP, TOPK: tl.constexpr,
                          E: tl.constexpr, EP: tl.constexpr, BM: tl.constexpr,
-                         BLOCK: tl.constexpr, TILES: tl.constexpr):
+                         BLOCK: tl.constexpr, TILES):
     tile = tl.program_id(0)
     offsets = tl.arange(0, BLOCK)
     if tile < TILES:
@@ -180,7 +180,9 @@ def align_valid_routes(topk_ids, valid_count, block_size, num_experts):
         route_block = 256
         tiles = triton.cdiv(numel, route_block)
         expert_block = triton.next_power_of_2(num_experts)
-        prefix_tiles = min(triton.next_power_of_2(tiles), max(1, 8192 // expert_block))
+        # One bounded scan geometry per expert layout, independent of scheduler
+        # capacity. CAP/TILES remain actual bounds, including padding sentinels.
+        prefix_tiles = max(1, 8192 // expert_block)
         counts = torch.empty((tiles, expert_block), dtype=torch.int32, device=topk_ids.device)
         offsets = torch.empty((tiles + 1, expert_block), dtype=torch.int32, device=topk_ids.device)
         _route_tile_counts[(tiles,)](

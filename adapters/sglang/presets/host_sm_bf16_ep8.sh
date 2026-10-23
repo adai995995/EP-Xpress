@@ -1,0 +1,24 @@
+# Source before launching the patched SGLang server.
+# Measured candidate: BF16, EP8, hidden=2048, 512-token prompts, B1/B32.
+# Keep other framework/model settings identical when comparing against NCCL.
+# This is a workload-specific preset, not a hardware-independent optimum.
+export EP_XPRESS_TRANSPORT=host_sm
+export EP_XPRESS_CHANNELS=32
+export EP_XPRESS_MAX_TOKENS=16384
+export EP_XPRESS_CHUNK_BYTES=4194304
+export EP_XPRESS_COMBINE_FRAME_ROWS=16
+export EP_XPRESS_SLOTS=2
+export EP_XPRESS_ADAPTIVE_CHANNELS=1
+export EP_XPRESS_VALID_COUNT=1
+export EP_XPRESS_DECODE_MAX_TOKENS=64
+export EP_XPRESS_DECODE_WORKSPACE=1
+export EP_XPRESS_FUSED_DECODE=1
+export EP_XPRESS_COMBINE_WARP_SPECIALIZATION=1
+export EP_XPRESS_DIAGNOSTICS=0
+export EP_XPRESS_HOST_BUDGET_BYTES=536870912
+export NCCL_P2P_DISABLE=1
+export NCCL_NVLS_ENABLE=0
+export NCCL_MNNVL_ENABLE=0
+export NCCL_COLLNET_ENABLE=0
+export NCCL_IB_DISABLE=1
+export NCCL_SHM_DISABLE=0

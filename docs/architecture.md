@@ -302,8 +302,9 @@ one serialized CUDA transport stream. An epoch belongs to the combine
 submission, not to its dispatch handle; independently allocated handles may
 still be combined in a consistent reverse order across ranks. GPU bounds,
 READY/ACK ordering and optional identity diagnostics remain active. Existing
-combine phase profiling does not instrument this kernel and explicitly rejects
-fusion; disable fusion to measure the pair-queue path.
+prefill phase profiling does not instrument fused mailbox operations. They
+continue on their normal path and are excluded from the diagnostic capture;
+profiling never silently changes fusion or transport selection.
 
 ## Borrowed communication workspaces
 
@@ -466,3 +467,29 @@ does not show improvement when work moves to CE or CPU.
 NCCL is a comparison baseline, not this release's payload transport. Route
 planner, transport engine, CPU packing, reduction placement, and chunk/slot
 changes should be measured as separate factors when possible.
+
+
+## Runtime route capacities and prefill diagnostics
+
+Large-route alignment passes exact `CAP` and `TILES` as non-specializing Triton
+runtime scalars. The prefix scan uses one bounded static geometry per expert
+layout, with a runtime loop for larger tile counts. Allocation bounds, masks,
+and padding sentinels still use the actual capacity. Small-route geometry uses
+power-of-two buckets; dtype, expert layout and GEMM block size can still require
+initial compilation. This removes exact-capacity specialization, not all JIT.
+
+Opt-in capture schema 4 records a `kind` and `timing_layout` per operation.
+Dispatch retains sequential CTA phase accounting. Prefill warp combine records
+Tx and Rx group timings independently using their existing named-barrier groups,
+without a cross-group phase barrier. Credit check/wait and final credit drain
+belong to Tx; READY check/wait belongs to Rx. Their durations overlap, so sums
+across groups or CTAs are not request latency. Payload intervals include GPU
+instructions and diagnostic barriers; publish and ACK include system fences.
+Byte counters count requested payload accesses, not physical PCIe transactions.
+Fused decode and idle operations are excluded. Initialization, final GPU
+reduction and diagnostic readback are outside the transport phase intervals.
+
+The normal template specialization omits group timers and profiling barriers.
+Profile storage is allocated at an explicit request boundary and read back only
+after capture. Measurements with these diagnostics must be paired with an
+uninstrumented run; end-to-end performance uses diagnostics disabled.

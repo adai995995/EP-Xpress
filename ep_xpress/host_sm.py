@@ -480,9 +480,6 @@ class HostSMContext(Context):
         with self._lock, torch.cuda.device(self.device):
             if self._closed:
                 raise RuntimeError("Context is closed")
-            if self.config.combine_warp_specialization:
-                raise ValueError("combine phase profiling requires combine_warp_specialization=False; "
-                                 "its counters describe the sequential pair-queue kernel")
             self._check_aborted()
             if self._combine_profile is not None:
                 raise RuntimeError("stop the current combine profile before starting another")
@@ -536,7 +533,8 @@ class HostSMContext(Context):
             session["dropped_operations"] += 1
             return None, None
         record = {
-            "index": index, "operation": self._counter, "epoch": epoch,
+            "timing_layout": "overlapping_warp_groups" if self.config.combine_warp_specialization else "sequential_cta",
+            "kind": "combine", "index": index, "operation": self._counter, "epoch": epoch,
             "dispatch_operation": handle.operation,
             "tag": copy.deepcopy(tag), "label": self._combine_profile_label,
             "local_tokens": handle.local_token_count,
@@ -576,8 +574,9 @@ class HostSMContext(Context):
                 session["status_readout"].copy_(self._status, non_blocking=True)
             self._work_stream.synchronize()
             result = {
-                "schema_version": 3, "transport": "host_sm", "rank": self.rank,
+                "schema_version": 4, "transport": "host_sm", "rank": self.rank,
                 "world_size": self.world_size, "queue_layout": "rank_pair",
+                "warp_specialized": self.config.combine_warp_specialization,
                 "channels": self.effective_channels, "fields": session["fields"],
                 "counter_rows": [{"channel": channel, "peer": peer}
                                  for channel in range(self.effective_channels)
@@ -588,17 +587,21 @@ class HostSMContext(Context):
                 "status": int(session["status_readout"].tolist()[0]),
                 "host_failed": self._failure is not None,
                 "operations": session["operations"],
-                "raw_counters": [session["readout"][index, :operation["active_channels"] * self.world_size].tolist()
+                "raw_counters": [session["readout"][index, :len(operation["counter_rows"])].tolist()
                                  for index, operation in enumerate(session["operations"])],
-                "scope": "combine transport kernels only; excludes initialization and final reduction",
+                "scope": "non-fused dispatch and combine transport kernels (fused decode/idle excluded); excludes initialization and final reduction; dispatch uses sequential CTA phase schema",
                 "timing": {
                     "unit": "nanoseconds for fields ending in _ns",
                     "clock_scope": "GPU globaltimer; raw timestamps are not assumed comparable across devices",
                     "phase_fields": session["fields"][3:12],
                     "idle_fields": [field for field in session["fields"] if field.startswith("idle_") and field.endswith("_ns")],
-                    "phase_rule": "nine disjoint phase durations sum to elapsed_ns per (channel, peer) CTA",
+                    "phase_rule": ("Tx/Rx group phase times overlap; no sum-to-elapsed invariant; idle fields are group wait phases"
+                                   if self.config.combine_warp_specialization else
+                                   "nine disjoint phase durations sum to elapsed_ns per (channel, peer) CTA"),
                     "completion_phase_order": session["fields"][3:12],
-                    "idle_rule": "no-progress wait categories are exclusive subsets of elapsed time; they overlap the phase view",
+                    "idle_rule": ("credit/drain belong to Tx, READY belongs to Rx; they overlap across groups"
+                                  if self.config.combine_warp_specialization else
+                                  "no-progress wait categories are exclusive subsets of elapsed time; they overlap the phase view"),
                     "interpretation": "instrumented GPU instructions and CTA/peer waiting, not pure PCIe transfer time",
                     "missing_first_event": -1,
                 },
@@ -718,8 +721,6 @@ class HostSMContext(Context):
                         raise ValueError("workspace shape or fused combine mode does not match dispatch")
                     if workspace._busy:
                         raise RuntimeError("wait on the previous workspace combine before reusing it")
-                if fused_combine and self._combine_profile is not None:
-                    raise ValueError("fused combine does not support combine profiling")
                 channels = self.effective_channels if active_channels is None else active_channels
                 if (isinstance(channels, bool) or not isinstance(channels, int) or
                         not 1 <= channels <= self.effective_channels):
@@ -752,13 +753,22 @@ class HostSMContext(Context):
                         expected_ranks, local_rows = workspace.expected_ranks, workspace.local_rows
                     decode_options = ({"expected_ranks": expected_ranks, "local_rows": local_rows}
                                       if fused_combine else {})
-                    self._prepared.dispatch(x, ids, weights, epoch, hidden, local_ids,
-                                            weights_out, inverse, count, owner_rows, owner_counts,
-                                            active_channels=channels, identity=identity, **decode_options)
                     handle = RouteHandle(self._id, self._counter,
                                          _DeviceRoute(inverse, count, owner_rows, owner_counts, channels,
                                                       expected_ranks, local_rows, workspace),
                                          x.shape[0], capacity, tag)
+                    dispatch_profile, dispatch_record = ((None, None) if fused_combine else
+                                                         self._combine_profile_slice(handle, tag, epoch))
+                    if dispatch_record is not None:
+                        dispatch_record["kind"] = "dispatch"
+                        dispatch_record["timing_layout"] = "sequential_cta"
+                        dispatch_record["counter_rows"] = [{"channel": c} for c in range(channels)]
+                        dispatch_profile = dispatch_profile[:channels]
+                    self._prepared.dispatch(x, ids, weights, epoch, hidden, local_ids,
+                                            weights_out, inverse, count, owner_rows, owner_counts,
+                                            active_channels=channels, identity=identity, profile=dispatch_profile, **decode_options)
+                    if dispatch_record is not None:
+                        dispatch_record["submitted"] = True
                     return self._finish(DispatchBatch(hidden, local_ids, weights_out, handle, count), channels)
             except BaseException as error:
                 self._abort(error)
@@ -779,8 +789,6 @@ class HostSMContext(Context):
                     raise ValueError("partial must be an inference tensor")
                 fused_combine = handle._plan.expected_ranks is not None
                 workspace = handle._plan.workspace
-                if fused_combine and self._combine_profile is not None:
-                    raise ValueError("fused combine does not support combine profiling")
                 identity = _operation_identity("combine", tag, handle.operation) if self.config.diagnostics else 0
                 epoch = self._begin("combine", stream)
                 for tensor in (partial, handle._plan.inverse, handle._plan.count,
@@ -797,7 +805,8 @@ class HostSMContext(Context):
                             dtype=torch.bfloat16, device=self.device))
                     else:
                         output, remote = workspace.output, workspace.remote
-                    profile, profile_record = self._combine_profile_slice(handle, tag, epoch)
+                    profile, profile_record = ((None, None) if fused_combine else
+                                               self._combine_profile_slice(handle, tag, epoch))
                     decode_options = ({"expected_ranks": handle._plan.expected_ranks,
                                        "local_rows": handle._plan.local_rows} if fused_combine else {})
                     self._prepared.combine(partial, handle._plan.inverse, handle._plan.count,

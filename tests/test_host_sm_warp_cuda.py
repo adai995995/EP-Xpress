@@ -136,10 +136,19 @@ def _warp_worker(rank, directory, frame_rows, barrier):
             _assert_drained(mappings["legacy"][rank], rank, epoch, active,
                             hidden, frame_rows, owner_counts_cpu, False)
             barrier.wait(timeout=60)
+            fields = native.host_sm_profile_fields()
+            profile = (torch.zeros((active * world, len(fields)), dtype=torch.int64,
+                                   device="cuda") if epoch % 2 == 0 else None)
             prepared.combine(partial, inverse, count, owner_rows, owner_counts,
-                epoch, result, remote, active_channels=active, identity=epoch)
+                epoch, result, remote, active_channels=active, identity=epoch, profile=profile)
             torch.cuda.synchronize()
             assert status.item() == 0
+            if profile is not None:
+                counters = profile.cpu()
+                assert (counters[:, fields.index("status")] == 0).all()
+                expected = sum(n for peer, n in enumerate(owner_counts_cpu) if peer != rank) * hidden * 2
+                assert counters[:, fields.index("payload_written_bytes")].sum().item() == expected
+                assert (counters[:, fields.index("elapsed_ns")] > 0).all()
             torch.testing.assert_close(result.view(torch.int16), reference.view(torch.int16), rtol=0, atol=0)
             torch.testing.assert_close(remote.view(torch.int16), reference_remote.view(torch.int16), rtol=0, atol=0)
             _assert_drained(mappings["prepared"][rank], rank, epoch, active,
