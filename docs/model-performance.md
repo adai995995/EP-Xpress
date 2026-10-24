@@ -2186,3 +2186,109 @@ the final trace is about 39% lower. These are separate diagnostic runs, not
 isolated PCIe bandwidth measurements. Kernel intervals include peer waits,
 metadata, payload access and reduction. Combine remains a major cost, and these
 traces do not separate READY waiting from host payload latency or final ACK drain.
+
+
+## Independent decode groups and Tx/Rx specialization (2026-10-25)
+
+Implemented an optional decode mailbox scheduler with independent thread groups
+and a split sending/receiving mode. `EP_XPRESS_DECODE_WARP_MODE=0` retains the
+original CTA loop; `1` uses independent groups with sequential send/receive/drain;
+`2` assigns 128 threads to Tx/drain and 128 to Rx/reduction. Group widths are
+chosen from GPU owner-list counts and token partitions, not benchmark batch
+labels. Small partitions use wider groups and larger partitions use more groups.
+The choice executes inside the kernel; changed routes/counts do not create a new
+CUDA specialization. The build-time mode flag itself requires loading a different
+cached extension when changed before startup.
+
+Mailbox addresses, single-writer READY/ACK ownership, publication fences,
+ascending-rank arithmetic and final outgoing ACK drain are unchanged. Wide
+thread groups use disjoint, non-aligned named hardware barriers and predicate
+reductions. Scalar and vector payload paths remain available. This adds no CPU
+route read, new collective, deferred credit or extra host arena. Prefill kernels
+are unchanged.
+
+### Full-model results
+
+Same eight H20D GPUs, BF16 Qwen3-30B-A3B-Instruct-2507, SGLang v0.5.21,
+TP=DP=EP=8, Triton experts, FlashInfer attention, full decode Graph with local
+buckets [1,2,4,8] and eager prefill. Both implementations disable P2P, NVLS,
+MNNVL, network transports and custom all-reduce. Default SGLang NCCL is the
+primary baseline. Every final EP mode uses the same runtime source and other
+settings, including single-frame dispatch, peer batch 2, producer-local NUMA,
+32 allocated channels and the existing automatic active-channel policy.
+
+Each load has 512 input tokens, 32 output tokens, eight warmups and five timed
+repeats. The fresh NCCL run preceded the candidate iterations in the same
+session; the final three EP modes were measured sequentially on idle GPUs.
+All twenty timed prompt hashes match across backends/modes. Configuration and
+transport checks validate all comparisons. All available NVLink payload
+counters remained zero; logs show SHM only (60 framework connections for EP,
+120 for NCCL), with zero P2P/NET/NVLS. Producer NUMA placement is verified.
+
+Values are median [min,max]. TTFT is the last first-token arrival in a batch,
+including scheduling and prefill. Decode TPS counts aggregate output tokens/s.
+
+| Backend | Batch | TTFT (ms) | Decode TPOT (ms) | Decode TPS | Batch latency (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NCCL | 1 | 101.081 [100.846, 102.134] | 6.450 [6.432, 6.474] | 155.040 [154.463, 155.473] | 301.224 [300.835, 301.883] |
+| NCCL | 8 | 125.921 [125.297, 210.722] | 6.557 [6.496, 6.622] | 1220.028 [1208.138, 1231.451] | 331.059 [329.161, 413.348] |
+| NCCL | 32 | 507.278 [454.292, 550.681] | 9.010 [8.833, 9.059] | 3551.784 [3532.563, 3622.751] | 786.987 [732.238, 824.566] |
+| NCCL | 64 | 925.100 [898.375, 995.424] | 10.778 [10.738, 10.832] | 5937.762 [5908.198, 5960.045] | 1259.668 [1230.092, 1329.723] |
+| Original CTA (mode 0) | 1 | 96.997 [96.641, 97.419] | 6.998 [6.972, 7.033] | 142.893 [142.185, 143.428] | 314.467 [312.895, 314.814] |
+| Original CTA (mode 0) | 8 | 101.132 [100.709, 688.308] | 11.367 [11.355, 11.389] | 703.780 [702.426, 704.563] | 453.308 [452.970, 1040.793] |
+| Original CTA (mode 0) | 32 | 292.535 [285.270, 316.709] | 14.002 [13.907, 14.046] | 2285.361 [2278.225, 2301.027] | 720.718 [716.004, 747.154] |
+| Original CTA (mode 0) | 64 | 531.654 [527.675, 580.092] | 14.852 [14.752, 14.986] | 4309.232 [4270.642, 4338.539] | 993.992 [985.703, 1037.098] |
+| Independent groups (mode 1) | 1 | 97.130 [96.633, 97.487] | 7.271 [7.255, 7.313] | 137.535 [136.744, 137.837] | 322.380 [322.131, 323.864] |
+| Independent groups (mode 1) | 8 | 101.184 [100.713, 190.022] | 11.810 [11.796, 11.832] | 677.398 [676.134, 678.191] | 467.524 [466.537, 555.969] |
+| Independent groups (mode 1) | 32 | 323.834 [290.751, 334.079] | 14.226 [14.177, 14.335] | 2249.426 [2232.372, 2257.229] | 763.233 [731.778, 772.908] |
+| Independent groups (mode 1) | 64 | 527.599 [527.337, 588.580] | 15.069 [14.952, 15.162] | 4247.171 [4220.961, 4280.494] | 995.572 [992.011, 1054.276] |
+| Split Tx/Rx groups (mode 2) | 1 | 97.060 [95.779, 98.610] | 7.537 [7.504, 7.557] | 132.673 [132.325, 133.260] | 330.279 [329.670, 332.359] |
+| Split Tx/Rx groups (mode 2) | 8 | 102.047 [101.500, 198.560] | 11.731 [11.718, 11.753] | 681.949 [680.686, 682.703] | 466.452 [465.384, 561.382] |
+| Split Tx/Rx groups (mode 2) | 32 | 287.900 [286.195, 323.066] | 14.270 [14.255, 14.355] | 2242.409 [2229.182, 2244.770] | 728.888 [724.349, 763.838] |
+| Split Tx/Rx groups (mode 2) | 64 | 582.216 [529.288, 591.686] | 15.075 [15.016, 15.187] | 4245.360 [4214.054, 4262.064] | 1049.493 [995.686, 1057.345] |
+
+### Same-source scheduling ablation
+
+| Batch | Mode 0 TPS | Mode 1 TPS | Mode 1 change | Mode 2 TPS | Mode 2 change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 142.893 | 137.535 | -3.75% | 132.673 | -7.15% |
+| 8 | 703.780 | 677.398 | -3.75% | 681.949 | -3.10% |
+| 32 | 2285.361 | 2249.426 | -1.57% | 2242.409 | -1.88% |
+| 64 | 4309.232 | 4247.171 | -1.44% | 4245.360 | -1.48% |
+
+### Interpretation and validation
+
+The new scheduler remains opt-in; the library and existing Graph preset retain
+mode 0. The fixed 32-thread/token prototype regressed strongly (B1/B32/B64 TPS
+113.537/1926.054/3666.653). Resource-derived wider groups recovered most of that
+loss. Replacing shared-memory group votes with hardware reduction barriers made
+only a small difference in the split implementation; synchronization cleanup
+alone did not establish a throughput win.
+
+The existing balanced-load channel policy is an important constraint. Local
+Graph shapes are 1/1/4/8 and active channel counts are 2/2/4/8 for the four loads.
+Thus a nonempty receiving CTA generally has one output token. Independent groups
+cannot add cross-token parallelism in that case: mode 1 selects a wide group,
+while mode 2 splits a previously 256-thread token operation into a 128-thread Rx
+role plus a 128-thread Tx role. This is a code/resource observation consistent
+with the timing, not a measured partition of PCIe, READY or ACK latency. Skewed
+loads and different channel settings can produce multiple tasks per CTA; those
+remain supported, but this report does not claim an unmeasured speedup for them.
+TTFT advantages over NCCL largely predate this decode change and must not be
+attributed to Tx/Rx overlap. No phase profile was collected in this iteration.
+
+The initial split implementations passed seven focused GPU cases, covering
+random BF16 legacy-rounding comparisons, scalar/vector/shifted storage, sparse
+contributors, delayed nonparticipants, empty ranks, skewed ownership, reverse
+handle use, changing routes, Graph bucket switches and eager/Graph alternation.
+After the hardware-barrier change, four focused cases were rerun: aligned
+2048-wide and scalar 258-wide mailbox comparisons plus the two Graph/ring-fallback
+cases. All passed. Each final full-model mode also matches the prior EP version's
+four short greedy outputs/token IDs; all 29 compared prefix logprobs have zero
+observed difference. This is bounded correctness evidence, not exhaustive
+verification of every route, group size or deployment.
+
+Inputs for the performance sweep are synthetic. Complete model inference is
+measured, but production request-length distributions, arrival processes, expert
+skew and other GPU/NUMA topologies need their own validation. The mode selection
+is deliberately not hard-coded to the benchmark's concurrency values.

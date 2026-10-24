@@ -54,11 +54,15 @@ def load(*, verbose: bool = False):
         decode_peer_batch = os.environ.get("EP_XPRESS_DECODE_PEER_BATCH", "0")
         if decode_peer_batch not in {"0", "1", "2", "4"}:
             raise ValueError("EP_XPRESS_DECODE_PEER_BATCH must be 0, 1, 2, or 4")
+        decode_warp_mode = os.environ.get("EP_XPRESS_DECODE_WARP_MODE", "0")
+        if decode_warp_mode not in {"0", "1", "2"}:
+            raise ValueError("EP_XPRESS_DECODE_WARP_MODE must be 0, 1, or 2")
         cuda_flags = ["-O3", "-lineinfo", f"-DEP_XPRESS_PREFILL_READ_UNROLL={read_unroll}",
                       f"-DEP_XPRESS_PREFILL_WRITE_UNROLL={write_unroll}",
                       f"-DEP_XPRESS_DISPATCH_READ_UNROLL={dispatch_read_unroll}",
                       f"-DEP_XPRESS_COMBINE_LAST_DATA={combine_last_data}",
-                      f"-DEP_XPRESS_DECODE_PEER_BATCH={decode_peer_batch}"]
+                      f"-DEP_XPRESS_DECODE_PEER_BATCH={decode_peer_batch}",
+                      f"-DEP_XPRESS_DECODE_WARP_MODE={decode_warp_mode}"]
         digest = hashlib.sha256()
         for source in sources + sorted(source_dir.glob("*.h")):
             digest.update(source.read_bytes())

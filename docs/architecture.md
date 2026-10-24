@@ -694,3 +694,45 @@ fits the allocated cooperative grid. This is a resource-bound decision shared
 by every rank, not a special case for an observed benchmark batch. Explicit
 channel overrides remain authoritative; insufficient grid capacity retains the
 ring fallback. The same width is saved in the handle for combine.
+
+
+## Independent decode mailbox groups
+
+`EP_XPRESS_DECODE_WARP_MODE` selects a build-time scheduling implementation,
+without changing mailbox layout or the group-wide channel contract. Mode 0 is
+the original CTA loop. Mode 1 assigns disjoint token subsets to independent
+thread groups. Mode 2 divides a CTA into 128 Tx threads and 128 Rx threads;
+Tx groups send their subset and then drain its ACKs while Rx groups independently
+wait for actual contributors, reduce and acknowledge their tokens. All modes
+preserve the same single-writer READY/ACK words and exact reduction order.
+
+Group width is derived on the GPU from immutable owner-list counts and output
+capacity within each channel. Small partitions use more threads per token;
+larger partitions use multiple independent 32/64-thread groups. Split roles
+use at most 128 threads per group; the unsplit ablation can use 256. Each role
+chooses once before its progress loop, so group membership never changes while
+a barrier is in flight. No batch-size labels, model identity or cached routing
+enter this decision, and no metadata is copied to the CPU.
+
+Within each channel partition, groups consume strided owner-list entries on
+send and strided source-token IDs on receive. Empty partitions, local-only
+tokens, unequal rank loads and changed routes between graph replays are valid.
+Rank-mask polling covers all supported ranks. A token can still wait for its
+actual contributors, and later tokens in that group can wait behind it; other
+groups make progress independently.
+
+Only group-local barriers appear inside progress loops; named barrier IDs are
+disjoint between groups, including different Tx and Rx widths. Wide groups use
+non-aligned named reduction barriers for READY/ACK and stop predicates, avoiding
+shared-memory vote scratch and extra handoff barriers. Each payload
+writer performs a system fence before group synchronization and READY
+publication. Every payload reader completes its reads before synchronization
+and ACK publication. The final CTA barrier joins Tx/Rx completion. Invocation
+completion still drains every outgoing mailbox before the next serialized
+invocation can reuse it. No deferred credit, additional host arena or cross-call
+overlap is introduced. Cooperative residency includes the new mailbox kernel.
+
+The vector receive path keeps cache-invalidating host loads and falls back to
+scalar loads for unsupported alignment/width. Ascending-rank FP32 accumulation,
+intermediate BF16 rounding and local BF16 addition are unchanged. Prefill kernels
+and expert weighting are unaffected.
