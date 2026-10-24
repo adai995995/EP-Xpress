@@ -117,6 +117,7 @@ and general combine frame sizing/execution:
 | `EP_XPRESS_COMBINE_FRAME_ROWS` | `0` | Fix rows per pair-queue frame independently of allocated channels. `0` restores the original split of the chunk budget across channels and peers. |
 | `EP_XPRESS_PREFILL_READ_UNROLL` | `0` | Build-time host payload vector-read expansion for prepared warp combine: `1`, `2`, `4`, `8`; `0` retains scalar reads. Set before worker startup; changing it selects a separate native build. |
 | `EP_XPRESS_PREFILL_WRITE_UNROLL` | `0` | Build-time vector expansion for prepared warp-combine sends: `1`, `2`, `4`, `8`; `0` retains scalar writes. Independent of the read setting. |
+| `EP_XPRESS_DISPATCH_READ_UNROLL` | `0` | Build-time vector expansion for selected dispatch payload reads: `1`, `2`, `4`, `8`; `0` retains scalar reads. Applies to dispatch in both prefill and decode. Preserves multicast selection and falls back to scalar for unaligned layouts. |
 
 The three switches accept `0` or `1`; both size settings accept integers from
 `0` through `256`. Core `Config.decode_max_tokens` and
@@ -289,7 +290,10 @@ both sides of a comparison.
 
 The separate experimental
 [`presets/host_sm_bf16_ep8_vector.sh`](presets/host_sm_bf16_ep8_vector.sh)
-enables four-way vector expansion for both prefill combine reads and writes.
+enables four-way vector expansion for dispatch reads and prefill combine reads
+and writes.
 It retains two slots and the same host-memory footprint. Measured B32 gains
-are modest and timing ranges overlap; the original preset and general loader
-defaults retain scalar copies. Both presets keep the necessary READY/ACK fences.
+are workload-dependent; the latest dispatch ablation improves last-request TTFT
+while average-request TTFT is essentially unchanged. The original preset and
+general loader defaults retain scalar copies. Both presets keep the necessary
+READY/ACK fences.

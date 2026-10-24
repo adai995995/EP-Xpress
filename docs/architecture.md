@@ -525,3 +525,21 @@ It gathers aligned vectors from the owner-indexed GPU rows, then issues volatile
 the Tx barrier before READY publication. Unaligned inputs or payloads use the
 scalar path. This setting also participates in the extension cache identity;
 it changes no token routing, frame format or ACK/credit semantics.
+
+### Selected dispatch payload reads
+
+`EP_XPRESS_DISPATCH_READ_UNROLL` independently controls dispatch's host reads.
+The default is zero (scalar); values 1, 2, 4 and 8 select 128-bit vector reads
+with that many independent iterations expanded before HBM stores. The setting
+is compiled into the extension and included in its cache key. Dispatch uses
+this setting in both prefill and decode; the fused decode combine is unchanged.
+
+The receiver first performs the existing rank-mask selection and compaction.
+Vector addresses then use the selected wire-row list, so a receiver reads only
+its own rows even when a shared frame contains other destinations. Output rows
+retain their compact indices, inverse mappings and owner lists. Hidden sizes,
+frame payload addresses or output views that lack 16-byte alignment use the
+original scalar loop. Tail iterations never read beyond selected payload rows.
+READY/acquire, cache-invalidating host reads, reader completion and ACK release
+retain their original ordering. Queue capacity, multicast reader sets and
+terminal handshakes are unchanged.

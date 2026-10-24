@@ -1625,3 +1625,99 @@ and buffer-lifetime scheduling before assuming that more CTAs or deeper rings
 will improve inference. Prefill still materializes per-peer GPU scratch before
 a separate reduction. No change to that dependency structure or to required
 memory-ordering operations was made in this experiment.
+
+### Vectorizing selected dispatch reads
+
+The next candidate changes only dispatch payload reads: 128-bit vectors and
+four independent expanded iterations, using the existing selected wire-row
+indices. It keeps multicast ownership, GPU compaction, two slots, 32 configured
+channels, 16-row combine frames, combine read/write expansion four and all
+READY/fence/ACK boundaries. Hidden sizes or addresses that are not vector
+aligned use the scalar fallback. The independent build-time switch is
+`EP_XPRESS_DISPATCH_READ_UNROLL`; its general default remains zero.
+
+Five focused three-GPU cases pass. They cover sparse multicast and same-rank
+expert deduplication, a delayed nonreader, four epochs with alternating active
+channel counts, empty/asymmetric routes, vector and tail copies, misaligned
+frame payloads, non-vector hidden sizes and shifted output storage. The payload
+pattern varies across hidden positions. Output/inverse/owner mapping and the
+weighted round trip agree exactly with the reference.
+
+The adjacent full-model runs enable or disable only the dispatch read switch;
+launch environment differences were checked, and all ten measured input hashes
+match. Settings remain BF16, eager, EP8/TP8/DP8, 512 input tokens, 32 output
+tokens, eight warmups per batch size and five measured repeats. NCCL numbers
+reuse the earlier verified same-configuration run. All runs report SHM, no
+P2P/NVLS/network transport channels, and zero available NVLink payload counters.
+Values below are median [min, max].
+
+| Batch | Metric | Default NCCL | EP combine-vector / dispatch scalar, rerun | EP combine-vector / dispatch vector x4 |
+|---:|---|---:|---:|---:|
+| 1 | TTFT (ms) | 192.549 [189.091, 192.903] | 187.298 [184.956, 187.432] | 186.202 [183.735, 188.111] |
+| 1 | Decode TPS | 10.739 [10.661, 10.908] | 11.589 [11.518, 11.730] | 11.712 [11.611, 11.839] |
+| 32 | Mean request TTFT (ms) | 568.963 [496.359, 626.142] | 410.185 [383.182, 485.525] | 412.489 [333.331, 437.187] |
+| 32 | Last request TTFT (ms) | 607.648 [565.040, 640.562] | 459.015 [446.138, 502.974] | 431.148 [381.754, 444.179] |
+| 32 | Decode TPS | 352.412 [349.331, 353.596] | 356.913 [349.479, 357.862] | 359.125 [358.481, 361.447] |
+| 32 | Batch completion (ms) | 3412.189 [3371.846, 3478.319] | 3270.255 [3225.468, 3274.199] | 3170.257 [3131.883, 3204.697] |
+
+Against the adjacent EP control, B32 last-request TTFT falls 6.07%, and all
+five matching prompt batches improve on this metric. Mean request TTFT changes
+by +0.56%, effectively unchanged in these variable admission/scheduling runs.
+Decode TPS increases only 0.62%; no substantial decode improvement is established.
+B1 changes are small and timing ranges overlap. Versus the reused NCCL baseline,
+B32 last-request TTFT falls 29.05% and decode TPS rises 1.90%. These are bounded
+full-model results, not a general throughput claim or confidence interval.
+
+Four short greedy prompts preserve tokens, text and logprobs exactly versus
+both the adjacent control and the preceding combine-vector candidate. Against
+NCCL, tokens/text match on all four, with maximum absolute logprob difference
+0.218723 on their common generated prefixes. This is a limited output sanity
+check, not exhaustive numerical equivalence. The experimental vector preset
+now enables dispatch expansion four as well; the original preset explicitly
+resets it to zero.
+
+The candidate's ordinary selective dispatch kernels use 72 registers, zero
+stack/local storage and four vector loads/stores in their expanded path for
+both int32 and int64 expert IDs. All eight profiled workers retain 32 channels.
+The diagnostic capture contains two instrumented B32 trials, each with 96
+dispatch and 96 combine operations per rank, with no dropped records or status
+errors. Median requested payload bytes match the preceding combine-vector
+capture: 1,955,778,560 dispatch read bytes and 1,832,900,608 combine read bytes
+per rank/trial.
+
+| Diagnostic quantity (ms) | Previous dispatch scalar | Dispatch vector x4 |
+|---|---:|---:|
+| Dispatch critical-CTA elapsed sum | 166.737 | 92.925 |
+| Dispatch selected payload read component | 93.885 | 33.599 |
+| Combine critical-CTA elapsed sum | 125.234 | 119.873 |
+| Combine receive payload component | 19.588 | 18.577 |
+| Combine send payload component | 34.734 | 34.705 |
+| Combine publish/fence component | 20.843 | 21.686 |
+| Combine READY check/wait | 87.822 | 93.052 |
+| Combine Tx credit check/wait | 28.559 | 25.780 |
+| Combine final ACK drain | 28.359 | 29.747 |
+
+Each quantity is the median across rank/trial sums of the slowest CTA selected
+per operation. Tx/Rx overlap; these rows must not be added or subtracted from
+HTTP TTFT. Instrumentation adds synchronization, and the captures are separate
+runs. Summed concurrent dispatch payload-read work per requested GiB falls
+from 1645.038 to 617.386 ms/GiB; this is not a physical PCIe bandwidth figure.
+
+The remaining combine Rx group-work shares are approximately 53.64% READY
+check/wait, 28.27% payload reads and 15.71% ACK publication. Tx shares are
+37.31% payload stores, 27.12% publication/fence, 13.69% credit checks/waits and
+20.07% final drain. Faster dispatch therefore does not eliminate the combine
+producer/publication and buffer-turnover bottleneck. These percentages cannot
+by themselves distinguish late expert-compute completion from slow production
+or publishing, and no required synchronization was removed.
+
+A separate offline analysis of the exported Chrome traces matches native
+(epoch, dispatch-operation) identities and all eight rank-local CUDA launch
+correlations. On the declared shared Chrome time base, the per-layer combine
+start spread is about 0.360 ms median / 0.850 ms P90 after the change, compared
+with 0.368 / 0.853 ms in the preceding capture. This coarse skew persists;
+GPU globaltimer values were not subtracted across devices. Cross-device clock
+calibration uncertainty is unquantified, so these spreads do not provide an
+exact causal decomposition of READY wait. Finer producer milestones or
+compute/communication dependency measurements are needed before changing the
+publication or final-drain protocol.

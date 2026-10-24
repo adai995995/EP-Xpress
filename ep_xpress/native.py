@@ -45,8 +45,12 @@ def load(*, verbose: bool = False):
         write_unroll = os.environ.get("EP_XPRESS_PREFILL_WRITE_UNROLL", "0")
         if write_unroll not in {"0", "1", "2", "4", "8"}:
             raise ValueError("EP_XPRESS_PREFILL_WRITE_UNROLL must be 0, 1, 2, 4, or 8")
+        dispatch_read_unroll = os.environ.get("EP_XPRESS_DISPATCH_READ_UNROLL", "0")
+        if dispatch_read_unroll not in {"0", "1", "2", "4", "8"}:
+            raise ValueError("EP_XPRESS_DISPATCH_READ_UNROLL must be 0, 1, 2, 4, or 8")
         cuda_flags = ["-O3", "-lineinfo", f"-DEP_XPRESS_PREFILL_READ_UNROLL={read_unroll}",
-                      f"-DEP_XPRESS_PREFILL_WRITE_UNROLL={write_unroll}"]
+                      f"-DEP_XPRESS_PREFILL_WRITE_UNROLL={write_unroll}",
+                      f"-DEP_XPRESS_DISPATCH_READ_UNROLL={dispatch_read_unroll}"]
         digest = hashlib.sha256()
         for source in sources + sorted(source_dir.glob("*.h")):
             digest.update(source.read_bytes())

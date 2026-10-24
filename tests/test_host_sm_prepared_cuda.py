@@ -29,9 +29,9 @@ def _routes(epoch, source):
     return routes
 
 
-def _prepared_worker(rank, directory, barrier):
+def _prepared_worker(rank, directory, barrier, hidden, chunk_rows, offset):
     torch.cuda.set_device(rank)
-    world, channels, slots, chunk_rows, hidden, capacity = 3, 2, 2, 2, 8, 32
+    world, channels, slots, capacity = 3, 2, 2, 32
     mappings, addresses, pointers = {}, [], {}
     prepared = None
     try:
@@ -61,8 +61,10 @@ def _prepared_worker(rank, directory, barrier):
             ids = torch.tensor(routes, dtype=torch.int64, device="cuda").reshape(n, 2)
             weights = torch.tensor([0.25, 0.75], device="cuda").expand(n, 2).contiguous()
             values = torch.arange(n, dtype=torch.float32, device="cuda") + rank * 16 + epoch
-            x = values[:, None].expand(n, hidden).contiguous().bfloat16()
-            output = torch.empty(capacity, hidden, dtype=torch.bfloat16, device="cuda")
+            pattern = (torch.arange(hidden, device="cuda") % 8).float()
+            x = (values[:, None] + pattern).bfloat16()
+            storage = torch.empty(capacity * hidden + offset, dtype=torch.bfloat16, device="cuda")
+            output = storage[offset:].view(capacity, hidden)
             output_ids = torch.empty(capacity, 2, dtype=torch.int64, device="cuda")
             output_weights = torch.empty(capacity, 2, dtype=torch.float32, device="cuda")
             inverse = torch.empty(capacity, 2, dtype=torch.int64, device="cuda")
@@ -72,9 +74,10 @@ def _prepared_worker(rank, directory, barrier):
             torch.cuda.synchronize()
             barrier.wait(timeout=60)
             if epoch == 1 and rank == 2:
-                # Rank 2 is not a payload reader. Rank 0 must publish all nine
-                # frames through two slots before rank 2 launches its kernel.
-                row_stride = 64  # align_up(16 + 2*12 + hidden*2, 16)
+                # Rank 2 is not a payload reader. Rank 0 must publish every
+                # frame through two slots before rank 2 launches its kernel.
+                row_stride = ((16 + 2 * 12 + hidden * 2 + 15) // 16) * 16
+                expected_frames = (17 + chunk_rows - 1) // chunk_rows
                 slot_stride = ((640 + chunk_rows * row_stride + 127) // 128) * 128
                 deadline = time.monotonic() + 5
                 progress = 0
@@ -83,10 +86,10 @@ def _prepared_worker(rank, directory, barrier):
                                                     128 + slot * slot_stride)[0]
                                  for slot in range(slots)]
                     progress = max(((seq & 0xffffffff) for seq in sequences if seq >> 32 == epoch), default=0)
-                    if progress >= 9:
+                    if progress >= expected_frames:
                         break
                     time.sleep(0.005)
-                assert progress >= 9, "unrelated rank blocked payload-slot reuse"
+                assert progress >= expected_frames, "unrelated rank blocked payload-slot reuse"
             prepared.dispatch(x, ids, weights, epoch, output, output_ids, output_weights,
                               inverse, count, owner_rows, owner_counts,
                               active_channels=active, identity=epoch)
@@ -103,7 +106,7 @@ def _prepared_worker(rank, directory, barrier):
             assert {tuple(row) for row in actual_inverse} == set(expected)
             for row, key in enumerate(actual_inverse):
                 torch.testing.assert_close(output[row].cpu(),
-                    torch.full((hidden,), expected[tuple(key)], dtype=torch.bfloat16), rtol=0, atol=0)
+                    (expected[tuple(key)] + pattern.cpu()).bfloat16(), rtol=0, atol=0)
             covered = []
             for owner, length in enumerate(owner_counts.cpu().tolist()):
                 indices = owner_rows[owner, :length].cpu().tolist()
@@ -142,7 +145,12 @@ def _prepared_worker(rank, directory, barrier):
                 mapping.close()
 
 
-def test_prepared_selective_readers_owner_lists_and_active_channel_reuse():
+@pytest.mark.parametrize("hidden,chunk_rows,offset", [
+    (8, 2, 0), (2048, 7, 0), (264, 3, 0), (258, 3, 0), (2048, 7, 2),
+])
+def test_prepared_selective_readers_owner_lists_and_active_channel_reuse(
+        hidden, chunk_rows, offset, monkeypatch):
+    monkeypatch.setenv("EP_XPRESS_DISPATCH_READ_UNROLL", "4")
     from torch.utils.cpp_extension import CUDA_HOME
     if CUDA_HOME is None:
         pytest.skip("CUDA toolkit is unavailable")
@@ -151,10 +159,10 @@ def test_prepared_selective_readers_owner_lists_and_active_channel_reuse():
         pytest.skip("insufficient cooperative residency for the focused test")
     with tempfile.TemporaryDirectory(prefix="ep-xpress-prepared-test-", dir="/dev/shm") as directory:
         for phase, topk, peers in (("dispatch", 2, 1), ("combine", 0, 3)):
-            size = native.host_sm_arena_bytes(8, topk, 2, 2, channels=2, queue_peers=peers)
+            size = native.host_sm_arena_bytes(hidden, topk, 2, chunk_rows, channels=2, queue_peers=peers)
             for rank in range(3):
                 with open(os.path.join(directory, f"{phase}-{rank}"), "wb") as output:
                     os.posix_fallocate(output.fileno(), 0, size)
         context = torch.multiprocessing.get_context("spawn")
         barrier = context.Barrier(3)
-        torch.multiprocessing.spawn(_prepared_worker, args=(directory, barrier), nprocs=3, join=True)
+        torch.multiprocessing.spawn(_prepared_worker, args=(directory, barrier, hidden, chunk_rows, offset), nprocs=3, join=True)

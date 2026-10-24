@@ -128,6 +128,12 @@ static_assert(EP_XPRESS_PREFILL_READ_UNROLL == 0 || EP_XPRESS_PREFILL_READ_UNROL
 static_assert(EP_XPRESS_PREFILL_WRITE_UNROLL == 0 || EP_XPRESS_PREFILL_WRITE_UNROLL == 1 ||
               EP_XPRESS_PREFILL_WRITE_UNROLL == 2 || EP_XPRESS_PREFILL_WRITE_UNROLL == 4 ||
               EP_XPRESS_PREFILL_WRITE_UNROLL == 8, "unsupported prefill write unroll");
+#ifndef EP_XPRESS_DISPATCH_READ_UNROLL
+#define EP_XPRESS_DISPATCH_READ_UNROLL 0
+#endif
+static_assert(EP_XPRESS_DISPATCH_READ_UNROLL == 0 || EP_XPRESS_DISPATCH_READ_UNROLL == 1 ||
+              EP_XPRESS_DISPATCH_READ_UNROLL == 2 || EP_XPRESS_DISPATCH_READ_UNROLL == 4 ||
+              EP_XPRESS_DISPATCH_READ_UNROLL == 8, "unsupported dispatch read unroll");
 __device__ __forceinline__ void host_store128(void* address, uint4 value) {
   // Match the scalar volatile store policy. Each writer still executes a
   // system fence before the Tx leader publishes READY for the whole frame.
@@ -685,6 +691,37 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
           if (tid == 0 && num_selected && profile.values[PFirstPayloadReceive] < 0)
             profile.values[PFirstPayloadReceive] = profile.mark - profile.values[PBegin];
         }
+#if EP_XPRESS_DISPATCH_READ_UNROLL > 0
+        if (!Combine && a.hidden % 8 == 0 &&
+            ((reinterpret_cast<uintptr_t>(slot + x_offset) |
+              reinterpret_cast<uintptr_t>(a.output)) & 15) == 0) {
+          constexpr int kUnroll = EP_XPRESS_DISPATCH_READ_UNROLL;
+          const int vectors_per_row = a.hidden / 8;
+          const int64_t vectors = int64_t(num_selected) * vectors_per_row;
+          for (int64_t base = tid; base < vectors; base += kThreads * kUnroll) {
+            uint4 values[kUnroll];
+            // Compact only this rank's selected multicast rows. Issue several
+            // independent PCIe reads before consuming their results in HBM.
+            #pragma unroll
+            for (int j = 0; j < kUnroll; ++j) {
+              const int64_t i = base + j * kThreads;
+              if (i < vectors) {
+                const int row = int(i / vectors_per_row), h = int(i % vectors_per_row);
+                values[j] = host_load128(slot + x_offset +
+                    (int64_t(selected_rows[row]) * vectors_per_row + h) * 16);
+              }
+            }
+            #pragma unroll
+            for (int j = 0; j < kUnroll; ++j) {
+              const int64_t i = base + j * kThreads;
+              if (i < vectors) {
+                const int row = int(i / vectors_per_row), h = int(i % vectors_per_row);
+                reinterpret_cast<uint4*>(a.output + int64_t(output_base + row) * a.hidden)[h] = values[j];
+              }
+            }
+          }
+        } else
+#endif
         for (int64_t i = tid; i < int64_t(num_selected) * (a.hidden / 2); i += blockDim.x) {
           int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
           const int source = selected_rows[row];
