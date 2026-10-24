@@ -81,12 +81,15 @@ def validate_valid_count_runner(config):
 
 
 def select_active_channels(global_capacity, *, is_extend, allocated, adaptive,
-                           prefill_override=0, decode_override=0):
+                           prefill_override=0, decode_override=0,
+                           decode_source_bound=0, dispatch_frame_rows=0):
     """Select identically on all ranks from existing global scheduler metadata.
 
     A phase override requests a fixed count (clamped to cooperative capacity).
     Auto uses one channel per token in prefill, one per eight global tokens in
-    decode. Local token counts and local forward mode must not enter this choice.
+    decode. Bounded decode may raise the auto width to fit one frame per
+    source/channel, if the allocated grid supports it. Overrides are preserved.
+    Local token counts and local forward mode must not enter this choice.
     """
     override = prefill_override if is_extend else decode_override
     if override:
@@ -94,4 +97,15 @@ def select_active_channels(global_capacity, *, is_extend, allocated, adaptive,
     if not adaptive:
         return allocated
     tokens_per_channel = 1 if is_extend else 8
-    return max(1, min(allocated, (global_capacity + tokens_per_channel - 1) // tokens_per_channel))
+    selected = max(1, min(allocated, (global_capacity + tokens_per_channel - 1) // tokens_per_channel))
+    if not is_extend and decode_source_bound:
+        if dispatch_frame_rows <= 0:
+            raise ValueError("single-frame dispatch requires a positive frame capacity")
+        # Size for any legal source load, including rank skew. This is derived
+        # from allocation/protocol limits, not observed routes or batch labels.
+        rows = min(dispatch_frame_rows, 256)
+        required = (decode_source_bound + rows - 1) // rows
+        if required <= allocated:
+            selected = max(selected, required)
+        # If insufficient resident channels exist, native keeps the ring.
+    return selected

@@ -379,8 +379,13 @@ __global__ void host_sm_finalize_kernel(TransportArgs a) {
 // 3 timeout, 4 peer abort, 5 operation identity mismatch. An error is sticky.
 // More than one channel requires a cooperative, all-resident launch. Separate
 // producer-only and receiver-only blocks would not provide this liveness.
-template <bool Combine, typename Id, bool Profile = false, bool Selective = false>
+template <bool Combine, typename Id, bool Profile = false, bool Selective = false, bool SingleFrame = false>
 __global__ void host_sm_transport_kernel(TransportArgs a) {
+  static_assert(!SingleFrame || (!Combine && !Selective), "single-frame dispatch only");
+  // Bounded decode publishes one final frame (possibly empty) per channel.
+  // All metadata readers ACK that frame; there is no separate terminal phase.
+  // The previous operation drained its readers before returning, so slot zero
+  // may be overwritten without polling old credits, including after prefill.
   if (a.device_epoch) a.epoch = *a.device_epoch;
   using Scan = cub::BlockScan<uint64_t, kThreads>;
   __shared__ typename Scan::TempStorage scan_storage;
@@ -433,9 +438,9 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
     __syncthreads();
     if (error) break;
     char* send_slot = own + kArenaHeader + (sent_chunks % a.slots) * a.slot_stride;
-    if (tid == 0) previous = producer_done ? 0 : acquire(control(send_slot, 0));
+    if (tid == 0) previous = (SingleFrame || producer_done) ? 0 : acquire(control(send_slot, 0));
     __syncthreads();
-    bool blocked = !producer_done && tid < a.world && tid != a.rank &&
+    bool blocked = !SingleFrame && !producer_done && tid < a.world && tid != a.rank &&
                    (!Selective || (slot_readers[sent_chunks % a.slots] & (uint64_t(1) << tid))) &&
                    acquire(control(send_slot, 1 + tid)) != previous;
     if constexpr (Profile) {
@@ -445,7 +450,7 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
     if constexpr (Profile) {
       if (tid == 0) {
         profile.credit_missing = any_blocked;
-        if (!producer_done) profile.values[PCreditPolls] += a.world - 1;
+        if (!SingleFrame && !producer_done) profile.values[PCreditPolls] += a.world - 1;
         for (int peer = 0; peer < a.world; ++peer)
           profile.values[PCreditBlockedObservations] += profile.credit_blocked[peer];
       }
@@ -587,7 +592,7 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
           if (tid == 0) {
             release(control(send_slot, 0), (a.epoch << 32) | uint64_t(sent_chunks + 1));
             ++sent_chunks;
-            if (!num_remote) producer_done = 1;
+            if (SingleFrame || !num_remote) producer_done = 1;
             if constexpr (Profile) {
               const int64_t elapsed = ticks_ns() - profile.values[PBegin];
               if (profile.values[PFirstPublish] < 0) profile.values[PFirstPublish] = elapsed;
@@ -785,7 +790,7 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
           else release(control(slot, 1 + a.rank), received_sequence[peer]);
         } else release(control(slot, 1 + a.rank), (a.epoch << 32) | uint64_t(peer_chunk[peer] + 1));
         ++peer_chunk[peer];
-        if (rows == -1) peer_done[peer] = 1;
+        if (SingleFrame || rows == -1) peer_done[peer] = 1;
         if constexpr (Profile) {
           ++profile.values[PReceiveFrames];
           profile.values[PTerminalReceived] += rows == -1;
@@ -799,13 +804,14 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
     const int unfinished_peers = __syncthreads_or(tid < a.world && !peer_done[tid]);
     bool unacked = false;
     if (producer_done && (Selective || !unfinished_peers)) {
-      for (int i = tid; i < a.slots * a.world; i += blockDim.x) {
+      for (int i = tid; i < (SingleFrame ? 1 : a.slots) * a.world; i += blockDim.x) {
         int peer = i % a.world;
         if (peer == a.rank) continue;
         if constexpr (Selective)
           if (!(slot_readers[i / a.world] & (uint64_t(1) << peer))) continue;
         char* slot = own + kArenaHeader + (i / a.world) * a.slot_stride;
-        if (acquire(control(slot, 1 + peer)) != acquire(control(slot, 0))) unacked = true;
+        const uint64_t published = SingleFrame ? ((a.epoch << 32) | uint64_t(1)) : acquire(control(slot, 0));
+        if (acquire(control(slot, 1 + peer)) != published) unacked = true;
       }
     }
     int outstanding = __syncthreads_or(unacked);
@@ -1683,6 +1689,7 @@ int max_channels_current_device(int world = 1) {
   if (!cooperative) { capacities.emplace(key, 0); return 0; }
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
   int a, b, c, diagnostic, selective_a, selective_b, mailbox_capacity, warp_pair_capacity;
+  int single_a, single_b, single_profile_a, single_profile_b;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&a, host_sm_transport_kernel<false, int32_t>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, host_sm_transport_kernel<false, int64_t>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&c, host_sm_pair_combine_kernel<false>, kThreads, 0));
@@ -1691,13 +1698,17 @@ int max_channels_current_device(int world = 1) {
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&selective_b, host_sm_transport_kernel<false, int64_t, false, true>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&mailbox_capacity, host_sm_mailbox_combine_kernel, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&warp_pair_capacity, host_sm_warp_pair_combine_kernel<false>, kThreads, 0));
-  const int capacity = std::min({32, sms * std::min({a, b, selective_a, selective_b, mailbox_capacity}),
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&single_a, host_sm_transport_kernel<false, int32_t, false, false, true>, kThreads, 0));
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&single_b, host_sm_transport_kernel<false, int64_t, false, false, true>, kThreads, 0));
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&single_profile_a, host_sm_transport_kernel<false, int32_t, true, false, true>, kThreads, 0));
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&single_profile_b, host_sm_transport_kernel<false, int64_t, true, false, true>, kThreads, 0));
+  const int capacity = std::min({32, sms * std::min({a, b, selective_a, selective_b, mailbox_capacity, single_a, single_b, single_profile_a, single_profile_b}),
                                  sms * std::min({c, diagnostic, warp_pair_capacity}) / world});
   capacities.emplace(key, capacity);
   return capacity;
 }
 
-template <bool Combine, typename Id, bool Profile = false, bool Selective = false, bool WarpCombine = false>
+template <bool Combine, typename Id, bool Profile = false, bool Selective = false, bool WarpCombine = false, bool SingleFrame = false>
 void launch_transport(TransportArgs args, cudaStream_t stream) {
   const int64_t elements = int64_t(args.capacity) * args.hidden * (Combine ? args.world : 1);
   const int blocks = int(std::max<int64_t>(1, std::min<int64_t>(4096, (elements + kThreads - 1) / kThreads)));
@@ -1707,13 +1718,13 @@ void launch_transport(TransportArgs args, cudaStream_t stream) {
   if (lanes == 1) {
     if constexpr (WarpCombine) host_sm_warp_pair_combine_kernel<Profile><<<1, kThreads, 0, stream>>>(args);
     else if constexpr (Combine) host_sm_pair_combine_kernel<Profile><<<1, kThreads, 0, stream>>>(args);
-    else host_sm_transport_kernel<false, Id, Profile, Selective><<<1, kThreads, 0, stream>>>(args);
+    else host_sm_transport_kernel<false, Id, Profile, Selective, SingleFrame><<<1, kThreads, 0, stream>>>(args);
   } else {
     void* parameters[] = {&args};
     const void* kernel;
     if constexpr (WarpCombine) kernel = reinterpret_cast<const void*>(host_sm_warp_pair_combine_kernel<Profile>);
     else if constexpr (Combine) kernel = reinterpret_cast<const void*>(host_sm_pair_combine_kernel<Profile>);
-    else kernel = reinterpret_cast<const void*>(host_sm_transport_kernel<false, Id, Profile, Selective>);
+    else kernel = reinterpret_cast<const void*>(host_sm_transport_kernel<false, Id, Profile, Selective, SingleFrame>);
     C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
         kernel, dim3(lanes), dim3(kThreads), parameters, 0, stream));
   }
@@ -1810,6 +1821,7 @@ struct PreparedHostSM::Impl {
   uint64_t last_mailbox_epoch = 0;
   cudaStream_t mailbox_stream = nullptr;
   bool combine_warp_specialization = false;
+  bool decode_single_frame = false;
   torch::Tensor device_epochs;
   bool submitted = false;
 };
@@ -1820,7 +1832,7 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
     int64_t slots, int64_t dispatch_rows, int64_t combine_rows,
     int64_t timeout_ms, int64_t channels, bool diagnostics, bool fatal_errors,
     c10::optional<torch::Tensor> mailbox_pointers, int64_t mailbox_tokens,
-    bool combine_warp_specialization) {
+    bool combine_warp_specialization, bool decode_single_frame) {
   TORCH_CHECK(status.is_cuda(), "status must be a CUDA tensor");
   const auto device = status.device();
   tensor_check(status, at::kInt, 1, device, "status");
@@ -1875,7 +1887,9 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
   impl_->retained = {expert_rank, expert_local, dispatch_pointers, combine_pointers, status};
   if (mailbox_pointers.has_value()) impl_->retained.push_back(*mailbox_pointers);
   impl_->device = device;
+  TORCH_CHECK(!decode_single_frame || mailbox_tokens > 0, "single-frame dispatch requires a decode mailbox bound");
   impl_->combine_warp_specialization = combine_warp_specialization;
+  impl_->decode_single_frame = decode_single_frame;
   for (bool combine : {false, true}) {
     auto& a = combine ? impl_->combine : impl_->dispatch;
     a.pointers = (combine ? combine_pointers : dispatch_pointers).data_ptr<int64_t>();
@@ -1964,7 +1978,19 @@ void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Ten
   a.owner_rows = owner_rows.data_ptr<int32_t>(); a.owner_counts = owner_counts.data_ptr<int32_t>();
   a.input_rows = int(input.size(0)); a.capacity = int(output.size(0));
   a.epoch = uint64_t(epoch); a.identity = uint64_t(identity);
-  if (profile.has_value()) {
+  // Select from group-wide configured bounds, never this rank's row count:
+  // empty ranks and asymmetric local shapes must speak the same wire protocol.
+  // Fused decode is already a group-wide submission contract. Larger configured
+  // mailboxes fall back to the general selective ring on every rank.
+  const bool single_frame = impl_->decode_single_frame && expected_ranks.has_value() &&
+      (a.mailbox_tokens + a.channels - 1) / a.channels <= std::min(a.chunk_rows, kThreads);
+  if (single_frame && profile.has_value()) {
+    if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t, true, false, false, true>(a, stream);
+    else launch_transport<false, int64_t, true, false, false, true>(a, stream);
+  } else if (single_frame) {
+    if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t, false, false, false, true>(a, stream);
+    else launch_transport<false, int64_t, false, false, false, true>(a, stream);
+  } else if (profile.has_value()) {
     if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t, true, true>(a, stream);
     else launch_transport<false, int64_t, true, true>(a, stream);
   } else if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t, false, true>(a, stream);

@@ -2081,3 +2081,108 @@ in the steady window from the last first token to the first request completion;
 it is not a maximum sustained serving-throughput benchmark. Repeat ranges are
 observations rather than confidence intervals. Graph padding may process more
 rows than eager execution, and both backends use the same bucket list.
+
+
+## Bounded final-frame dispatch and capacity-derived width (2026-10-25)
+
+The opt-in `decode_single_frame` context setting uses one final frame for each
+source/channel when the configured per-source decode bound fits a frame. It
+removes dispatch's separate terminal notification/ACK phase and its initial
+credit poll. Required publication fences, frame ACKs and outgoing-reader drain
+remain. Payload is still rank-deduplicated and multicast; all peers consume frame
+metadata, while only destinations read token payload. Combine arithmetic and
+prefill transport are unchanged.
+
+This is a capacity-based library path, not a branch for a benchmark batch size,
+model name or balanced routing. The setting participates in the existing
+initialization configuration exchange. Different rank settings fail before
+allocation. Empty ranks and skewed local row counts use the same protocol;
+insufficient frame/grid capacity selects the general ring on all ranks.
+
+The SGLang adapter's automatic decode width is at least
+`ceil(decode_max_tokens / min(dispatch_frame_rows, 256))` when that count fits
+the allocated cooperative grid. Explicit channel overrides are honored. The
+first candidate retained the old auto width and consequently fell back to the
+ring at B1/B8. The final capacity-derived policy uses 2/2/4/8 channels for the
+four tested loads, with no batch-specific condition. The library default is off;
+the opt-in Graph preset now enables the setting.
+
+### Full-model comparison
+
+Same eight H20D GPUs, BF16 Qwen3-30B-A3B-Instruct-2507, TP=DP=EP=8, Triton
+experts, FlashInfer attention, full decode Graph with per-rank buckets [1,2,4,8],
+eager prefill, and P2P/NVLink paths disabled on both sides. The baseline is
+SGLang's default NCCL backend. Producer-local NUMA placement was verified; all
+available NVLink payload counters stayed zero, and transport logs recorded no
+P2P/NET/NVLS connections. No CPU trace-analysis job overlapped timed inference.
+
+Each load uses 512 input and 32 output tokens, eight warmups and five timed
+repeats. The final candidate reuses the same-session NCCL reference. A separate
+same-session EP-Xpress run with the setting disabled checks the feature's effect.
+All twenty timed prompt hashes and the benchmark shapes match across the three
+runs. Native kernels are unchanged between the disabled run and final policy;
+when disabled, the additional policy branch is inactive.
+
+Values below are medians [min,max], in milliseconds or output tokens/second.
+TTFT is the last first-token arrival in the batch, not isolated prefill time.
+
+| Backend | Batch | TTFT (ms) | Decode TPOT (ms) | Decode TPS | Batch latency (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NCCL Graph | 1 | 101.859 [100.966, 104.307] | 6.457 [6.433, 6.475] | 154.861 [154.439, 155.456] | 302.143 [301.697, 304.787] |
+| NCCL Graph | 8 | 124.712 [124.430, 125.161] | 6.574 [6.505, 6.636] | 1216.884 [1205.571, 1229.913] | 328.869 [326.926, 330.468] |
+| NCCL Graph | 32 | 478.317 [463.660, 554.250] | 8.991 [8.892, 9.058] | 3558.986 [3532.894, 3598.900] | 756.678 [740.591, 833.041] |
+| NCCL Graph | 64 | 914.722 [905.171, 966.267] | 10.749 [10.691, 10.763] | 5954.112 [5946.137, 5986.277] | 1247.696 [1237.181, 1297.818] |
+| EP-Xpress final-frame Graph | 1 | 97.081 [96.216, 100.579] | 7.010 [6.961, 7.063] | 142.652 [141.577, 143.660] | 315.879 [312.094, 317.993] |
+| EP-Xpress final-frame Graph | 8 | 105.540 [104.780, 302.993] | 11.384 [11.375, 11.392] | 702.752 [702.235, 703.310] | 458.689 [457.856, 655.928] |
+| EP-Xpress final-frame Graph | 32 | 307.203 [288.227, 342.791] | 13.982 [13.915, 14.062] | 2288.636 [2275.676, 2299.611] | 738.334 [717.637, 773.661] |
+| EP-Xpress final-frame Graph | 64 | 554.317 [547.998, 589.122] | 14.817 [14.731, 14.883] | 4319.443 [4300.274, 4344.520] | 1014.494 [1006.888, 1045.897] |
+
+### Feature-disabled ablation
+
+| Batch | Disabled decode TPOT (ms) | Enabled decode TPOT (ms) | Disabled TPS | Enabled TPS | TPS change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 7.837 | 7.010 | 127.592 | 142.652 | +11.8% |
+| 8 | 13.654 | 11.384 | 585.926 | 702.752 | +19.9% |
+| 32 | 16.802 | 13.982 | 1904.503 | 2288.636 | +20.2% |
+| 64 | 17.802 | 14.817 | 3595.108 | 4319.443 | +20.1% |
+
+The final policy improves EP-Xpress decode throughput at all four tested loads,
+but NCCL remains faster in decode. The B64 batch completes sooner than NCCL on
+this short-output workload because of the existing TTFT advantage; this must
+not be called a decode win or attributed entirely to the new dispatch protocol.
+The B32 whole-batch difference is small compared with observed repeat spread.
+
+Two focused native Graph cases exercise int32/int64 routes, missing experts,
+empty ranks, changing routes, five buckets, two replay streams, eager/Graph and
+ring/final-frame reuse, the configured source bound with all eight tokens on one
+rank, and a frame too small for the fast path. Analytical BF16 output checks
+pass. Initialization tests reject mixed protocol settings before storage.
+Local Config/adapter checks pass (one environment-dependent patch check skips).
+Four short greedy model prompts match prior Graph EP-Xpress text and token IDs;
+all 29 compared logprobs have zero observed difference.
+
+These checks do not establish correctness for every deployment or performance
+on other GPU/NUMA topologies. Inputs for the throughput sweep are synthetic;
+full model execution is measured, but this is not a production request-length,
+routing-skew or sustained-arrival workload study. Bounds and fallback are
+correctness constraints, not a claim that the auto width is optimal everywhere.
+
+
+### Final Graph-only profiling
+
+The final B8/B32 traces include a few eager local-DECODE steps while other DP
+ranks are still in prefill. Excluding steps without `cudaGraphLaunch` leaves
+63 and 61 rank-steps respectively. Every retained dispatch uses the single-frame
+kernel specialization. The table reports the median across ranks of each
+rank's mean per replay, in milliseconds:
+
+| Batch | GPU forward window | Dispatch | Fused mailbox combine | Expert GEMM |
+| --- | ---: | ---: | ---: | ---: |
+| 8 | 11.622 | 4.197 | 3.145 | 0.923 |
+| 32 | 13.932 | 4.622 | 3.793 | 1.914 |
+
+The earlier Graph B32 reference had about 7.562 ms dispatch residency per step;
+the final trace is about 39% lower. These are separate diagnostic runs, not
+isolated PCIe bandwidth measurements. Kernel intervals include peer waits,
+metadata, payload access and reduction. Combine remains a major cost, and these
+traces do not separate READY waiting from host payload latency or final ACK drain.

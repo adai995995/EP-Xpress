@@ -12,13 +12,14 @@ pytestmark = [pytest.mark.cuda, pytest.mark.skipif(
     reason="two CUDA GPUs are required")]
 
 
-def _worker(rank, init_file, fused):
+def _worker(rank, init_file, fused, single_frame=False, chunk_bytes=4096, id_bits=64):
     import torch.distributed as dist
     torch.cuda.set_device(rank)
     dist.init_process_group("gloo", init_method="file://" + init_file, rank=rank, world_size=2)
     context = Context(None, [0, 0, 1, 1], Config(
-        128, 2, 8, transport="host_sm", channels=2, chunk_bytes=4096,
-        decode_max_tokens=8, fatal_errors=True, combine_warp_specialization=True), device=rank)
+        128, 2, 8, transport="host_sm", channels=2, chunk_bytes=chunk_bytes,
+        decode_max_tokens=8, fatal_errors=True, combine_warp_specialization=True,
+        decode_single_frame=single_frame), device=rank)
     context.enable_cuda_graph()
     capture_stream = torch.cuda.Stream()
     replay_streams = [torch.cuda.Stream(), torch.cuda.Stream()]
@@ -29,7 +30,7 @@ def _worker(rank, init_file, fused):
         patterns = ([[0, 1], [2, 3], [0, 2], [-1, -1]],
                     [[2, 3], [0, 1], [1, 3], [0, -1]])
         ids = torch.tensor([patterns[step % 2][i % 4] for i in range(n)],
-                           dtype=torch.int64, device="cuda").reshape(n, 2)
+                           dtype=torch.int32 if id_bits == 32 else torch.int64, device="cuda").reshape(n, 2)
         weights = torch.full((n, 2), 0.5, device="cuda")
         return x, ids, weights
 
@@ -75,6 +76,16 @@ def _worker(rank, init_file, fused):
                 result = forward(eager, workspace, 2, False)
                 results.append((result.clone(), eager[0].float() * (eager[1] >= 0).sum(1)[:, None] * 0.5))
                 saved.append(workspace)
+        # Exact configured source bound, maximally skewed token ownership.
+        # The other rank still participates with zero local rows. One channel
+        # exercises the full frame; small-frame configurations use the ring.
+        if single_frame:
+            with torch.cuda.stream(replay_streams[0]):
+                edge = inputs(8 if rank == 0 else 0, 3)
+                workspace = context.create_workspace(8, edge[0].shape[0], fused_combine=True)
+                output = forward(edge, workspace, 1, True)
+                results.append((output.clone(), edge[0].float() * (edge[1] >= 0).sum(1)[:, None] * 0.5))
+                saved.append(workspace)
         torch.cuda.synchronize()
         for actual, expected in results:
             torch.testing.assert_close(actual.float(), expected, rtol=0, atol=0)
@@ -95,3 +106,16 @@ def test_graph_dynamic_routing_bucket_switch_and_eager_prefill(fused):
     native.load()
     with tempfile.TemporaryDirectory(prefix="ep-xpress-graph-test-") as root:
         torch.multiprocessing.spawn(_worker, args=(os.path.join(root, "rendezvous"), fused), nprocs=2, join=True)
+
+
+@pytest.mark.parametrize("chunk_bytes, id_bits", [(4096, 32), (256, 64)])
+def test_single_frame_graph_and_small_frame_fallback(chunk_bytes, id_bits):
+    """Both protocols support fresh routes, empty ranks, skew and slot reuse."""
+    from torch.utils.cpp_extension import CUDA_HOME
+    if CUDA_HOME is None:
+        pytest.skip("CUDA toolkit is unavailable")
+    native.load()
+    with tempfile.TemporaryDirectory(prefix="ep-xpress-single-frame-test-") as root:
+        torch.multiprocessing.spawn(_worker,
+            args=(os.path.join(root, "rendezvous"), True, True, chunk_bytes, id_bits),
+            nprocs=2, join=True)

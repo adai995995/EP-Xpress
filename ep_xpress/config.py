@@ -25,8 +25,13 @@ class Config:
     combine_frame_rows: int = 0  # 0: split chunk budget; positive: rows per pair/frame
     decode_max_tokens: int = 0  # 0: no decode mailbox; otherwise per-source capacity
     combine_warp_specialization: bool = False  # independent pair-queue send/receive groups
+    decode_single_frame: bool = False  # bounded dispatch with one final frame per channel
 
     def __post_init__(self):
+        if not isinstance(self.decode_single_frame, bool):
+            raise ValueError("decode_single_frame must be a bool")
+        if self.decode_single_frame and (self.transport != "host_sm" or not self.decode_max_tokens):
+            raise ValueError("decode_single_frame requires host_sm with decode_max_tokens")
         if not isinstance(self.combine_warp_specialization, bool):
             raise ValueError("combine_warp_specialization must be a bool")
         if self.combine_warp_specialization and self.transport != "host_sm":

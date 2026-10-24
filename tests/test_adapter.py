@@ -39,6 +39,16 @@ def runner_config(**changes):
 
 
 class Tensor:
+    def test_single_frame_auto_width_uses_bounds_and_preserves_overrides(self):
+        common = dict(is_extend=False, allocated=32, adaptive=True,
+                      decode_source_bound=64, dispatch_frame_rows=32)
+        self.assertEqual(select_active_channels(1, **common), 2)
+        self.assertEqual(select_active_channels(32, **common), 4)
+        self.assertEqual(select_active_channels(1, decode_override=1, **common), 1)
+        self.assertEqual(select_active_channels(1, **dict(common, dispatch_frame_rows=1)), 1)
+        self.assertEqual(select_active_channels(1, **dict(common, is_extend=True)), 1)
+        self.assertEqual(select_active_channels(1, **dict(common, adaptive=False)), 32)
+
     def __init__(self, shape):
         self.shape = shape
 

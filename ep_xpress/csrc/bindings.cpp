@@ -170,11 +170,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       int64_t rank, int64_t hidden, int64_t topk, int64_t slots, int64_t dispatch_rows,
       int64_t combine_rows, int64_t timeout_ms, int64_t channels,
       bool diagnostics, bool fatal_errors, c10::optional<torch::Tensor> mailbox_pointers,
-      int64_t mailbox_tokens, bool combine_warp_specialization) {
+      int64_t mailbox_tokens, bool combine_warp_specialization, bool decode_single_frame) {
     return std::make_shared<PreparedHostSM>(expert_rank, expert_local, dispatch_pointers,
         combine_pointers, status, rank, hidden, topk, slots, dispatch_rows, combine_rows,
         timeout_ms, channels, diagnostics, fatal_errors, mailbox_pointers, mailbox_tokens,
-        combine_warp_specialization);
+        combine_warp_specialization, decode_single_frame);
   }, pybind11::arg("expert_rank"), pybind11::arg("expert_local"),
       pybind11::arg("dispatch_pointers"), pybind11::arg("combine_pointers"),
       pybind11::arg("status"), pybind11::arg("rank"), pybind11::arg("hidden"),
@@ -184,7 +184,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       pybind11::arg("fatal_errors") = false,
       pybind11::arg("mailbox_pointers") = pybind11::none(),
       pybind11::arg("mailbox_tokens") = 0,
-      pybind11::arg("combine_warp_specialization") = false);
+      pybind11::arg("combine_warp_specialization") = false,
+      pybind11::arg("decode_single_frame") = false);
   module.def("register_host", &register_host);
   module.def("register_mapped_host", &register_mapped_host);
   module.def("host_sm_max_channels", &host_sm_max_channels, pybind11::arg("world") = 1);

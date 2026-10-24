@@ -441,7 +441,8 @@ class HostSMContext(Context):
                         diagnostics=self.config.diagnostics, fatal_errors=self.config.fatal_errors,
                         mailbox_pointers=self._pointers.get("mailbox"),
                         mailbox_tokens=self.config.decode_max_tokens,
-                        combine_warp_specialization=self.config.combine_warp_specialization)
+                        combine_warp_specialization=self.config.combine_warp_specialization,
+                        decode_single_frame=self.config.decode_single_frame)
                 self._work_stream.synchronize()
                 self._last_stream = self._work_stream
         except Exception:

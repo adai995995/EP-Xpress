@@ -522,3 +522,24 @@ def test_direct_workspace_avoids_completion_events_and_orders_api_transitions():
         producer.wait_stream.assert_any_call(other)
         context.combine_on_stream(batch.hidden, batch.handle, stream=producer)
         assert event.call_count == 1
+
+
+def test_single_frame_protocol_mismatch_is_rejected_before_storage():
+    context = object.__new__(HostSMContext)
+    context.rank, context.world_size = 0, 2
+    context.config = Config(128, 2, 8, transport="host_sm", decode_max_tokens=8,
+                            decode_single_frame=True)
+    context.expert_to_rank = (0, 1)
+    context.device = torch.device("cuda", 0)
+    context.group, context._channel_capacity = object(), 4
+
+    def gather(result, signature, group):
+        other_config = dict(signature[1], decode_single_frame=False)
+        result[:] = [signature, (signature[0], other_config, signature[2], "gpu-1", 4)]
+
+    with patch("ep_xpress.host_sm.dist.all_gather_object", side_effect=gather), \
+            patch("ep_xpress.host_sm.torch.cuda.get_device_properties", return_value=SimpleNamespace(uuid="gpu-0")), \
+            patch("ep_xpress.host_sm.dist.broadcast_object_list") as broadcast:
+        with pytest.raises(ValueError, match="configuration"):
+            context._bootstrap(None)
+    broadcast.assert_not_called()

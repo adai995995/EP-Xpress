@@ -262,7 +262,7 @@ def prepare_host_sm(
     expert_rank, expert_local, dispatch_pointers, combine_pointers, status,
     rank, hidden, topk, slots, dispatch_rows, combine_rows, timeout_ms, channels,
     *, diagnostics=False, fatal_errors=False, mailbox_pointers=None, mailbox_tokens=0,
-    combine_warp_specialization=False,
+    combine_warp_specialization=False, decode_single_frame=False,
 ):
     """Validate and cache immutable GPU transport state during bootstrap.
 
@@ -306,14 +306,19 @@ def prepare_host_sm(
     replaced by caller-managed ordering. Use HostSMContext's graph lifecycle
     methods for this ownership contract.
 
+    decode_single_frame=True selects a final-frame dispatch for fused decode
+    when the configured mailbox bound fits one frame per active channel. The
+    decision never uses local live row counts. All ranks must agree on this
+    initialization option; Context negotiates it through Config at bootstrap.
+
     combine_warp_specialization=True gives prepared pair queues independent
     128-thread send/receive groups. It preserves the grid and frame layout,
     leaves fused mailbox combine unchanged; opt-in profiling records overlapping group times.
     The default False keeps the sequential pair kernel and its profiler.
     """
     if not all(isinstance(value, bool) for value in
-               (diagnostics, fatal_errors, combine_warp_specialization)):
-        raise TypeError("diagnostics, fatal_errors and combine_warp_specialization must be bools")
+               (diagnostics, fatal_errors, combine_warp_specialization, decode_single_frame)):
+        raise TypeError("diagnostics, fatal_errors, combine_warp_specialization and decode_single_frame must be bools")
     return load().prepare_host_sm(
         expert_rank, expert_local, dispatch_pointers, combine_pointers, status,
         _integer(rank, "rank"), _integer(hidden, "hidden", 1),
@@ -325,6 +330,7 @@ def prepare_host_sm(
         mailbox_pointers=mailbox_pointers,
         mailbox_tokens=_integer(mailbox_tokens, "mailbox_tokens"),
         combine_warp_specialization=combine_warp_specialization,
+        decode_single_frame=decode_single_frame,
     )
 
 

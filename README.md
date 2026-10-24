@@ -22,13 +22,18 @@ End-to-end performance must be measured against the intended inference framework
 - No remote GPU pointers, GPU IPC, peer copies, or RDMA in either transport.
 - Bounded host rings with configurable slot count, immutable published chunks,
   generation IDs, consumer ACKs, and simultaneous send/receive progress.
-  Prepared `host_sm` dispatch shares each producer's payload among its actual
+  General prepared `host_sm` dispatch shares each producer's payload among its actual
   readers and reclaims it using only their ACKs. Combine uses independent
   queues for each directed rank pair and channel, with GPU owner row lists
   generated during dispatch. Optional warp specialization gives prepared pair
   queues four sending warps and four receiving warps within the same CTA.
   An optional bounded decode path receives and
   reduces directly from per-token host mailboxes in one combine kernel.
+- Opt-in bounded decode dispatch uses one final frame per source/channel,
+  removing a separate terminal exchange. Selected ranks still share token
+  payload; all frame-metadata readers acknowledge reuse. Selection depends on
+  configured capacity and frame size, with the general ring as fallback.
+  The SGLang automatic policy derives the minimum width from those bounds.
 - Explicitly borrowed decode workspaces reuse communication tensors. Generic
   calls without a workspace retain operation-owned outputs and route storage.
 - Operation-scoped inverse-route handles, already-weighted rank partials,

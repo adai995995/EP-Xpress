@@ -102,5 +102,17 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(Config(128, 4, 32, transport="host_ce").diagnostics)
 
 
+    def test_single_frame_requires_explicit_host_sm_mailbox(self):
+        for kwargs in (
+            {"decode_single_frame": 1},
+            {"decode_single_frame": True},
+            {"decode_single_frame": True, "transport": "host_sm"},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, "decode_single_frame"):
+                Config(128, 2, 8, **kwargs)
+        self.assertTrue(Config(128, 2, 8, transport="host_sm", decode_max_tokens=8,
+                               decode_single_frame=True).decode_single_frame)
+
+
 if __name__ == "__main__":
     unittest.main()

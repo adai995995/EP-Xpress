@@ -120,6 +120,9 @@ class HostEPDispatcher(BaseDispatcher):
         self._decode_same_stream = transport == "host_sm" and decode_same_stream == "1"
         decode_workspace = os.environ.get("EP_XPRESS_DECODE_WORKSPACE", "1")
         fused_decode = os.environ.get("EP_XPRESS_FUSED_DECODE", "1")
+        decode_single_frame = os.environ.get("EP_XPRESS_DECODE_SINGLE_FRAME", "0")
+        if decode_single_frame not in ("0", "1"):
+            raise ValueError("EP_XPRESS_DECODE_SINGLE_FRAME must be 0 or 1")
         combine_warps = os.environ.get("EP_XPRESS_COMBINE_WARP_SPECIALIZATION", "1")
         if combine_warps not in ("0", "1"):
             raise ValueError("EP_XPRESS_COMBINE_WARP_SPECIALIZATION must be 0 or 1")
@@ -142,6 +145,7 @@ class HostEPDispatcher(BaseDispatcher):
                                 if transport == "host_sm" else 0),
             decode_max_tokens=(int(os.environ.get("EP_XPRESS_DECODE_MAX_TOKENS", "64"))
                                if transport == "host_sm" else 0),
+            decode_single_frame=decode_single_frame == "1",
             combine_warp_specialization=transport == "host_sm" and combine_warps == "1",
         )
         adaptive = os.environ.get("EP_XPRESS_ADAPTIVE_CHANNELS", "1")
@@ -223,13 +227,6 @@ class HostEPDispatcher(BaseDispatcher):
                 capacity = get_global_dp_buffer_len()
                 is_extend = get_is_extend_in_batch()
                 dispatch_options["recv_capacity"] = capacity
-                dispatch_options["active_channels"] = select_active_channels(
-                    capacity, is_extend=is_extend,
-                    allocated=self._context().effective_channels,
-                    adaptive=self._adaptive_channels,
-                    prefill_override=self._prefill_channels,
-                    decode_override=self._decode_channels,
-                )
                 # All ranks derive fusion from existing global CPU metadata.
                 # Local token counts only select a local workspace shape.
                 small_decode = (not is_extend and
@@ -238,6 +235,17 @@ class HostEPDispatcher(BaseDispatcher):
                 same_stream = self._cuda_graph or (small_decode and self._decode_same_stream)
                 fused = small_decode and self._fused_decode
                 dispatch_options["fused_combine"] = fused
+                context = self._context()
+                dispatch_options["active_channels"] = select_active_channels(
+                    capacity, is_extend=is_extend,
+                    allocated=context.effective_channels,
+                    adaptive=self._adaptive_channels,
+                    prefill_override=self._prefill_channels,
+                    decode_override=self._decode_channels,
+                    decode_source_bound=(self._config.decode_max_tokens
+                        if fused and self._config.decode_single_frame else 0),
+                    dispatch_frame_rows=self._config.channel_chunk_rows(context.effective_channels),
+                )
                 if ((small_decode and self._reuse_decode_workspace) or
                         (self._cuda_graph and not is_extend)):
                     key = (capacity, hidden_states.shape[0], fused)

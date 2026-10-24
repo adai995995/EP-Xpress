@@ -649,3 +649,48 @@ adapter retains decode workspaces for all selected buckets, integrates the two
 lifecycle hooks in its full-graph backend, and keeps eager prefill on the same
 ordered context. CUDA Graphs preserve changing top-k routing; they do not cache
 a previous token's expert assignment.
+
+
+## Bounded single-frame decode dispatch
+
+`Config(decode_single_frame=True, decode_max_tokens=...)` opts a host-SM
+context into a bounded dispatch protocol. The option is included in the existing
+bootstrap configuration exchange, so ranks with different protocol settings fail
+before arena allocation. No new metadata collective or host read of routing is
+added to dispatch. The SGLang adapter exposes it as
+`EP_XPRESS_DECODE_SINGLE_FRAME=1` before context initialization.
+
+Selection requires fused decode and
+`ceil(decode_max_tokens / active_channels) <= min(dispatch_frame_rows, 256)`.
+Both operands use group-wide configured limits, not the rank's live row count,
+batch-size labels, observed routing distribution or model identity. Empty ranks
+select the same protocol as populated ranks. Larger configured bounds and all
+non-fused operations retain the selective ring. The active width and fused mode
+remain collective submission contracts, as with the existing mailbox API.
+
+Each producer/channel publishes one frame, including a negative row count for
+an empty frame. A nonempty frame is also final: consumers ACK it and finish that
+source without a separate terminal notification. Payload remains rank-deduplicated
+and shared among selected readers; all peers inspect frame metadata, and only
+selected peers read token payload. The one metadata/payload ACK per consumer
+protects reuse. This is not removal of all-peer completion or of required memory
+ordering. System fences remain on publish and ACK.
+
+Each operation drains its outgoing frame before returning, so the next operation
+can reuse slot zero without an initial credit poll. The drain compares ACKs
+against the known generation instead of rereading the producer READY word.
+General-ring/fixed-frame transitions retain that same lifetime guarantee. This
+revision does not defer ACKs across calls, change buffer ownership, or introduce
+concurrent graph replays. Invalid routes and capacity errors remain checked.
+
+Fixed capacity reserves storage; it does not imply fixed expert routing or that
+all reserved rows are valid. Every graph replay still reads the current top-k IDs
+and generates fresh inverse maps, owner lists and GPU receive counts.
+
+
+In SGLang automatic-channel mode, fused decode raises the active width to at
+least `ceil(decode_max_tokens / min(dispatch_frame_rows, 256))` when that width
+fits the allocated cooperative grid. This is a resource-bound decision shared
+by every rank, not a special case for an observed benchmark batch. Explicit
+channel overrides remain authoritative; insufficient grid capacity retains the
+ring fallback. The same width is saved in the handle for combine.
