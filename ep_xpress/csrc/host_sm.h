@@ -16,6 +16,9 @@ class PreparedHostSM {
       int64_t timeout_ms, int64_t channels, bool diagnostics, bool fatal_errors,
       c10::optional<torch::Tensor> mailbox_pointers, int64_t mailbox_tokens,
       bool combine_warp_specialization);
+  // Before any operation. Caller serializes all eager/replay work and keeps
+  // this object and its arenas alive until every captured graph is destroyed.
+  void enable_device_epochs();
   void dispatch(torch::Tensor input, torch::Tensor ids, torch::Tensor weights,
       int64_t epoch, torch::Tensor output, torch::Tensor output_ids,
       torch::Tensor output_weights, torch::Tensor inverse, torch::Tensor count,

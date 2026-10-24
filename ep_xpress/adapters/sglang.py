@@ -1,4 +1,4 @@
-"""Experimental eager BF16 adapter for the pinned SGLang source revision.
+"""BF16 adapter with eager execution and opt-in full decode CUDA Graphs.
 
 The patch under adapters/sglang registers this as its own A2A backend. The
 communication library itself does not depend on SGLang or its global state.
@@ -32,6 +32,18 @@ from sglang.srt.runtime_context import get_parallel
 
 _contexts = {}
 _logger = logging.getLogger(__name__)
+
+
+def prepare_graph_capture():
+    """Called by the full-graph backend after warmup, outside capture."""
+    for context in _contexts.values():
+        context.prepare_graph_capture()
+
+
+def prepare_graph_replay():
+    """One notification per forward, so eager/graph queue reuse stays ordered."""
+    for context in _contexts.values():
+        context.prepare_graph_replay()
 
 
 def close_contexts():
@@ -70,7 +82,7 @@ class _Ticket:
 class HostEPDispatcher(BaseDispatcher):
     """Standard/Triton input contract with EP-Xpress communication.
 
-    SGLang's StandardCombineInput has no handle field. The eager adapter
+    SGLang's StandardCombineInput has no handle field. The adapter
     therefore accepts exactly one outstanding operation per layer; an
     immutable operation ticket survives until its matching combine. TBO/SBO
     must use a future interface carrying tickets through expert execution.
@@ -99,6 +111,12 @@ class HostEPDispatcher(BaseDispatcher):
         decode_same_stream = os.environ.get("EP_XPRESS_DECODE_SAME_STREAM", "0")
         if decode_same_stream not in ("0", "1"):
             raise ValueError("EP_XPRESS_DECODE_SAME_STREAM must be 0 or 1")
+        graph_mode = os.environ.get("EP_XPRESS_CUDA_GRAPH", "0")
+        if graph_mode not in ("0", "1"):
+            raise ValueError("EP_XPRESS_CUDA_GRAPH must be 0 or 1")
+        self._cuda_graph = graph_mode == "1"
+        if self._cuda_graph and (transport != "host_sm" or diagnostics != "0"):
+            raise ValueError("CUDA Graph requires host_sm with diagnostics disabled")
         self._decode_same_stream = transport == "host_sm" and decode_same_stream == "1"
         decode_workspace = os.environ.get("EP_XPRESS_DECODE_WORKSPACE", "1")
         fused_decode = os.environ.get("EP_XPRESS_FUSED_DECODE", "1")
@@ -140,7 +158,7 @@ class HostEPDispatcher(BaseDispatcher):
             if not 0 <= value <= self._config.channels:
                 raise ValueError("phase channel override must be 0 (auto) or within configured channels")
         self._expert_map = tuple(contiguous_expert_map(moe_runner_config.num_experts, size))
-        self._context_key = (self._group, self._device, self._config, self._expert_map)
+        self._context_key = (self._group, self._device, self._config, self._expert_map, self._cuda_graph)
         self._resolved_context = None
         self._layer_id = moe_runner_config.layer_id
         self._sequence = 0
@@ -160,7 +178,7 @@ class HostEPDispatcher(BaseDispatcher):
         # Guard only this first resolution; normal calls use the cached context
         # and the transport's existing per-submission capture check.
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("EP-Xpress currently requires eager execution")
+            raise RuntimeError("initialize the EP context during eager warmup before capture")
         if self._context_key not in _contexts:
             _contexts[self._context_key] = Context(
                 group=self._group,
@@ -168,6 +186,8 @@ class HostEPDispatcher(BaseDispatcher):
                 config=self._config,
                 device=self._device,
             )
+            if self._cuda_graph:
+                _contexts[self._context_key].enable_cuda_graph()
             if self._config.transport == "host_sm":
                 _logger.info(
                     "EP-Xpress host_sm channels: requested=%d effective=%d",
@@ -215,20 +235,23 @@ class HostEPDispatcher(BaseDispatcher):
                 small_decode = (not is_extend and
                                 0 <= capacity <= self._config.decode_max_tokens and
                                 self._config.decode_max_tokens > 0)
-                same_stream = small_decode and self._decode_same_stream
+                same_stream = self._cuda_graph or (small_decode and self._decode_same_stream)
                 fused = small_decode and self._fused_decode
                 dispatch_options["fused_combine"] = fused
-                if small_decode and self._reuse_decode_workspace:
+                if ((small_decode and self._reuse_decode_workspace) or
+                        (self._cuda_graph and not is_extend)):
                     key = (capacity, hidden_states.shape[0], fused)
                     workspace = self._decode_workspaces.get(key)
                     if workspace is None:
+                        if torch.cuda.is_current_stream_capturing():
+                            raise RuntimeError("warm each graph bucket before capture")
                         workspace = self._context().create_workspace(
                             recv_capacity=capacity, local_tokens=hidden_states.shape[0],
                             fused_combine=fused,
                         )
                         # Bound storage for dynamic serving batches. Outstanding
                         # tensors retain their stream lifetimes on eviction.
-                        if len(self._decode_workspaces) == 4:
+                        if not self._cuda_graph and len(self._decode_workspaces) == 4:
                             self._decode_workspaces.pop(next(iter(self._decode_workspaces)))
                         self._decode_workspaces[key] = workspace
                     dispatch_options["workspace"] = workspace

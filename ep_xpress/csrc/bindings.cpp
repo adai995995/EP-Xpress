@@ -148,6 +148,7 @@ torch::Tensor finish_combine(torch::Tensor remote, torch::Tensor local) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   pybind11::class_<PreparedHostSM, std::shared_ptr<PreparedHostSM>>(module, "PreparedHostSM")
+      .def("enable_device_epochs", &PreparedHostSM::enable_device_epochs)
       .def("dispatch", &PreparedHostSM::dispatch,
           pybind11::arg("x"), pybind11::arg("ids"), pybind11::arg("weights"),
           pybind11::arg("epoch"), pybind11::arg("output"), pybind11::arg("output_ids"),

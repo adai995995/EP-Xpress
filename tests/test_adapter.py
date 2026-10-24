@@ -173,7 +173,7 @@ class AdapterValidationTest(unittest.TestCase):
         for changes in ({"dp_size": 1}, {"nnodes": 2}, {"enable_eplb": True},
                         {"enable_two_batch_overlap": True}, {"enable_single_batch_overlap": True},
                         {"speculative_algorithm": "EAGLE"}, {"quantization": "fp8"},
-                        {"dwdp_size": 2}, {"ep_join_mode": "scale"}):
+                        {"dwdp_size": 2}, {"ep_join_mode": "scale"}, {"enable_pdmux": True}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 validate_server_args(SimpleNamespace(**(values | changes)), model)
 

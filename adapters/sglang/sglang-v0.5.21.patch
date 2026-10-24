@@ -71,7 +71,7 @@
              "moe_a2a_backend is overridden to 'deepep' because Waterfill "
 --- a/python/sglang/srt/arg_groups/moe_hook.py
 +++ b/python/sglang/srt/arg_groups/moe_hook.py
-@@ -252,6 +252,14 @@
+@@ -252,6 +252,22 @@
      run_post_process_pass(server_args, _a2a_fusion_adjustments)
  
      a2a_backend = resolved_view(server_args).moe_a2a_backend
@@ -79,10 +79,18 @@
 +        from ep_xpress.adapters.sglang_config import validate_server_args
 +
 +        validate_server_args(resolved_view(server_args), model_config_of(server_args).hf_config)
-+        graph_config = with_phase(cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED)
++        import os
++
++        graph_enabled = os.environ.get("EP_XPRESS_CUDA_GRAPH", "0") == "1"
++        graph_config = cfg.cuda_graph_config
++        if graph_enabled:
++            if graph_config.decode.backend not in (Backend.FULL, Backend.DISABLED):
++                raise ValueError("EP-Xpress supports only full decode CUDA Graphs")
++        else:
++            graph_config = with_phase(graph_config, Phase.DECODE, backend=Backend.DISABLED)
 +        graph_config = with_phase(graph_config, Phase.PREFILL, backend=Backend.DISABLED)
 +        declare_resolution(server_args, "_handle_a2a_moe", cuda_graph_config=graph_config)
-+        logger.warning("EP-Xpress uses eager execution; prefill and decode CUDA graphs are disabled")
++        logger.info("EP-Xpress graph mode=%s; prefill remains eager", graph_enabled)
      if cfg.enable_waterfill:
          declare_resolution(
              server_args, "_handle_a2a_moe", enforce_shared_experts_fusion=True
@@ -392,3 +400,50 @@
    }
  
    template <ActivationKind kAct>
+--- a/python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py
++++ b/python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py
+@@ -86,6 +86,9 @@
+         enable_memory_saver: bool = False,
+         reuse_output_buffer: bool = False,
+     ) -> None:
++        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
++
++        self._ep_xpress = get_moe_a2a_backend().is_ep_xpress()
+         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
+         self._outputs: Dict[Any, Any] = {}
+         self._pool = None
+@@ -157,6 +160,10 @@
+             self._reuse_output_buffer = self._output_buffer is not None
+         del warmup_output
+ 
++        if self._ep_xpress:
++            from ep_xpress.adapters.sglang import prepare_graph_capture
++
++            prepare_graph_capture()
+         graph = torch.cuda.CUDAGraph()
+ 
+         graph_ctx: Callable[..., AbstractContextManager]
+@@ -206,6 +213,10 @@
+         static_forward_batch: ForwardBatch,
+         **kwargs,
+     ) -> Any:
++        if self._ep_xpress:
++            from ep_xpress.adapters.sglang import prepare_graph_replay
++
++            prepare_graph_replay()
+         with graph_pool_replay_scope():
+             self._graphs[shape_key].replay()
+         return self._outputs[shape_key]
+--- a/python/sglang/srt/utils/common.py
++++ b/python/sglang/srt/utils/common.py
+@@ -3987,6 +3987,10 @@
+             return True
+         elif moe_a2a_backend.is_none():
+             return True
++        elif moe_a2a_backend.is_ep_xpress():
++            # Host receive capacity and channel count must use the same graph
++            # bucket on every EP rank, including ranks with no live requests.
++            return True
+         elif moe_a2a_backend.is_flashinfer():
+             # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank
+             # token count: MoeAlltoAll uses fixed-geometry buffers and the decode

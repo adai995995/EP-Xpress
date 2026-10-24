@@ -1975,3 +1975,109 @@ adapter default stays off. CUDA Graph remains unsupported: replay-safe device
 epochs and graph-lifetime workspaces still need implementation and validation.
 Expert-layout fusion, residual epilogue fusion and independent Tx/Rx tuning
 are not part of this measured change.
+
+
+## Serialized full decode CUDA Graph (2026-10-25)
+
+This revision adds opt-in full decode Graph capture/replay. Dispatch and
+combine use GPU-owned generations, graph workspaces remain alive, routes are
+recomputed from the current token on each replay, and the SGLang full-graph
+backend orders replay with eager work. Graph mode also submits eager prefill
+on the compute stream. Prefill itself is not captured. Queue READY/ACK and
+credit ordering are preserved; no CPU routing or metadata collective is added.
+
+The reference remains SGLang's default NCCL backend with GPU P2P/NVLink paths
+disabled on both sides. Both use full decode Graph with local per-DP-rank
+buckets `[1, 2, 4, 8]`, eager prefill, eight identical H20D GPUs, BF16
+Qwen3-30B-A3B-Instruct-2507, TP=DP=EP=8, Triton experts and FlashInfer attention.
+Custom all-reduce and FlashInfer all-reduce fusion are disabled. Prompts have
+512 input tokens and 32 generated tokens, B1/B32, eight warmups and five timed
+repeats. The host transport retains producer-local NUMA placement, 32 allocated
+channels, two slots, 4 MiB payload budget and 16-row prefill combine frames.
+Read/write/dispatch unroll remains four and LAST-data remains enabled.
+
+### Graph-mode tuning
+
+The initial scalar decode mailbox uses auto channels (one at B1 and four at
+balanced B32). Replacing it with two-peer vector reads changes only the build
+setting. Fixed channel counts test the same vector path; prefill is unchanged.
+Values below are median steady-state TPOT in milliseconds; smaller is better.
+
+| Candidate | B1 TPOT | B32 TPOT |
+| --- | ---: | ---: |
+| Scalar / auto | 8.828 | 17.861 |
+| Vector / auto | 7.854 | 16.839 |
+| Vector / one channel | 7.813 | 22.714 |
+| Vector / two channels | 7.987 | 18.995 |
+
+### Final adjacent NCCL Graph comparison
+
+The final candidate keeps vector peer batch two and automatic channels.
+Both server configurations, input hashes for all ten timed cases, transport
+settings and available NVLink counters were checked. Both use SHM framework
+communication with no P2P/NET/NVLS connections in the recorded transport logs;
+all available NVLink payload counters remain zero. Values are median [min, max].
+TTFT below is the last first-token arrival in a batch; TPS is aggregate steady
+state output tokens per second.
+
+| Backend | Batch | TTFT (ms) | TPOT (ms) | Decode TPS | Whole batch (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NCCL Graph | 1 | 101.427 [101.010, 102.913] | 6.453 [6.426, 6.476] | 154.958 [154.425, 155.629] | 301.859 [300.713, 302.915] |
+| NCCL Graph | 32 | 479.182 [459.855, 535.574] | 8.998 [8.894, 9.096] | 3556.396 [3518.040, 3598.112] | 756.115 [739.167, 811.043] |
+| EP-Xpress Graph | 1 | 95.749 [95.209, 96.519] | 7.811 [7.798, 8.051] | 128.031 [124.214, 128.235] | 338.392 [337.440, 345.805] |
+| EP-Xpress Graph | 32 | 333.487 [287.789, 334.516] | 16.673 [16.620, 16.887] | 1919.234 [1894.951, 1925.339] | 848.699 [805.793, 850.179] |
+
+**The candidate improves substantially over its earlier eager execution, but
+NCCL Graph still wins decode throughput and whole-batch completion time.**
+At B1/B32, the candidate's decode throughput is 17.4%/46.0% lower than NCCL
+Graph. Its TTFT is 5.6%/30.4% lower, while whole-batch time is 12.1%/12.2%
+longer on this 32-output-token workload. The TTFT improvement is a service
+metric and must not be presented as an isolated prefill-kernel speedup.
+
+Twenty-four host API checks pass. The final graph tests cover both fused
+mailboxes and warp-specialized pair queues on two GPUs: five retained buckets,
+changing routing IDs between replays, empty ranks, different replay streams,
+and alternating graph decode with eager pair-queue prefill. Thirteen adapter
+checks cover patch applicability, parsing and supported configuration bounds.
+Four short greedy full-model prompts match the previous eager EP version in
+all generated token IDs and text; the 29 sampled common-prefix logprobs have
+zero observed difference. These are bounded correctness checks, not exhaustive
+numerical equivalence or a proof that every benchmark follows identical routes.
+
+Use `adapters/sglang/presets/host_sm_bf16_ep8_graph.sh` with full decode Graph
+and buckets `[1, 2, 4, 8]`. Generic defaults stay eager. The same bucket list
+and Graph mode are required in the NCCL comparison. The final scope rejects
+PD-Multiplexing alongside the existing overlapping-forward and memory-saver
+restrictions; graph contexts execute serially.
+
+### Profiling and scope
+
+Separate eight-step B32 traces of the prior direct-stream eager version and
+the initial scalar Graph version show median per-rank observed GPU idle within
+forward windows decreasing from 45.5% to 4.1%. In the scalar Graph trace,
+dispatch transport occupies 42.4% and fused mailbox combine 26.2% of the forward
+window (per-rank medians). Expert GEMM is 10.6%, expert alignment 0.9%.
+These are kernel residency intervals including peer waits, GPU work and host
+memory accesses, not pure PCIe wire times. The traces use different execution
+modes with different profiler overhead; they do not isolate a byte-transfer
+speedup or prove the cause of every idle interval.
+
+A separate trace of the final vector candidate has eight decode steps on each
+of eight B32 ranks, with eight `cudaGraphLaunch` calls per rank. Median observed
+idle is 3.1%; dispatch transport is 45.3%, fused mailbox combine 22.1%, expert
+GEMM 11.5% and alignment 1.0% of the forward window. This confirms actual graph
+replay and locates the remaining kernel residency, without separating payload
+access from READY/ACK/peer waiting inside those kernels.
+
+The remaining decode work should prioritize dispatch's small-message protocol
+and mailbox payload/progress efficiency. These traces do not support prioritizing
+expert alignment fusion over transport, or assuming that fewer channels improve
+performance. More CTAs alone do not remove per-message control dependencies.
+
+The eager-only advantage in earlier sections must not be generalized to a
+Graph-enabled NCCL baseline. TTFT includes scheduling/first-token delivery and
+is not isolated prefill kernel time. Decode TPS is aggregate output throughput
+in the steady window from the last first token to the first request completion;
+it is not a maximum sustained serving-throughput benchmark. Repeat ranges are
+observations rather than confidence intervals. Graph padding may process more
+rows than eager execution, and both backends use the same bucket list.

@@ -2,8 +2,8 @@
 
 No per-operation route tensor is read by the CPU. The public tensors have a
 caller-provided upper-bound capacity, with padding IDs -1 and a device count.
-All ranks must enqueue the same phase and handle order. CUDA Graph capture is
-not supported. GPU stream dependencies and queue credits remain necessary.
+All ranks must enqueue the same phase and handle order. Serialized CUDA Graph
+execution is opt-in. GPU stream dependencies and queue credits remain necessary.
 """
 
 from dataclasses import asdict, dataclass
@@ -161,7 +161,10 @@ class HostSMWorkspace:
         self.local_rows = (torch.empty(local_tokens, dtype=torch.int32, **options)
                            if fused_combine else None)
 
-    def _record_stream(self, stream):
+    def _record_stream(self, stream, *, capturing=False):
+        if capturing:
+            # Graph callers retain storage for the entire graph lifetime.
+            return
         if stream not in self._recorded_streams:
             if stream != self._allocation_stream:
                 stream.wait_stream(self._allocation_stream)
@@ -172,19 +175,19 @@ class HostSMWorkspace:
                     tensor.record_stream(stream)
             self._recorded_streams.append(stream)
 
-    def _acquire(self, context, producer, execution=None):
+    def _acquire(self, context, producer, execution=None, *, capturing=False):
         # These dependencies protect prior expert/output consumers, including
         # a stream different from the producer supplied for this dispatch.
         execution = context._work_stream if execution is None else execution
         for consumer in self._consumer_streams:
-            if consumer != producer and consumer != execution:
+            if not capturing and consumer != producer and consumer != execution:
                 execution.wait_stream(consumer)
         self._consumer_streams.clear()
         self._generation += 1
         self._busy = True
 
-    def _combined(self, consumer):
-        if consumer not in self._consumer_streams:
+    def _combined(self, consumer, *, capturing=False):
+        if not capturing and consumer not in self._consumer_streams:
             self._consumer_streams.append(consumer)
         self._busy = False
 
@@ -320,6 +323,8 @@ class HostSMContext(Context):
         self._root = None
         self._work_stream = None
         self._last_stream = None
+        self._cuda_graph_enabled = False
+        self._capture_ready = False
         self._combine_profile = None
         self._combine_profile_last = None
         self._combine_profile_label = None
@@ -497,6 +502,8 @@ class HostSMContext(Context):
             if self._closed:
                 raise RuntimeError("Context is closed")
             self._check_aborted()
+            if getattr(self, "_cuda_graph_enabled", False):
+                raise RuntimeError("operation profiling is unavailable in CUDA Graph mode")
             if self._combine_profile is not None:
                 raise RuntimeError("stop the current combine profile before starting another")
             if (isinstance(max_operations, bool) or not isinstance(max_operations, int) or
@@ -638,6 +645,64 @@ class HostSMContext(Context):
                 raise RuntimeError("no completed combine profile is available")
             return copy.deepcopy(self._combine_profile_last)
 
+    def enable_cuda_graph(self):
+        """Opt into serialized direct-stream eager/capture/replay execution.
+
+        Call once before dispatch. Prepare each capture with
+        ``prepare_graph_capture`` after warming its workspaces, and call
+        ``prepare_graph_replay`` immediately before every graph replay. Keep
+        the context, workspaces and external static inputs alive until graphs
+        are destroyed; never run graphs sharing this context concurrently.
+        All ranks must execute the same operation and graph-bucket order.
+        """
+        with self._lock, torch.cuda.device(self.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("enable CUDA Graph outside capture")
+            if self._closed or self._counter or self._cuda_graph_enabled:
+                raise RuntimeError("enable CUDA Graph once, before the first submission")
+            if self.config.diagnostics or self._combine_profile is not None:
+                raise ValueError("CUDA Graph mode requires operation diagnostics off")
+            self._work_stream.synchronize()
+            with torch.cuda.stream(self._work_stream):
+                self._prepared.enable_device_epochs()
+            self._work_stream.synchronize()
+            self._cuda_graph_enabled = True
+
+    def prepare_graph_capture(self):
+        """Drain eager work once outside capture; never resets protocol state.
+
+        Warm every workspace shape before this boundary. The capture must use
+        only direct-stream operations and already allocated workspaces. CPU
+        handles describe the recording; routes/counts are recomputed on replay.
+        """
+        with self._lock, torch.cuda.device(self.device):
+            if not self._cuda_graph_enabled or self._closed or self._failure is not None:
+                raise RuntimeError("an enabled, healthy graph context is required")
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("prepare_graph_capture must run outside capture")
+            (self._last_stream or self._work_stream).synchronize()
+            self._capture_ready = True
+
+    def prepare_graph_replay(self, stream=None):
+        """Order one replay with prior eager/replay work without a host fence.
+
+        Invoke before updating shared static inputs and graph.replay() on the
+        same stream. Output consumers must be enqueued before another operation
+        reuses workspace; cross-stream input writes need this dependency too.
+        This notification is needed because replay bypasses all Python methods.
+        """
+        with self._lock, torch.cuda.device(self.device):
+            if not self._cuda_graph_enabled or self._closed or self._failure is not None:
+                raise RuntimeError("an enabled, healthy graph context is required")
+            execution = stream or torch.cuda.current_stream(self.device)
+            if execution.device != self.device or torch.cuda.is_current_stream_capturing():
+                raise ValueError("replay must be submitted outside capture on the context device")
+            previous = self._last_stream or self._work_stream
+            if execution != previous:
+                execution.wait_stream(previous)
+            self._last_stream = execution
+            self._capture_ready = False
+
     def _begin(self, phase, stream, *, same_stream=False):
         if self._closed:
             raise RuntimeError("Context is closed")
@@ -645,13 +710,26 @@ class HostSMContext(Context):
             raise RuntimeError("EP context is in a failed state") from self._failure
         # The caller's producer stream can be capturing even though the
         # separate native transport stream is not; keep both boundary guards.
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("host_sm eager backend cannot be captured in a CUDA Graph")
+        capturing = torch.cuda.is_current_stream_capturing()
+        graph_mode = getattr(self, "_cuda_graph_enabled", False)
+        if graph_mode and not same_stream:
+            raise RuntimeError("CUDA Graph mode requires direct-stream operations")
+        if capturing and not (graph_mode and self._capture_ready):
+            raise RuntimeError("prepare_graph_capture is required before CUDA Graph capture")
         if self._unwaited >= self.config.max_pending_operations:
             raise RuntimeError("pending ticket capacity exceeded; wait on earlier tickets")
         producer = stream or torch.cuda.current_stream(self.device)
         if producer.device != self.device:
             raise ValueError("producer stream must belong to the context device")
+        self._capturing_submission = capturing
+        if capturing:
+            if producer != torch.cuda.current_stream(self.device):
+                raise ValueError("capture operations must use the current capture stream")
+            # Recording must neither wait on a noncapturing stream nor change
+            # the stream of the last executed work. Native epochs live on GPU.
+            self._counter += 1
+            return 1
+        self._capture_ready = False
         self._epochs[phase] += 1
         self._counter += 1
         if self._epochs[phase] >= 1 << 31:
@@ -665,7 +743,7 @@ class HostSMContext(Context):
         if producer != execution and producer != previous:
             execution.wait_stream(producer)
         self._last_stream = execution
-        return self._epochs[phase]
+        return 1 if graph_mode else self._epochs[phase]
 
     def _finish(self, value, active_channels, workspace=None):
         completed = torch.cuda.Event()
@@ -722,7 +800,7 @@ class HostSMContext(Context):
         This does not block the CPU. Consume the batch on this stream; callers
         using another stream must establish its dependency and tensor lifetimes.
         Shared queue transitions remain ordered with the asynchronous API.
-        CUDA Graph capture is not supported.
+        Capture requires enable_cuda_graph and the documented lifecycle hooks.
         """
         return self._dispatch(x, topk_ids, topk_weights, tag, stream, recv_capacity,
                               active_channels, workspace, fused_combine, same_stream=True)
@@ -778,10 +856,14 @@ class HostSMContext(Context):
                 execution = (stream or torch.cuda.current_stream(self.device)) if same_stream else self._work_stream
                 epoch = (self._begin("dispatch", execution, same_stream=True) if same_stream
                          else self._begin("dispatch", stream))
+                capturing = getattr(self, "_capturing_submission", False)
+                if capturing and (workspace is None or workspace._generation == 0):
+                    raise RuntimeError("CUDA Graph capture requires a warmed, retained workspace")
                 if workspace is not None:
-                    workspace._acquire(self, stream or torch.cuda.current_stream(self.device), execution)
+                    workspace._acquire(self, stream or torch.cuda.current_stream(self.device), execution,
+                                       capturing=capturing)
                     if same_stream:
-                        workspace._record_stream(execution)
+                        workspace._record_stream(execution, capturing=getattr(self, "_capturing_submission", False))
                 for tensor in (x, topk_ids, topk_weights):
                     tensor.record_stream(execution)
                 with torch.cuda.stream(execution), torch.no_grad():
@@ -860,7 +942,7 @@ class HostSMContext(Context):
                 epoch = (self._begin("combine", execution, same_stream=True) if same_stream
                          else self._begin("combine", stream))
                 if same_stream and workspace is not None:
-                    workspace._record_stream(execution)
+                    workspace._record_stream(execution, capturing=getattr(self, "_capturing_submission", False))
                 # Workspace storage is registered once per execution stream.
                 # The expert output is external and still needs its lifetime recorded.
                 inputs = ((partial,) if same_stream and workspace is not None else
@@ -892,7 +974,7 @@ class HostSMContext(Context):
                     handle._consumed = True
                     if same_stream:
                         if workspace is not None:
-                            workspace._combined(execution)
+                            workspace._combined(execution, capturing=getattr(self, "_capturing_submission", False))
                         return output
                     if workspace is None:
                         return self._finish(output, handle.active_channels)

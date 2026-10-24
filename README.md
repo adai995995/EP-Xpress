@@ -3,11 +3,12 @@
 An independent expert-parallel communication library for single-node MoE
 inference through host memory, without GPU peer access or NVLink payloads.
 
-**Status: experimental BF16 eager implementation.** Two selectable transports
+**Status: experimental BF16 inference implementation.** Two selectable transports
 share the dispatch/combine interface: `host_ce` uses CPU routing and copy
 engines; `host_sm` runs routing and mapped-host communication on the GPU.
-Neither transport supports CUDA Graph capture. End-to-end performance must be
-measured against the intended inference framework and workload.
+The `host_sm` direct-stream API supports opt-in serialized CUDA Graph replay;
+`host_ce` remains eager. See the SGLang adapter for the supported decode scope.
+End-to-end performance must be measured against the intended inference framework and workload.
 
 ## Implemented
 

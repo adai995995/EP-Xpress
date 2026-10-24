@@ -297,6 +297,7 @@ struct TransportArgs {
   int input_rows, hidden, topk, capacity;
   int64_t slot_stride, channel_stride;
   uint64_t epoch, timeout_ns, identity;
+  uint64_t* device_epoch = nullptr;
   bool diagnostics = true;
   bool trusted_placement = false;
   bool fatal_errors = false;
@@ -332,6 +333,11 @@ template <bool Combine>
 __global__ void host_sm_init_kernel(TransportArgs a) {
   int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = int64_t(gridDim.x) * blockDim.x;
+  if (i == 0 && a.device_epoch) {
+    // Same stream for all phases, including eager work between graph replays.
+    // Never reset after capture: capture records nodes without advancing state.
+    if (++*a.device_epoch >= (uint64_t(1) << 31)) asm volatile("trap;");
+  }
   if (!Combine && i == 0) *a.output_count = 0;
   if (!Combine && a.local_rows)
     for (int64_t j = i; j < a.input_rows; j += stride) a.local_rows[j] = -1;
@@ -375,6 +381,7 @@ __global__ void host_sm_finalize_kernel(TransportArgs a) {
 // producer-only and receiver-only blocks would not provide this liveness.
 template <bool Combine, typename Id, bool Profile = false, bool Selective = false>
 __global__ void host_sm_transport_kernel(TransportArgs a) {
+  if (a.device_epoch) a.epoch = *a.device_epoch;
   using Scan = cub::BlockScan<uint64_t, kThreads>;
   __shared__ typename Scan::TempStorage scan_storage;
   __shared__ int cursor, end, error, producer_done, sent_chunks;
@@ -853,6 +860,7 @@ int64_t channel_bytes(int64_t hidden, int64_t topk, int64_t slots, int64_t rows)
 // outbound ring never prevents the inbound ring from being drained.
 template <bool Profile = false>
 __global__ void host_sm_pair_combine_kernel(TransportArgs a) {
+  if (a.device_epoch) a.epoch = *a.device_epoch;
   using Scan = cub::BlockScan<int, kThreads>;
   __shared__ typename Scan::TempStorage scan_storage;
   __shared__ int cursor, end, error, sent, received, send_done, recv_done;
@@ -1147,6 +1155,7 @@ __device__ __forceinline__ void group_profile_phase(ProfileState<Profile>& p, in
 
 template <bool Profile = false>
 __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
+  if (a.device_epoch) a.epoch = *a.device_epoch;
   __shared__ ProfileState<Profile> tx_profile, rx_profile;
   __shared__ int begin, end;
   __shared__ int send_rows[kThreads], send_tokens[kThreads], recv_tokens[kThreads];
@@ -1504,6 +1513,7 @@ __device__ __forceinline__ void mailbox_reduce_vectors(
 }
 
 __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
+  if (a.device_epoch) a.epoch = *a.device_epoch;
   __shared__ int begin, end, row, token, error, local_row, blocked;
   __shared__ uint64_t readers;
   const int tid = threadIdx.x, channel = blockIdx.x;
@@ -1784,6 +1794,12 @@ cudaStream_t eager_stream(const torch::Device& device) {
 }
 }  // namespace
 
+namespace {
+__global__ void advance_mailbox_epoch(uint64_t* epoch) {
+  if (++*epoch >= (uint64_t(1) << 31)) asm volatile("trap;");
+}
+}  // namespace
+
 struct PreparedHostSM::Impl {
   // Keep all static device addresses alive. Bootstrap tensors are immutable for
   // this object's lifetime; contexts own the underlying registered host arenas.
@@ -1794,6 +1810,8 @@ struct PreparedHostSM::Impl {
   uint64_t last_mailbox_epoch = 0;
   cudaStream_t mailbox_stream = nullptr;
   bool combine_warp_specialization = false;
+  torch::Tensor device_epochs;
+  bool submitted = false;
 };
 
 PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_local,
@@ -1879,6 +1897,20 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
   }
 }
 
+void PreparedHostSM::enable_device_epochs() {
+  const c10::cuda::CUDAGuard guard(impl_->device);
+  eager_stream(impl_->device);
+  TORCH_CHECK(!impl_->submitted && !impl_->device_epochs.defined(),
+              "enable device epochs once, before the first submission");
+  TORCH_CHECK(!impl_->dispatch.diagnostics,
+              "graph mode does not support host operation diagnostics");
+  impl_->device_epochs = torch::zeros({2}, torch::TensorOptions()
+      .device(impl_->device).dtype(torch::kInt64));
+  auto* epochs = reinterpret_cast<uint64_t*>(impl_->device_epochs.data_ptr<int64_t>());
+  impl_->dispatch.device_epoch = epochs;
+  impl_->combine.device_epoch = epochs + 1;
+}
+
 void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Tensor weights,
     int64_t epoch, torch::Tensor output, torch::Tensor output_ids,
     torch::Tensor output_weights, torch::Tensor inverse, torch::Tensor count,
@@ -1922,7 +1954,9 @@ void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Ten
     a.profile = profile->data_ptr<int64_t>();
   }
   const c10::cuda::CUDAGuard guard(device);
-  const auto stream = eager_stream(device);
+  const auto stream = impl_->device_epochs.defined()
+      ? c10::cuda::getCurrentCUDAStream(device.index()).stream() : eager_stream(device);
+  impl_->submitted = true;
   a.input = input.data_ptr<at::BFloat16>(); a.ids = ids.data_ptr();
   a.weights = weights.data_ptr<float>(); a.output = output.data_ptr<at::BFloat16>();
   a.output_ids = output_ids.data_ptr<int64_t>(); a.output_weights = output_weights.data_ptr<float>();
@@ -1957,7 +1991,7 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
     TORCH_CHECK(a.mailbox_pointers && output.size(0) <= a.mailbox_tokens,
                 "output exceeds prepared mailbox capacity");
     TORCH_CHECK(!profile.has_value(), "mailbox combine does not support phase profiling");
-    TORCH_CHECK(uint64_t(epoch) > impl_->last_mailbox_epoch,
+    TORCH_CHECK(a.device_epoch || uint64_t(epoch) > impl_->last_mailbox_epoch,
                 "mailbox combine epochs must increase on the serialized transport stream");
     tensor_check(*expected_ranks, at::kLong, 1, device, "expected rank masks");
     tensor_check(*local_rows, at::kInt, 1, device, "local compact rows");
@@ -1979,7 +2013,9 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
   }
   owner_check(owner_rows, owner_counts, device, a.world, partial.size(0));
   const c10::cuda::CUDAGuard guard(device);
-  const auto stream = eager_stream(device);
+  const auto stream = impl_->device_epochs.defined()
+      ? c10::cuda::getCurrentCUDAStream(device.index()).stream() : eager_stream(device);
+  impl_->submitted = true;
   a.input = partial.data_ptr<at::BFloat16>(); a.input_inverse = inverse.data_ptr<int64_t>();
   a.input_count = count.data_ptr<int32_t>(); a.output = output.data_ptr<at::BFloat16>();
   a.profile = profile.has_value() ? profile->data_ptr<int64_t>() : nullptr;
@@ -1987,7 +2023,7 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
   a.input_rows = int(partial.size(0)); a.capacity = int(output.size(0));
   a.epoch = uint64_t(epoch); a.identity = uint64_t(identity);
   if (fused) {
-    if (impl_->last_mailbox_epoch && impl_->mailbox_stream != stream) {
+    if (!a.device_epoch && impl_->last_mailbox_epoch && impl_->mailbox_stream != stream) {
       // Mailbox reuse requires the previous outgoing ACK drain. Preserve this
       // dependency for native callers too; consecutive same-stream calls do
       // not allocate or record an event.
@@ -1995,7 +2031,12 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
       transition.record(c10::cuda::getStreamFromExternal(impl_->mailbox_stream, device.index()));
       transition.block(c10::cuda::getCurrentCUDAStream(device.index()));
     }
-    // No init/finalizer and no world-by-token device scratch for this path.
+    // Graph replays need a device-side generation even with no init kernel.
+    if (a.device_epoch) {
+      advance_mailbox_epoch<<<1, 1, 0, stream>>>(a.device_epoch);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    // No capacity clear/finalizer or world-by-token scratch for this path.
     if (a.channels == 1) host_sm_mailbox_combine_kernel<<<1, kThreads, 0, stream>>>(a);
     else {
       void* parameters[] = {&a};

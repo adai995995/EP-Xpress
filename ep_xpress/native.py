@@ -298,6 +298,14 @@ def prepare_host_sm(
     streams alive until their submissions complete. Omitting these arguments
     preserves the rank-pair queue path.
 
+    enable_device_epochs() is an opt-in, before any submission, for graph
+    capture. It retains two device counters and permits capture in prepared
+    methods. Its caller must serialize every eager operation and graph replay,
+    order stream transitions, and retain all graph input/output storage. Host
+    epochs become placeholders in this mode; native mailbox stream events are
+    replaced by caller-managed ordering. Use HostSMContext's graph lifecycle
+    methods for this ownership contract.
+
     combine_warp_specialization=True gives prepared pair queues independent
     128-thread send/receive groups. It preserves the grid and frame layout,
     leaves fused mailbox combine unchanged; opt-in profiling records overlapping group times.

@@ -19,7 +19,8 @@ for sequential inference.
 `host_ce` is the CPU reference path described below. `host_sm` uses CUDA
 kernels to access mapped host memory; its protocol is described separately.
 Selection is explicit at context creation and is never a silent fallback.
-Neither mode enables GPU peer access or CUDA Graph execution.
+Neither mode enables GPU peer access. CUDA Graph execution requires explicit
+opt-in on the host-SM direct-stream path described below.
 
 ## Host-CE dispatch
 
@@ -406,7 +407,8 @@ the previous iteration's reads from the next iteration's updates. Disabling
 health checks does not make that barrier redundant. Ready/ACK fences, stream
 events and `record_stream` likewise carry required data dependencies. The
 producer and native work-stream capture guards check different streams and
-remain in place because CUDA Graph execution is not implemented.
+remain in place for ordinary eager contexts. Opt-in Graph contexts instead
+use GPU generations and the capture/replay lifecycle described below.
 
 Remaining limits include draining published payload ACKs before returning and
 dispatch's all-peer terminal handshake. Double slots and multiple active channels
@@ -616,4 +618,34 @@ READY/ACK and credit protocols are unchanged.
 The SGLang adapter exposes this as `EP_XPRESS_DECODE_SAME_STREAM=1` for decode
 within the configured small-token capacity. Its default remains off; the measured `host_sm_bf16_ep8_same_stream.sh` preset
 enables it for the documented workload. This is an eager optimization,
-not CUDA Graph support: Python-controlled epochs still prohibit replay.
+separate from the opt-in GPU-epoch Graph mode below.
+
+
+### Serialized CUDA Graph execution
+
+`enable_cuda_graph()` opts a fresh host-SM context into GPU-owned dispatch and
+combine generations. Both eager and captured work use direct-stream APIs in
+this mode. Dispatch and pair combine increment their counter in the existing
+initialization kernel; fused mailbox combine adds a one-thread generation
+kernel because it has no initialization pass. All transport CTAs then read the
+same generation. Counters are retained for the context lifetime, never reset
+at capture, and trap at the existing 31-bit protocol limit. Payload arithmetic,
+deduplication, multicast readers, release/acquire and ACK drains are unchanged.
+
+Warm each fixed workspace shape, then call `prepare_graph_capture()` outside
+capture. This startup boundary drains prior eager operations. Recording neither
+advances device generations nor inserts waits on unrelated, noncapturing
+streams. Each graph recomputes its device route maps, counts and masks from the
+current input tensors. Call `prepare_graph_replay(stream)` before updating shared static inputs and
+each replay to order it after prior eager/graph work and to track the actual
+execution stream for later eager submissions and shutdown. This is a GPU stream
+dependency on a stream change, not a host fence or per-layer collective.
+
+The caller must retain all static input storage, workspaces and the context
+through graph destruction. A graph output is borrowed until its workspace is
+reused; enqueue consumers before the next operation and clone retained outputs.
+Concurrent graph submissions sharing one context are unsupported. The SGLang
+adapter retains decode workspaces for all selected buckets, integrates the two
+lifecycle hooks in its full-graph backend, and keeps eager prefill on the same
+ordered context. CUDA Graphs preserve changing top-k routing; they do not cache
+a previous token's expert assignment.

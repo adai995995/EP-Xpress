@@ -25,7 +25,7 @@ def validate_server_args(args, hf_config):
         "enable_two_batch_overlap", "enable_single_batch_overlap",
         "enable_fused_moe_sum_all_reduce", "enable_torch_compile",
         "speculative_algorithm", "ep_num_redundant_experts", "ep_join_mode",
-        "elastic_ep_backend", "enable_memory_saver",
+        "elastic_ep_backend", "enable_memory_saver", "enable_pdmux",
     ):
         if getattr(args, name, None):
             raise ValueError(f"EP-Xpress does not support {name}")

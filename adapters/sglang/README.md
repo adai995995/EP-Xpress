@@ -10,16 +10,16 @@ The EP-Xpress core has no SGLang dependency.
 - One Linux host, NVIDIA CUDA, BF16 activations and unquantized BF16 experts.
 - `Qwen3MoeForCausalLM`, evenly partitioned contiguous experts.
 - Attention DP = TP = EP; MoE TP = 1, MoE DP = 1, pipeline parallelism = 1.
-- Eager prefill and decode. Both CUDA Graph phases are disabled by the patch.
+- Eager prefill; eager decode by default, opt-in full decode CUDA Graph.
 - No shared experts, EPLB, redundant experts, LoRA, speculative decoding,
-  Waterfill, TBO, SBO, Torch Compile, elastic EP, memory saver, or DWDP.
+  Waterfill, TBO, SBO, PD-Multiplexing, Torch Compile, elastic EP, memory saver, or DWDP.
 - One outstanding operation per layer. All EP ranks must follow the same layer
   sequence, including ranks with zero input or zero received tokens.
 
 These restrictions belong to this first adapter, not the core EP interface.
 Patch application and mocked contract tests do not establish end-to-end model
 correctness or performance. Compare outputs and throughput against the same
-eager SGLang configuration. For tuning an already validated path, prioritize
+SGLang graph mode and configuration. For tuning an already validated path, prioritize
 that full-model comparison; use focused standalone checks when an interface
 or protocol change introduces a concrete correctness or progress risk.
 
@@ -71,7 +71,7 @@ pinned host staging. `host_ce` selects the original CPU-planned CE transport
 and remains the default when this variable is unset. Neither EP payload path
 calls NCCL. The NCCL settings constrain other framework collectives and do not
 physically disable NVLink. Keep those settings, GPU count, model, precision,
-expert runner and eager mode identical in the `--moe-a2a-backend none` baseline.
+expert runner and graph mode identical in the `--moe-a2a-backend none` baseline.
 
 Configure SGLang's per-rank NUMA binding to match the GPU topology before worker
 startup. Host-SM setup allocates and initializes each producer's dispatch,
@@ -110,8 +110,7 @@ For the measured eager decode stream optimization, source
 server. It retains the vector/LAST prefill preset and enables
 `EP_XPRESS_DECODE_SAME_STREAM=1`. Direct decode submissions return results on
 the framework compute stream without per-operation completion tickets.
-Prefill and larger decode capacities keep the asynchronous path. CUDA Graph
-support remains disabled. See the full-model measurements in
+Prefill and larger decode capacities keep the asynchronous path in this eager preset. See the full-model measurements in
 [`docs/model-performance.md`](../../docs/model-performance.md).
 
 The following `host_sm` options select workspace reuse, bounded decode fusion
@@ -119,6 +118,7 @@ and general combine frame sizing/execution:
 
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
+| `EP_XPRESS_CUDA_GRAPH` | `0` | Enable GPU epochs, retained decode workspaces and full decode Graph capture/replay integration. All eager operations also use the compute stream in this mode. |
 | `EP_XPRESS_DECODE_SAME_STREAM` | `0` | Opt-in eligible decode dispatch/combine on the SGLang compute stream, without per-operation completion tickets; prefill retains the asynchronous path. |
 | `EP_XPRESS_DECODE_WORKSPACE` | `1` | Cache communication tensors for eligible decode operations; `0` uses independent tensors per call. |
 | `EP_XPRESS_FUSED_DECODE` | `1` | Use mailbox receive/reduce fusion for eligible decode; `0` retains pair queues. |
@@ -318,3 +318,36 @@ and the same memory footprint. The adjacent full-model ablation improves B32
 TTFT, with essentially unchanged decode TPS; see the performance report for
 sample ranges and limitations. The original and vector-only presets keep this
 protocol option disabled.
+
+## Full decode CUDA Graph (opt-in)
+
+Source `adapters/sglang/presets/host_sm_bf16_ep8_graph.sh` for the measured
+vector mailbox candidate with automatic channels, or set
+`EP_XPRESS_CUDA_GRAPH=1`, `EP_XPRESS_TRANSPORT=host_sm` and
+`EP_XPRESS_DIAGNOSTICS=0`, then use `--cuda-graph-backend-decode full`.
+Prefill remains eager. For the measured EP8 workload, use local per-DP-rank
+buckets `--cuda-graph-bs-decode 1 2 4 8` on **both** EP-Xpress and the default
+NCCL baseline. These buckets bound graph storage and cover global balanced
+B1/B32; skewed larger per-rank batches fall back to eager execution. Graph
+padding can process more token rows than eager execution, especially at B1.
+
+The adapter retains each warmed decode workspace shape until worker shutdown;
+it does not apply the eager four-entry eviction policy. Input routes are
+recomputed on GPU at every replay. Python handles only connect dispatch and
+combine during recording and are not reused as cached token routes. At each
+replay the backend notifies the transport once to preserve ordering with prior
+eager work and other graph buckets. No CPU route/count copy or new collective
+is added. Each capture drains warmup work once; steady replays do not perform
+that host synchronization.
+
+The native dispatch initializer advances a GPU generation counter. Fused
+combine uses one tiny generation kernel before its mailbox kernel; ordinary
+pair combine advances its counter in the existing initializer. Queue READY,
+reader ACK and outgoing ACK drains remain required. Generation counters never
+reset after capture or between graph buckets. Graphs sharing a context must
+execute serially, and contexts/workspaces must outlive every graph that uses
+them. Destroy graph objects before closing contexts.
+
+Only the pinned full decode backend is integrated. Concurrent forwards,
+recapture with memory-saving relocation, breakable/piecewise graphs, prefill
+graphs and operation-level transport diagnostics are outside this scope.
