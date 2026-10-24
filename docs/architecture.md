@@ -543,3 +543,33 @@ original scalar loop. Tail iterations never read beyond selected payload rows.
 READY/acquire, cache-invalidating host reads, reader completion and ACK release
 retain their original ordering. Queue capacity, multicast reader sets and
 terminal handshakes are unchanged.
+
+### Optional last-data marker in warp combine
+
+`EP_XPRESS_COMBINE_LAST_DATA=1` lets the prepared warp-combine sender attach
+end-of-queue to its last payload frame. The default zero retains the separate
+empty terminal for ablation. This is a build-time setting included in the
+extension cache key; set it before starting all workers. Legacy sequential
+pair combine, selective dispatch and fused decode mailbox protocols are
+unchanged.
+
+The existing signed row-count word encodes LAST as `-(payload_rows + 1)`.
+Thus `-1` still identifies an empty terminal, and a full or partial last data
+frame has a value below `-1`. Positive values identify nonfinal payload frames;
+zero is invalid on a published frame. The warp receiver accepts both formats,
+decodes and checks the payload length, and retains LAST in thread-local state
+while consuming the frame. LAST never bypasses its payload reads.
+
+Every payload writer still fences before READY publication. Every receiver
+still finishes its reads and the existing system fence/group barrier before
+ACK. Tx drains all published slots, including the last data frame, before
+returning. Unused slots from older epochs remain protected by their matching
+READY/ACK values. Empty and local-only operations still notify remote queues.
+No pool-size, slot-count, channel-count or floating-point ordering change is
+required. Workers must use the same supported native version; older warp
+receivers reject negative payload-bearing row counts.
+
+Diagnostic `terminal_sent` and `terminal_received` counters in warp combine
+count end markers, including markers attached to data. They must not be
+interpreted as counts of empty frames. Payload byte/row counts include the
+last data frame normally; frame counters count it once.

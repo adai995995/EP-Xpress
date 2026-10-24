@@ -134,6 +134,11 @@ static_assert(EP_XPRESS_PREFILL_WRITE_UNROLL == 0 || EP_XPRESS_PREFILL_WRITE_UNR
 static_assert(EP_XPRESS_DISPATCH_READ_UNROLL == 0 || EP_XPRESS_DISPATCH_READ_UNROLL == 1 ||
               EP_XPRESS_DISPATCH_READ_UNROLL == 2 || EP_XPRESS_DISPATCH_READ_UNROLL == 4 ||
               EP_XPRESS_DISPATCH_READ_UNROLL == 8, "unsupported dispatch read unroll");
+#ifndef EP_XPRESS_COMBINE_LAST_DATA
+#define EP_XPRESS_COMBINE_LAST_DATA 0
+#endif
+static_assert(EP_XPRESS_COMBINE_LAST_DATA == 0 || EP_XPRESS_COMBINE_LAST_DATA == 1,
+              "unsupported last-data setting");
 __device__ __forceinline__ void host_store128(void* address, uint4 value) {
   // Match the scalar volatile store policy. Each writer still executes a
   // system fence before the Tx leader publishes READY for the whole frame.
@@ -1138,7 +1143,7 @@ __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
   __shared__ ProfileState<Profile> tx_profile, rx_profile;
   __shared__ int begin, end;
   __shared__ int send_rows[kThreads], send_tokens[kThreads], recv_tokens[kThreads];
-  __shared__ int tx_error, tx_ready, tx_count, tx_complete, rx_error, rx_count;
+  __shared__ int tx_error, tx_ready, tx_count, tx_complete, rx_error, rx_count, rx_last;
   __shared__ uint64_t start;
   const int tid = threadIdx.x;
   const int channel = blockIdx.x / a.world, peer = blockIdx.x % a.world;
@@ -1218,6 +1223,7 @@ __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
       if (!tx_ready) { combine_group_sync<1>(); __nanosleep(64); continue; }
       group_profile_phase<Profile, 1>(tx_profile, PSendMetadata);
       const int count = tx_count;
+      const bool last = count == 0 || (EP_XPRESS_COMBINE_LAST_DATA && cursor + count == end);
       for (int i = tid; i < count; i += kCombineGroupThreads) {
         const int row = a.owner_rows[int64_t(peer) * a.input_rows + cursor + i];
         if (row < 0 || row >= a.input_rows) fail(a.status, 1);
@@ -1270,7 +1276,10 @@ __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
       }
       group_profile_phase<Profile, 1>(tx_profile, PPublish);
       if (tid == 0) {
-        host_store32(slot + kRowsOffset, count ? count : uint32_t(-1));
+        // Negative row counts encode LAST and its payload length: -(count+1).
+        // -1 remains the empty-queue terminal. READY still publishes both
+        // header and payload, and the ordinary ACK protects the final frame.
+        host_store32(slot + kRowsOffset, uint32_t(last ? -count - 1 : count));
         if (a.diagnostics) host_store64(slot + kIdentityOffset, a.identity);
       }
       // All writers complete their system fence before the leader publishes.
@@ -1282,9 +1291,10 @@ __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
         tx_profile.values[PWrittenBytes] += int64_t(count) * a.hidden * 2;
         tx_profile.values[PSendRows] += count;
         ++tx_profile.values[PSendFrames];
+        tx_profile.values[PTerminalSent] += last;
       }
       cursor += count;
-      terminal_sent = count == 0;
+      terminal_sent = last;
       // Before another iteration can overwrite shared metadata, every writer
       // must have finished using it; the preceding group barrier provides this.
     }
@@ -1301,18 +1311,22 @@ __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
       if (lane == 0) {
         combine_group_health(a, own, other, start, iteration++);
         rx_count = 0;
+        rx_last = 0;
         if (acquire(control(slot, 0)) == ((a.epoch << 32) | uint64_t(received + 1))) {
-          rx_count = int32_t(host_load32(slot + kRowsOffset));
+          const int wire_rows = int32_t(host_load32(slot + kRowsOffset));
+          rx_last = wire_rows < 0;
+          rx_count = rx_last ? -(wire_rows + 1) : wire_rows;
           if (a.diagnostics && received == 0 &&
               host_load64(slot + kIdentityOffset) != a.identity) fail(a.status, 5);
-          if (rx_count < -1 || rx_count == 0 || rx_count > min(kThreads, a.chunk_rows)) fail(a.status, 1);
+          if (wire_rows == 0 || rx_count > min(kThreads, a.chunk_rows)) fail(a.status, 1);
         }
         rx_error = read_status(a.status);
       }
       combine_group_sync<2>();
       if (rx_error) break;
       const int count = rx_count;
-      if (!count) { combine_group_sync<2>(); __nanosleep(64); continue; }
+      const bool last = rx_last;
+      if (!count && !last) { combine_group_sync<2>(); __nanosleep(64); continue; }
       group_profile_phase<Profile, 2>(rx_profile, PReceiveMetadata);
       for (int i = lane; i < count; i += kCombineGroupThreads) {
         const int token = int(host_load32(slot + kSlotHeader + i * 4));
@@ -1372,8 +1386,9 @@ __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
         rx_profile.values[PReadBytes] += int64_t(max(0, count)) * a.hidden * 2;
         rx_profile.values[PReceiveRows] += max(0, count);
         ++rx_profile.values[PReceiveFrames];
+        rx_profile.values[PTerminalReceived] += last;
       }
-      if (count == -1) break;
+      if (last) break;
     }
     group_profile_phase<Profile, 2>(rx_profile, POther);
   }

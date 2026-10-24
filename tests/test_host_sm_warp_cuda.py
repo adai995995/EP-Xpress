@@ -6,6 +6,7 @@ import os
 import random
 import struct
 import tempfile
+import time
 
 import pytest
 
@@ -25,6 +26,9 @@ def _rows(case, producer, frame_rows):
     elif case == 3:
         lengths = tuple((3, 0, 5)[producer] if peer == producer else 0
                         for peer in range(3))
+    elif case == 6:
+        # Exact full last frames on both active channels.
+        lengths = (4 * frame_rows,) * 3
     elif case == 4:
         lengths = (0, 0, 0)
     else:
@@ -68,11 +72,15 @@ def _assert_drained(mapping, rank, epoch, active, hidden, frame_rows,
             if channel >= active or peer == rank:
                 continue
             latest, rows = max(records)
-            assert latest >> 32 == epoch and rows == -1, (rank, channel, peer, records)
+            assert latest >> 32 == epoch, (rank, channel, peer, records)
+            if not exact_frames:
+                assert rows == -1, (rank, channel, peer, records)
             if exact_frames:
                 count = owner_counts[peer]
                 length = count * (channel + 1) // active - count * channel // active
-                frames = (length + frame_rows - 1) // frame_rows + 1
+                frames = max(1, (length + frame_rows - 1) // frame_rows)
+                final_rows = (length - 1) % frame_rows + 1 if length else 0
+                assert rows == -final_rows - 1, (rank, channel, peer, records)
                 assert latest & 0xffffffff == frames, (rank, channel, peer, frames, records)
 
 
@@ -144,6 +152,8 @@ def _warp_worker(rank, directory, frame_rows, hidden, slots, offset, barrier):
             fields = native.host_sm_profile_fields()
             profile = (torch.zeros((active * world, len(fields)), dtype=torch.int64,
                                    device="cuda") if epoch % 2 == 0 else None)
+            if epoch == 2 and rank == 2:
+                time.sleep(0.05)  # Delayed reader must still protect its final payload.
             prepared.combine(partial, inverse, count, owner_rows, owner_counts,
                 epoch, result, remote, active_channels=active, identity=epoch, profile=profile)
             torch.cuda.synchronize()
@@ -154,6 +164,13 @@ def _warp_worker(rank, directory, frame_rows, hidden, slots, offset, barrier):
                 expected = sum(n for peer, n in enumerate(owner_counts_cpu) if peer != rank) * hidden * 2
                 assert counters[:, fields.index("payload_written_bytes")].sum().item() == expected
                 assert (counters[:, fields.index("elapsed_ns")] > 0).all()
+                expected_frames = sum(
+                    max(1, (n * (c + 1) // active - n * c // active + frame_rows - 1) // frame_rows)
+                    for peer, n in enumerate(owner_counts_cpu) if peer != rank
+                    for c in range(active))
+                assert counters[:, fields.index("send_frames")].sum().item() == expected_frames
+                assert counters[:, fields.index("terminal_sent")].sum().item() == active * (world - 1)
+                assert counters[:, fields.index("terminal_received")].sum().item() == active * (world - 1)
             torch.testing.assert_close(result.view(torch.int16), reference.view(torch.int16), rtol=0, atol=0)
             torch.testing.assert_close(remote.view(torch.int16), reference_remote.view(torch.int16), rtol=0, atol=0)
             _assert_drained(mappings["prepared"][rank], rank, epoch, active,
@@ -178,6 +195,8 @@ def _warp_worker(rank, directory, frame_rows, hidden, slots, offset, barrier):
 )
 def test_prefill_warp_pair_legacy_rounding_and_slot_reuse(frame_rows, hidden, slots, offset, monkeypatch):
     # Spawned workers import native afresh and exercise the opt-in vector build.
+    monkeypatch.setenv("EP_XPRESS_COMBINE_LAST_DATA", "1")
+    monkeypatch.setenv("EP_XPRESS_DISPATCH_READ_UNROLL", "4")
     monkeypatch.setenv("EP_XPRESS_PREFILL_READ_UNROLL", "4")
     monkeypatch.setenv("EP_XPRESS_PREFILL_WRITE_UNROLL", "4")
     from torch.utils.cpp_extension import CUDA_HOME

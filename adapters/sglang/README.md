@@ -118,9 +118,10 @@ and general combine frame sizing/execution:
 | `EP_XPRESS_PREFILL_READ_UNROLL` | `0` | Build-time host payload vector-read expansion for prepared warp combine: `1`, `2`, `4`, `8`; `0` retains scalar reads. Set before worker startup; changing it selects a separate native build. |
 | `EP_XPRESS_PREFILL_WRITE_UNROLL` | `0` | Build-time vector expansion for prepared warp-combine sends: `1`, `2`, `4`, `8`; `0` retains scalar writes. Independent of the read setting. |
 | `EP_XPRESS_DISPATCH_READ_UNROLL` | `0` | Build-time vector expansion for selected dispatch payload reads: `1`, `2`, `4`, `8`; `0` retains scalar reads. Applies to dispatch in both prefill and decode. Preserves multicast selection and falls back to scalar for unaligned layouts. |
+| `EP_XPRESS_COMBINE_LAST_DATA` | `0` | Build-time opt-in for prepared warp combine: `1` marks the final payload frame as LAST, avoiding a separate empty terminal on nonempty queues. Empty queues retain a terminal. All final ACKs are still drained. Does not change fused decode or legacy pair combine. |
 
-The three switches accept `0` or `1`; both size settings accept integers from
-`0` through `256`. Core `Config.decode_max_tokens` and
+The workspace, fusion and warp-specialization switches accept `0` or `1`;
+both size settings accept integers from `0` through `256`. Core `Config.decode_max_tokens` and
 `Config.combine_frame_rows` default to `0`. The adapter enables a 64-token
 mailbox by default and retains budget-derived pair frames unless overridden.
 Workspace reuse and fusion can be ablated separately. Core
@@ -297,3 +298,12 @@ are workload-dependent; the latest dispatch ablation improves last-request TTFT
 while average-request TTFT is essentially unchanged. The original preset and
 general loader defaults retain scalar copies. Both presets keep the necessary
 READY/ACK fences.
+
+The experimental
+[`presets/host_sm_bf16_ep8_last_data.sh`](presets/host_sm_bf16_ep8_last_data.sh)
+adds payload-bearing LAST frames to the vector preset. It avoids a separate
+empty terminal for each nonempty warp-combine queue, retaining final ACK drains
+and the same memory footprint. The adjacent full-model ablation improves B32
+TTFT, with essentially unchanged decode TPS; see the performance report for
+sample ranges and limitations. The original and vector-only presets keep this
+protocol option disabled.

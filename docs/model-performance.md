@@ -1721,3 +1721,101 @@ calibration uncertainty is unquantified, so these spreads do not provide an
 exact causal decomposition of READY wait. Finer producer milestones or
 compute/communication dependency measurements are needed before changing the
 publication or final-drain protocol.
+
+### Last-data marker instead of a separate combine terminal
+
+The next isolated change uses the final nonempty warp-combine payload frame to
+carry LAST. Empty queues still send a terminal. Payload writers retain their
+system fences before READY; readers retain their completion/fence/ACK ordering;
+Tx retains its final drain of every published slot. Dispatch, fused decode,
+BF16 arithmetic, frame layout size and pool capacity are unchanged. Set
+`EP_XPRESS_COMBINE_LAST_DATA=1` before worker startup to enable it; the general
+default is zero, and the setting participates in the native cache key.
+
+Six focused CUDA cases pass against the legacy pair-combine reference, with
+bitwise-identical output and remote scratch. Tests verify exact frame counts,
+LAST payload lengths, matching READY/ACK on every slot, full and partial final
+frames, empty/local-only queues, asymmetric traffic, delayed readers, changing
+active channel counts across six epochs, and scalar/vector/alignment tails.
+
+Adjacent full-model runs differ only in the LAST switch. They retain vector
+read/write expansion four, dispatch read expansion four, two slots, 32 channels,
+16-row combine frames and the same host allocation. BF16/eager EP8/TP8/DP8 and
+512-input/32-output-token workloads remain fixed, with eight warmups per batch
+size and five measured repeats. All ten input hashes match. The NCCL column
+reuses the verified same-configuration baseline. All runs retain SHM-only
+reported NCCL transport and zero available NVLink payload counters.
+
+Values are median [min, max].
+
+| Batch | Metric | Default NCCL | EP LAST off, adjacent rerun | EP LAST on |
+|---:|---|---:|---:|---:|
+| 1 | TTFT (ms) | 192.549 [189.091, 192.903] | 187.650 [184.787, 191.975] | 186.428 [184.872, 187.811] |
+| 1 | Decode TPS | 10.739 [10.661, 10.908] | 11.648 [11.554, 11.746] | 11.650 [11.634, 11.755] |
+| 32 | Mean request TTFT (ms) | 568.963 [496.359, 626.142] | 399.482 [377.849, 437.299] | 365.812 [333.833, 389.439] |
+| 32 | Last request TTFT (ms) | 607.648 [565.040, 640.562] | 424.009 [412.293, 444.586] | 404.976 [382.288, 418.397] |
+| 32 | Decode TPS | 352.412 [349.331, 353.596] | 359.198 [355.576, 359.712] | 359.932 [359.142, 360.891] |
+| 32 | Batch completion (ms) | 3412.189 [3371.846, 3478.319] | 3177.843 [3162.985, 3232.754] | 3149.511 [3121.211, 3164.770] |
+
+B32 last-request TTFT falls 4.49% and mean-request TTFT falls 8.43% against the
+adjacent EP control. All five matching input batches improve on last-request
+TTFT, but timing ranges overlap and admission partitions remain variable;
+these observed ranges are not confidence intervals. Decode TPS differs by
+only +0.20%, with no decode kernel change. B1 is essentially unchanged.
+Against the reused NCCL baseline, B32 last-request TTFT is 33.35% lower and
+decode TPS is 2.13% higher. TTFT improvements must not be described as equivalent
+throughput gains.
+
+Four short greedy prompts retain identical text, tokens and logprobs versus
+both the adjacent control and the preceding dispatch-vector version. The
+experimental `host_sm_bf16_ep8_last_data.sh` preset enables the change on top
+of the vector preset. General defaults and both earlier presets retain the
+separate terminal. This is a measured optional configuration, not a universal
+optimum.
+
+The B32 profile completes all eight workers, four off/on trials (32 rank files),
+and 96 captured dispatch plus 96 combine operations per instrumented rank/trial,
+with no dropped records or status errors. Effective channels remain 32. The
+ordinary warp-combine kernel uses 96 registers (previously 90), with no stack or
+local storage and unchanged negotiated channel capacity.
+
+All 344,064 remote queue records in the two instrumented trials satisfy
+`send_frames == max(1, ceil(send_payload_rows / 16))`, and each queue sends and
+receives exactly one LAST marker. There are 43,426 empty queues. Measured total
+frames are 608,077; applying the old separate-terminal rule to these *same*
+queue payload lengths would require 908,715 frames, so 300,638 empty-terminal
+frames are avoided (33.08%). The old count here is derived from the protocol,
+not a separately executed identical-route replay. Payload bytes are unchanged
+by attaching LAST.
+
+Comparison with the preceding vector-dispatch capture gives the following
+median rank/trial critical-CTA sums. Tx and Rx overlap; rows are not additive.
+
+| Diagnostic quantity (ms) | Previous separate-terminal capture | LAST capture |
+|---|---:|---:|
+| Dispatch elapsed | 92.925 | 105.385 |
+| Dispatch payload reads | 33.599 | 33.460 |
+| Combine elapsed | 119.873 | 126.799 |
+| Combine payload writes | 34.705 | 33.896 |
+| Combine publish/fence | 21.686 | 19.549 |
+| Combine payload reads | 18.577 | 18.859 |
+| Combine READY check/wait | 93.052 | 93.369 |
+| Combine Tx credit check/wait | 25.780 | 10.494 |
+| Combine final ACK drain | 29.747 | 50.541 |
+
+These captures do **not** establish a shorter communication kernel. Scheduler
+partitions differ: earlier instrumented prefill forwards are uniform across
+ranks, while the new capture includes heterogeneous splits and ranks with no
+local input in the first forward. Median total requested dispatch/combine
+payload bytes match, but matching totals do not imply matching per-frame routes
+or arrival times. Diagnostic group barriers also affect scheduling. Credit
+wait decreases while final-drain wait increases in the observed breakdown;
+this must not be attributed wholly to the protocol change. The defensible
+result is fewer control frames and a modest TTFT improvement in the separate,
+uninstrumented adjacent comparison.
+
+For prioritization, the preceding Chrome trace's 96 combine operations have
+per-rank median cumulative init, transport and finalize GPU durations of
+0.950, 119.083 and 1.704 ms. This makes init/finalize fusion a lower priority for
+this captured workload than production/publication and arrival dependencies.
+It is not a claim that these kernel sums equal request critical-path latency.
