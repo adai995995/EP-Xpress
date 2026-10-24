@@ -493,3 +493,35 @@ The normal template specialization omits group timers and profiling barriers.
 Profile storage is allocated at an explicit request boundary and read back only
 after capture. Measurements with these diagnostics must be paired with an
 uninstrumented run; end-to-end performance uses diagnostics disabled.
+
+
+## Prefill payload read scheduling
+
+Prepared warp-specialized combine can read aligned host payloads as 16-byte
+vectors. Each Rx thread issues a bounded group of independent loads into
+registers before storing them to the existing per-peer GPU scratch plane.
+The payload uses the same cache-volatile system-memory policy as the scalar
+path; READY acquire, reader completion and ACK ordering remain unchanged.
+Widths and source/destination addresses that do not satisfy vector alignment
+use the scalar path, including contiguous tensor views with shifted storage.
+Masked final iterations do not access the next ring slot. This optimization
+changes neither the wire layout nor the BF16 reduction order.
+
+`EP_XPRESS_PREFILL_READ_UNROLL` is read once when the native extension loads.
+Values 1, 2, 4 and 8 select vector load expansion; the default 0 selects scalar
+reads. Vector reads remain opt-in until model-level gains are repeatable.
+The build setting is included in the extension cache identity. It cannot be
+changed in an already-loaded process. It affects prepared warp combine only,
+not dispatch or fused decode. Queue depth remains `Config.slots`, independent
+of combine frame rows and channel count. Deeper queues increase the total host
+pool and must pass the existing initialization budget check. They can hide
+transient consumer lag, but cannot increase the sustained link bandwidth.
+
+
+The corresponding send path is independently selectable with
+`EP_XPRESS_PREFILL_WRITE_UNROLL` (default 0; vector expansions 1, 2, 4, 8).
+It gathers aligned vectors from the owner-indexed GPU rows, then issues volatile
+128-bit host stores. Every writer still executes its system fence and joins
+the Tx barrier before READY publication. Unaligned inputs or payloads use the
+scalar path. This setting also participates in the extension cache identity;
+it changes no token routing, frame format or ACK/credit semantics.

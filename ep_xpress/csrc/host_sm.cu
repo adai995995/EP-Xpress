@@ -106,6 +106,34 @@ __device__ __forceinline__ uint32_t host_load32(const void* address) {
   asm volatile("ld.global.cv.u32 %0, [%1];" : "=r"(value) : "l"(address) : "memory");
   return value;
 }
+__device__ __forceinline__ uint4 host_load128(const void* address) {
+  uint4 value;
+  // Keep the scalar path's system-memory cache invalidation on ring reuse.
+  // Callers must prove 16-byte alignment; READY/acquire and ACK still delimit
+  // the payload lifetime independently of this vector load.
+  asm volatile("ld.global.cv.v4.u32 {%0, %1, %2, %3}, [%4];"
+      : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+      : "l"(address) : "memory");
+  return value;
+}
+#ifndef EP_XPRESS_PREFILL_READ_UNROLL
+#define EP_XPRESS_PREFILL_READ_UNROLL 0
+#endif
+static_assert(EP_XPRESS_PREFILL_READ_UNROLL == 0 || EP_XPRESS_PREFILL_READ_UNROLL == 1 ||
+              EP_XPRESS_PREFILL_READ_UNROLL == 2 || EP_XPRESS_PREFILL_READ_UNROLL == 4 ||
+              EP_XPRESS_PREFILL_READ_UNROLL == 8, "unsupported prefill read unroll");
+#ifndef EP_XPRESS_PREFILL_WRITE_UNROLL
+#define EP_XPRESS_PREFILL_WRITE_UNROLL 0
+#endif
+static_assert(EP_XPRESS_PREFILL_WRITE_UNROLL == 0 || EP_XPRESS_PREFILL_WRITE_UNROLL == 1 ||
+              EP_XPRESS_PREFILL_WRITE_UNROLL == 2 || EP_XPRESS_PREFILL_WRITE_UNROLL == 4 ||
+              EP_XPRESS_PREFILL_WRITE_UNROLL == 8, "unsupported prefill write unroll");
+__device__ __forceinline__ void host_store128(void* address, uint4 value) {
+  // Match the scalar volatile store policy. Each writer still executes a
+  // system fence before the Tx leader publishes READY for the whole frame.
+  asm volatile("st.volatile.global.v4.u32 [%0], {%1, %2, %3, %4};"
+      :: "l"(address), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w) : "memory");
+}
 __device__ __forceinline__ uint64_t host_load64(const void* address) {
   const auto* p = static_cast<const uint32_t*>(address);
   return uint64_t(host_load32(p)) | (uint64_t(host_load32(p + 1)) << 32);
@@ -1170,10 +1198,38 @@ __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
       for (int i = tid; i < count; i += kCombineGroupThreads)
         host_store32(slot + kSlotHeader + i * 4, send_tokens[i]);
       group_profile_phase<Profile, 1>(tx_profile, PSendPayload);
-      for (int64_t i = tid; i < int64_t(count) * (a.hidden / 2); i += kCombineGroupThreads) {
-        const int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
-        host_store32(slot + x_offset + i * 4,
-            reinterpret_cast<const uint32_t*>(a.input + int64_t(send_rows[row]) * a.hidden)[h]);
+#if EP_XPRESS_PREFILL_WRITE_UNROLL > 0
+      if (a.hidden % 8 == 0 &&
+          ((reinterpret_cast<uintptr_t>(slot + x_offset) |
+            reinterpret_cast<uintptr_t>(a.input)) & 15) == 0) {
+        constexpr int kUnroll = EP_XPRESS_PREFILL_WRITE_UNROLL;
+        const int vectors_per_row = a.hidden / 8;
+        const int64_t vectors = int64_t(count) * vectors_per_row;
+        for (int64_t base = tid; base < vectors; base += kCombineGroupThreads * kUnroll) {
+          uint4 values[kUnroll];
+          #pragma unroll
+          for (int j = 0; j < kUnroll; ++j) {
+            const int64_t i = base + j * kCombineGroupThreads;
+            if (i < vectors) {
+              const int row = int(i / vectors_per_row), h = int(i % vectors_per_row);
+              values[j] = reinterpret_cast<const uint4*>(
+                  a.input + int64_t(send_rows[row]) * a.hidden)[h];
+            }
+          }
+          #pragma unroll
+          for (int j = 0; j < kUnroll; ++j) {
+            const int64_t i = base + j * kCombineGroupThreads;
+            if (i < vectors) host_store128(slot + x_offset + i * 16, values[j]);
+          }
+        }
+      } else
+#endif
+      {
+        for (int64_t i = tid; i < int64_t(count) * (a.hidden / 2); i += kCombineGroupThreads) {
+          const int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
+          host_store32(slot + x_offset + i * 4,
+              reinterpret_cast<const uint32_t*>(a.input + int64_t(send_rows[row]) * a.hidden)[h]);
+        }
       }
       group_profile_phase<Profile, 1>(tx_profile, PPublish);
       if (tid == 0) {
@@ -1231,11 +1287,42 @@ __global__ void host_sm_warp_pair_combine_kernel(TransportArgs a) {
       combine_group_sync<2>();
       if (rx_error) break;
       group_profile_phase<Profile, 2>(rx_profile, PReceivePayload);
-      for (int64_t i = lane; i < int64_t(count) * (a.hidden / 2); i += kCombineGroupThreads) {
-        const int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
-        auto* dst = reinterpret_cast<uint32_t*>(
-            a.remote + (int64_t(peer) * a.capacity + recv_tokens[row]) * a.hidden);
-        dst[h] = host_load32(slot + x_offset + i * 4);
+#if EP_XPRESS_PREFILL_READ_UNROLL > 0
+      if (a.hidden % 8 == 0 &&
+          ((reinterpret_cast<uintptr_t>(slot + x_offset) |
+            reinterpret_cast<uintptr_t>(a.remote)) & 15) == 0) {
+        constexpr int kUnroll = EP_XPRESS_PREFILL_READ_UNROLL;
+        const int vectors_per_row = a.hidden / 8;
+        const int64_t vectors = int64_t(count) * vectors_per_row;
+        for (int64_t base = lane; base < vectors; base += kCombineGroupThreads * kUnroll) {
+          uint4 values[kUnroll];
+          // Issue independent host reads before consuming them in HBM stores.
+          // Partial final iterations are masked without reading the next slot.
+          #pragma unroll
+          for (int j = 0; j < kUnroll; ++j) {
+            const int64_t i = base + j * kCombineGroupThreads;
+            if (i < vectors) values[j] = host_load128(slot + x_offset + i * 16);
+          }
+          #pragma unroll
+          for (int j = 0; j < kUnroll; ++j) {
+            const int64_t i = base + j * kCombineGroupThreads;
+            if (i < vectors) {
+              const int row = int(i / vectors_per_row), h = int(i % vectors_per_row);
+              auto* dst = reinterpret_cast<uint4*>(
+                  a.remote + (int64_t(peer) * a.capacity + recv_tokens[row]) * a.hidden);
+              dst[h] = values[j];
+            }
+          }
+        }
+      } else
+#endif
+      {
+        for (int64_t i = lane; i < int64_t(count) * (a.hidden / 2); i += kCombineGroupThreads) {
+          const int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
+          auto* dst = reinterpret_cast<uint32_t*>(
+              a.remote + (int64_t(peer) * a.capacity + recv_tokens[row]) * a.hidden);
+          dst[h] = host_load32(slot + x_offset + i * 4);
+        }
       }
       group_profile_phase<Profile, 2>(rx_profile, PAck);
       // Do not ACK until every reader has finished the host payload. This is

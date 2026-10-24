@@ -1466,3 +1466,162 @@ between NCCL and the candidate. Log probabilities are not bitwise identical
 (maximum absolute difference 0.219 on the shared generated prefixes); this is
 not an exhaustive numerical-equivalence claim. Raw logs, traces, access details
 and deployment paths remain outside this repository.
+
+
+## Vector host reads and queue-depth ablation
+
+Prepared warp combine now offers an opt-in 128-bit cache-volatile host read
+path with bounded independent-load expansion. The tested expansion is four;
+scalar mode is retained with the same protocol and BF16 reduction order.
+Misaligned row widths, frame payloads and output views fall back to scalar
+reads. Focused multi-GPU checks cover normal model width, vector tails,
+unaligned addresses, empty/asymmetric traffic, profile on/off and slot reuse.
+An initial four-case check passed; after the address-alignment guard, three
+targeted cases passed. Compiled vector code contains four independent 128-bit
+system loads and no local-memory spills. The final vector build uses 86 registers versus 70 in the
+scalar comparison build; all eight model workers retain 32 effective channels.
+
+The full-model experiment retains the same eight GPUs, BF16 model, TP/DP/EP8,
+expert/attention backends, eager execution and producer-local NUMA allocation
+as above. Each configuration uses eight warmups and five timed repetitions
+for 512 input / 32 output tokens. All runs verify SHM, zero P2P/NVLS/NET channels
+and zero NVLink payload counter increments. Both dispatch and combine use the
+selected slot count; the decode mailbox is unchanged. The shared host pool is
+347.531 MiB with two slots and 669.531 MiB with four. The experiment uses a
+common 1 GiB budget ceiling; actual allocation follows the slot count.
+
+Values below are medians. The final four-slot vector run includes the complete
+address-alignment guard. Two-slot exploratory results precede that guard; the
+model tensors and payloads are aligned in all runs. The scalar build excludes
+the vector branch entirely. Decode TPS uses the same steady-state definition
+as above, excluding prefill. TTFT includes HTTP and scheduler effects.
+
+| Batch | Metric | NCCL | Scalar / 2 slots | Vector x4 / 2 slots | Scalar / 4 slots | Vector x4 / 4 slots |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | TTFT (ms) | 192.549 | 185.926 | 185.593 | 186.324 | 184.142 |
+| 1 | Decode TPS | 10.739 | 11.721 | 11.700 | 11.693 | 11.776 |
+| 32 | Mean request TTFT (ms) | 568.963 | 445.947 | 471.654 | 493.518 | 457.488 |
+| 32 | Last request TTFT (ms) | 607.648 | 494.604 | 496.833 | 521.048 | 491.762 |
+| 32 | Decode TPS | 352.412 | 357.727 | 356.432 | 361.636 | 355.933 |
+| 32 | Batch completion (ms) | 3412.189 | 3274.518 | 3235.258 | 3253.878 | 3264.367 |
+
+The final vector/four-slot candidate lowers B32 last-request TTFT by 19.07%
+versus NCCL, but only 0.57% versus scalar/two-slot EP. Its B32 decode TPS is
+0.50% below the latter. This does not demonstrate a new repeatable end-to-end
+improvement. B32 TTFT ranges overlap: scalar/two-slot 493.881–537.590 ms,
+vector/two-slot 445.202–519.063 ms, scalar/four-slot 479.356–528.273 ms, and
+final vector/four-slot 449.573–511.167 ms. An earlier vector/four-slot run had
+470.017 ms TTFT and 363.464 TPS, versus 491.762 ms and 355.933 TPS on the final
+run. These are observed ranges, not confidence intervals, and request scheduling
+partitions were not fixed.
+
+Consequently the native loader defaults to scalar reads and the existing
+preset keeps two slots. `EP_XPRESS_PREFILL_READ_UNROLL=4` enables the experimental
+vector path before worker startup. Values 1, 2 and 8 are available tuning
+geometries, but were not measured in this model experiment. The setting is
+part of the native build cache key and does not specialize on token counts.
+Four-slot experiments require a sufficient host-pool budget. No cumulative
+credit protocol, dedicated control warp or prefill receive/reduce fusion is
+introduced by this change.
+
+Four short greedy prompts match exactly between scalar and vector EP runs,
+including token log probabilities. This is a bounded sanity check, not an
+exhaustive model-equivalence claim. Private logs, traces, manifests and launch
+scripts remain outside the public repository.
+
+
+### Read-only phase diagnostics at the current frame size
+
+A separate B32 capture fixes 16-row frames and four slots on both sides, with
+scalar sends and either scalar reads or vector reads expanded four times.
+Each capture verifies all eight workers, two instrumented trials, 96 dispatch
+and 96 combine operations per rank, and no dropped records or status errors.
+Median requested combine read bytes per rank/trial are identical
+(1,832,900,608 bytes). These are software payload counts, not bus counters.
+
+The following values are median per-rank/trial sums of the slowest CTA selected
+independently for each operation. Tx and Rx overlap; rows must not be added.
+
+| Diagnostic quantity (ms) | Scalar reads | Vector reads x4 |
+|---|---:|---:|
+| Dispatch critical-CTA elapsed sum | 182.530 | 239.830 |
+| Dispatch payload read component | 92.973 | 94.458 |
+| Combine critical-CTA elapsed sum | 161.661 | 138.236 |
+| Combine receive payload component | 75.158 | 14.845 |
+| Combine Tx credit check/wait | 3.229 | 3.334 |
+| Combine Rx READY check/wait | 57.342 | 109.302 |
+| Combine Tx final ACK drain | 92.824 | 60.664 |
+
+Across all remote pair CTAs, median receive payload group-work per requested
+GiB falls from 9917.488 to 2709.899 ms/GiB. This sums concurrent worker times;
+it is not a physical bandwidth estimate. The receive payload fraction of Rx
+work falls from 67.99% to 25.53%, while READY check/wait rises from 28.55% to
+57.70%. Credit checks/waits occupy only 2.16% and 3.44% of measured Tx work at
+four slots, respectively. Final drain remains substantial. Queue capacity can
+let producers finish publishing sooner without making consumers finish sooner.
+
+The read optimization works within its measured phase, but the whole pipeline
+has not improved proportionally. Dispatch code was unchanged, yet its observed
+elapsed/wait time increased, so this is not an isolated bandwidth experiment.
+Scheduling, inter-rank arrival and overlap affect phase times; instrumentation
+adds group barriers. Neither these counters nor the unprofiled samples establish
+PCIe saturation. The next tested candidate therefore vectorizes the sender's
+payload copy as well, retaining the same READY/fence/ACK protocol.
+
+
+### Vectorizing both directions, with the original two-slot capacity
+
+The follow-up applies the same bounded vector-copy scheduling to Tx. GPU
+vectors are gathered from the existing owner-indexed rows, then written with
+volatile 128-bit host stores; all writers still fence and synchronize before
+READY. Read and write expansion have independent build-time switches. Six
+focused multi-GPU cases pass with both enabled, covering vector/tail paths,
+unaligned source and destination views, non-aligned frame payloads, empty and
+asymmetric traffic, and two/four-slot reuse. The normal transport kernel uses
+90 registers without spills and all eight model workers retain 32 channels.
+
+The complete model uses the same five-repeat experiment settings as the table
+above, with both expansion factors set to four and the original two slots.
+No additional shared host memory is required. Values are median [min, max].
+
+| Batch | Metric | NCCL | Scalar EP / 2 slots | Vector read+write x4 / 2 slots |
+|---:|---|---:|---:|---:|
+| 1 | TTFT (ms) | 192.549 [189.091, 192.903] | 185.926 [184.865, 186.503] | 185.663 [185.017, 187.974] |
+| 1 | Decode TPS | 10.739 [10.661, 10.908] | 11.721 [11.617, 11.805] | 11.680 [11.536, 11.891] |
+| 32 | Mean request TTFT (ms) | 568.963 [496.359, 626.142] | 445.947 [444.941, 527.542] | 439.373 [363.679, 487.595] |
+| 32 | Last request TTFT (ms) | 607.648 [565.040, 640.562] | 494.604 [493.881, 537.590] | 477.385 [443.419, 504.735] |
+| 32 | Decode TPS | 352.412 [349.331, 353.596] | 357.727 [355.257, 359.469] | 360.802 [356.362, 361.111] |
+| 32 | Batch completion (ms) | 3412.189 [3371.846, 3478.319] | 3274.518 [3247.873, 3305.880] | 3218.068 [3195.644, 3247.953] |
+
+Versus scalar EP at the same two-slot capacity, median B32 last-request TTFT
+falls by 3.48% and decode TPS rises by 0.86%.
+Versus NCCL, the corresponding changes are -21.44% and +2.38%. B1 is essentially
+unchanged versus scalar EP. Four of five matching B32 prompt batches have
+lower last-request TTFT, but ranges overlap and scheduler partitions vary.
+This is a modest measured candidate, not a demonstrated universal speedup.
+Decode's mailbox kernel was not changed, so its small throughput difference
+must not be attributed directly to the prefill copy optimization.
+
+The general defaults remain scalar reads/writes and two slots. The separate
+`adapters/sglang/presets/host_sm_bf16_ep8_vector.sh` opt-in preset enables both
+expansions without increasing memory. The original preset explicitly resets
+both switches to zero. No deeper-queue default is adopted. Four short greedy
+prompts retain identical tokens/text/logprobs versus scalar EP; versus NCCL,
+tokens/text match and logprob differences retain the previously reported bound.
+
+
+The final two-slot read+write candidate also completes a B32 prefill capture
+on all eight ranks with no dropped records or errors. Median critical-CTA
+elapsed sums are 166.737 ms for dispatch and 125.234 ms for combine. Within the
+selected combine CTAs, payload write/read components are 34.734/19.588 ms,
+READY check/wait 87.822 ms, Tx credit check/wait 28.559 ms, final ACK drain
+28.359 ms, publication/fence 20.843 ms, and ACK publication 7.717 ms. These
+components overlap between Tx and Rx; sums are not request latency. This
+capture uses two slots, whereas the read-only diagnostics above use four,
+so their differences do not isolate the write optimization alone.
+
+The remaining measured waits motivate examining producer arrival, publication
+and buffer-lifetime scheduling before assuming that more CTAs or deeper rings
+will improve inference. Prefill still materializes per-peer GPU scratch before
+a separate reduction. No change to that dependency structure or to required
+memory-ordering operations was made in this experiment.

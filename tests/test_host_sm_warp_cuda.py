@@ -38,18 +38,18 @@ def _rows(case, producer, frame_rows):
     return rows
 
 
-def _sizes(hidden, frame_rows):
+def _sizes(hidden, frame_rows, slots=2):
     return {
-        "dispatch": native.host_sm_arena_bytes(hidden, 1, 2, 4, channels=2),
+        "dispatch": native.host_sm_arena_bytes(hidden, 1, slots, 4, channels=2),
         "prepared": native.host_sm_arena_bytes(
-            hidden, 0, 2, frame_rows, channels=2, queue_peers=3),
+            hidden, 0, slots, frame_rows, channels=2, queue_peers=3),
         "legacy": native.host_sm_arena_bytes(
-            hidden, 0, 2, frame_rows, channels=2, queue_peers=3),
+            hidden, 0, slots, frame_rows, channels=2, queue_peers=3),
     }
 
 
 def _assert_drained(mapping, rank, epoch, active, hidden, frame_rows,
-                    owner_counts, exact_frames):
+                    owner_counts, exact_frames, slots=2):
     # Inspect protocol state only after the kernel completes. Slot geometry is
     # shared with the existing arena ABI: 128-byte queue and 640-byte slot head.
     row_stride = ((16 + hidden * 2 + 15) // 16) * 16
@@ -60,7 +60,7 @@ def _assert_drained(mapping, rank, epoch, active, hidden, frame_rows,
             base = (channel * 3 + peer) * channel_stride
             assert struct.unpack_from("<QQQ", mapping, base) == (0, 0, 0)
             records = []
-            for slot in range(2):
+            for slot in range(slots):
                 offset = base + 128 + slot * slot_stride
                 ready, ack = struct.unpack_from("<QQ", mapping, offset)
                 assert ready == ack, (rank, channel, peer, slot, ready, ack)
@@ -76,15 +76,15 @@ def _assert_drained(mapping, rank, epoch, active, hidden, frame_rows,
                 assert latest & 0xffffffff == frames, (rank, channel, peer, frames, records)
 
 
-def _warp_worker(rank, directory, frame_rows, barrier):
+def _warp_worker(rank, directory, frame_rows, hidden, slots, offset, barrier):
     torch.cuda.set_device(rank)
-    world, channels, slots, hidden = 3, 2, 2, 258
+    world, channels = 3, 2
     local_tokens = 4 * frame_rows + 7
     capacity = world * local_tokens + 4
     mappings, addresses, pointers = {}, [], {}
     prepared = None
     try:
-        for phase, size in _sizes(hidden, frame_rows).items():
+        for phase, size in _sizes(hidden, frame_rows, slots).items():
             mapped = []
             mappings[phase] = []
             for peer in range(world):
@@ -121,10 +121,15 @@ def _warp_worker(rank, directory, frame_rows, barrier):
             # Nonexact sums exercise the remote BF16 rounding before local add.
             # Hidden=258 also leaves a one-BF16-pair tail for a 128-thread group.
             partial = (torch.randn(capacity, hidden, device="cuda") * 31).bfloat16()
+            if offset:
+                shifted = torch.empty(partial.numel() + offset, dtype=partial.dtype, device="cuda")
+                shifted[offset:].copy_(partial.flatten())
+                partial = shifted[offset:].view_as(partial)
             reference = torch.empty(local_tokens, hidden, dtype=torch.bfloat16, device="cuda")
             result = torch.empty_like(reference)
             reference_remote = torch.empty(world, local_tokens, hidden, dtype=torch.bfloat16, device="cuda")
-            remote = torch.empty_like(reference_remote)
+            remote = torch.empty(reference_remote.numel() + offset, dtype=torch.bfloat16,
+                                 device="cuda")[offset:].view_as(reference_remote)
             torch.cuda.synchronize()
             barrier.wait(timeout=60)
             native.host_sm_combine(
@@ -134,7 +139,7 @@ def _warp_worker(rank, directory, frame_rows, barrier):
             torch.cuda.synchronize()
             assert status.item() == 0
             _assert_drained(mappings["legacy"][rank], rank, epoch, active,
-                            hidden, frame_rows, owner_counts_cpu, False)
+                            hidden, frame_rows, owner_counts_cpu, False, slots)
             barrier.wait(timeout=60)
             fields = native.host_sm_profile_fields()
             profile = (torch.zeros((active * world, len(fields)), dtype=torch.int64,
@@ -152,7 +157,7 @@ def _warp_worker(rank, directory, frame_rows, barrier):
             torch.testing.assert_close(result.view(torch.int16), reference.view(torch.int16), rtol=0, atol=0)
             torch.testing.assert_close(remote.view(torch.int16), reference_remote.view(torch.int16), rtol=0, atol=0)
             _assert_drained(mappings["prepared"][rank], rank, epoch, active,
-                            hidden, frame_rows, owner_counts_cpu, True)
+                            hidden, frame_rows, owner_counts_cpu, True, slots)
             barrier.wait(timeout=60)
     finally:
         torch.cuda.synchronize()
@@ -164,8 +169,17 @@ def _warp_worker(rank, directory, frame_rows, barrier):
                 mapping.close()
 
 
-@pytest.mark.parametrize("frame_rows", [4, 256], ids=["four-row-frames", "subgroup-metadata-tail"])
-def test_prefill_warp_pair_legacy_rounding_and_slot_reuse(frame_rows):
+@pytest.mark.parametrize(
+    "frame_rows,hidden,slots,offset",
+    [(4, 258, 2, 0), (256, 258, 2, 0), (16, 2048, 2, 0),
+     (16, 264, 4, 0), (16, 2048, 2, 2), (3, 264, 2, 0)],
+    ids=["scalar-tail", "subgroup-metadata-tail", "vector-model-width",
+         "vector-tail-four-slots", "unaligned-output", "unaligned-frame"],
+)
+def test_prefill_warp_pair_legacy_rounding_and_slot_reuse(frame_rows, hidden, slots, offset, monkeypatch):
+    # Spawned workers import native afresh and exercise the opt-in vector build.
+    monkeypatch.setenv("EP_XPRESS_PREFILL_READ_UNROLL", "4")
+    monkeypatch.setenv("EP_XPRESS_PREFILL_WRITE_UNROLL", "4")
     from torch.utils.cpp_extension import CUDA_HOME
     if CUDA_HOME is None:
         pytest.skip("CUDA toolkit is unavailable")
@@ -173,11 +187,11 @@ def test_prefill_warp_pair_legacy_rounding_and_slot_reuse(frame_rows):
     if native.host_sm_max_channels(3) < 2:
         pytest.skip("insufficient cooperative residency for the focused test")
     with tempfile.TemporaryDirectory(prefix="ep-xpress-warp-test-", dir="/dev/shm") as directory:
-        for phase, size in _sizes(258, frame_rows).items():
+        for phase, size in _sizes(hidden, frame_rows, slots).items():
             for rank in range(3):
                 with open(os.path.join(directory, f"{phase}-{rank}"), "wb") as output:
                     os.posix_fallocate(output.fileno(), 0, size)
         context = torch.multiprocessing.get_context("spawn")
         barrier = context.Barrier(3)
-        torch.multiprocessing.spawn(_warp_worker, args=(directory, frame_rows, barrier),
+        torch.multiprocessing.spawn(_warp_worker, args=(directory, frame_rows, hidden, slots, offset, barrier),
                                     nprocs=3, join=True)

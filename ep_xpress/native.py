@@ -37,18 +37,29 @@ def load(*, verbose: bool = False):
             raise RuntimeError("A CUDA toolkit is required to build EP-Xpress")
         source_dir = Path(__file__).resolve().parent / "csrc"
         sources = [source_dir / name for name in ("bindings.cpp", "kernels.cu", "host_sm.cu")]
+        # Build-time tuning only: no environment lookup on the transport path.
+        # Keep scalar copies as the default until model-level gains are repeatable.
+        read_unroll = os.environ.get("EP_XPRESS_PREFILL_READ_UNROLL", "0")
+        if read_unroll not in {"0", "1", "2", "4", "8"}:
+            raise ValueError("EP_XPRESS_PREFILL_READ_UNROLL must be 0, 1, 2, 4, or 8")
+        write_unroll = os.environ.get("EP_XPRESS_PREFILL_WRITE_UNROLL", "0")
+        if write_unroll not in {"0", "1", "2", "4", "8"}:
+            raise ValueError("EP_XPRESS_PREFILL_WRITE_UNROLL must be 0, 1, 2, 4, or 8")
+        cuda_flags = ["-O3", "-lineinfo", f"-DEP_XPRESS_PREFILL_READ_UNROLL={read_unroll}",
+                      f"-DEP_XPRESS_PREFILL_WRITE_UNROLL={write_unroll}"]
         digest = hashlib.sha256()
         for source in sources + sorted(source_dir.glob("*.h")):
             digest.update(source.read_bytes())
         digest.update(torch.__version__.encode())
         digest.update(str(torch.version.cuda).encode())
+        digest.update(" ".join(cuda_flags).encode())
         # Avoid oversized parallel compiler jobs by default; honor user settings.
         os.environ.setdefault("MAX_JOBS", "1")
         _extension = build_extension(
             name="ep_xpress_cuda_" + digest.hexdigest()[:12],
             sources=[str(source) for source in sources],
             extra_cflags=["-O3"],
-            extra_cuda_cflags=["-O3", "-lineinfo"],
+            extra_cuda_cflags=cuda_flags,
             with_cuda=True,
             verbose=verbose,
         )

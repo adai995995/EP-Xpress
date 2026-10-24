@@ -115,6 +115,8 @@ and general combine frame sizing/execution:
 | `EP_XPRESS_COMBINE_WARP_SPECIALIZATION` | `1` | Give prepared non-fused combine four Tx warps and four Rx warps per remote-peer CTA; `0` retains the sequential pair-queue kernel. |
 | `EP_XPRESS_DECODE_MAX_TOKENS` | `64` | Reserve this many mailbox token slots per source rank and use it as the adapter's global-capacity eligibility bound. `0` disables both small-decode selections. |
 | `EP_XPRESS_COMBINE_FRAME_ROWS` | `0` | Fix rows per pair-queue frame independently of allocated channels. `0` restores the original split of the chunk budget across channels and peers. |
+| `EP_XPRESS_PREFILL_READ_UNROLL` | `0` | Build-time host payload vector-read expansion for prepared warp combine: `1`, `2`, `4`, `8`; `0` retains scalar reads. Set before worker startup; changing it selects a separate native build. |
+| `EP_XPRESS_PREFILL_WRITE_UNROLL` | `0` | Build-time vector expansion for prepared warp-combine sends: `1`, `2`, `4`, `8`; `0` retains scalar writes. Independent of the read setting. |
 
 The three switches accept `0` or `1`; both size settings accept integers from
 `0` through `256`. Core `Config.decode_max_tokens` and
@@ -284,3 +286,10 @@ the fused decode path. See [full-model results](../../docs/model-performance.md)
 for workload scope, TTFT/decode TPS and measurement limits. Core defaults are
 unchanged; use the same framework settings and host-only NCCL restrictions for
 both sides of a comparison.
+
+The separate experimental
+[`presets/host_sm_bf16_ep8_vector.sh`](presets/host_sm_bf16_ep8_vector.sh)
+enables four-way vector expansion for both prefill combine reads and writes.
+It retains two slots and the same host-memory footprint. Measured B32 gains
+are modest and timing ranges overlap; the original preset and general loader
+defaults retain scalar copies. Both presets keep the necessary READY/ACK fences.
