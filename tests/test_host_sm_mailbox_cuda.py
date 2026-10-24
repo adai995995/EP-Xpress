@@ -34,9 +34,9 @@ def _routes(case, rank):
     return result
 
 
-def _mailbox_worker(rank, directory, barrier):
+def _mailbox_worker(rank, directory, barrier, hidden, storage_offset):
     torch.cuda.set_device(rank)
-    world, hidden, topk, channels, capacity, tokens = 3, 64, 3, 2, 32, 16
+    world, topk, channels, capacity, tokens = 3, 3, 2, 32, 16
     mappings, addresses, pointers = [], [], {}
     prepared = None
     try:
@@ -95,6 +95,11 @@ def _mailbox_worker(rank, directory, barrier):
                 # Random BF16 values exercise cancellation and intermediate
                 # BF16 rounding, rather than an exactly representable identity.
                 partial = (torch.randn(capacity, hidden, device="cuda") * 31).bfloat16()
+                if storage_offset:
+                    storage = torch.empty(capacity * hidden + storage_offset, dtype=torch.bfloat16, device="cuda")
+                    shifted = storage[storage_offset:].view(capacity, hidden)
+                    shifted.copy_(partial)
+                    partial = shifted
                 handles.append((case, n, partial, inverse, count, owner_rows,
                                 owner_counts, expected, local))
             for case, n, partial, inverse, count, owner_rows, owner_counts, expected, local in reversed(handles):
@@ -102,6 +107,9 @@ def _mailbox_worker(rank, directory, barrier):
                 reference = torch.empty(n, hidden, dtype=torch.bfloat16, device="cuda")
                 remote = torch.empty(world, n, hidden, dtype=torch.bfloat16, device="cuda")
                 result = torch.empty_like(reference)
+                if storage_offset:
+                    storage = torch.empty(n * hidden + storage_offset, dtype=torch.bfloat16, device="cuda")
+                    result = storage[storage_offset:].view(n, hidden)
                 prepared.combine(partial, inverse, count, owner_rows, owner_counts,
                     combine_epoch, reference, remote, active_channels=1 + case % 2,
                     identity=combine_epoch)
@@ -147,7 +155,8 @@ def _sizes(hidden, topk, channels, world, tokens):
     }
 
 
-def test_mailbox_sparse_readers_reuse_reverse_handles_and_legacy_rounding():
+@pytest.mark.parametrize("hidden,storage_offset", [(64, 0), (258, 0), (264, 0), (2048, 0), (2048, 2)])
+def test_mailbox_sparse_readers_reuse_reverse_handles_and_legacy_rounding(hidden, storage_offset):
     from torch.utils.cpp_extension import CUDA_HOME
     if CUDA_HOME is None:
         pytest.skip("CUDA toolkit is unavailable")
@@ -155,10 +164,10 @@ def test_mailbox_sparse_readers_reuse_reverse_handles_and_legacy_rounding():
     if native.host_sm_max_channels(3) < 2:
         pytest.skip("insufficient cooperative residency")
     with tempfile.TemporaryDirectory(prefix="ep-xpress-mailbox-test-", dir="/dev/shm") as directory:
-        for phase, size in _sizes(64, 3, 2, 3, 16).items():
+        for phase, size in _sizes(hidden, 3, 2, 3, 16).items():
             for rank in range(3):
                 with open(os.path.join(directory, f"{phase}-{rank}"), "wb") as output:
                     os.posix_fallocate(output.fileno(), 0, size)
         context = torch.multiprocessing.get_context("spawn")
         barrier = context.Barrier(3)
-        torch.multiprocessing.spawn(_mailbox_worker, args=(directory, barrier), nprocs=3, join=True)
+        torch.multiprocessing.spawn(_mailbox_worker, args=(directory, barrier, hidden, storage_offset), nprocs=3, join=True)

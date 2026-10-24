@@ -306,6 +306,25 @@ prefill phase profiling does not instrument fused mailbox operations. They
 continue on their normal path and are excluded from the diagnostic capture;
 profiling never silently changes fusion or transport selection.
 
+The experimental `EP_XPRESS_DECODE_PEER_BATCH` native build setting changes
+only the mailbox receive payload schedule. Zero retains scalar reads. Values
+1, 2 and 4 load a bounded group of remote-rank positions as 128-bit vectors
+before consuming those values. One thread owns eight consecutive BF16 hidden
+elements. Mailbox payloads have a 16-byte-aligned base; hidden widths not
+divisible by eight, or shifted GPU input/output views without 16-byte
+alignment, use the original scalar loop. Local partial reads and final output
+stores retain the same 128-bit ownership. Host vector reads keep the same
+cache-volatile policy on mailbox reuse.
+
+Accumulation still visits remote ranks in ascending order, including zero
+additions for absent remote contributors. Intermediate BF16 rounding and the
+local BF16 addition remain unchanged. There is no new host work, allocation,
+scratch plane, synchronization, or change to send/READY/ACK lifetimes. The
+setting is read once at extension load and participates in the build cache
+key; it does not specialize kernels on per-layer token counts. Channel
+selection is independent. This option remains experimental until full-model
+measurements establish a repeatable benefit.
+
 ## Borrowed communication workspaces
 
 `Context.create_workspace(recv_capacity, local_tokens, fused_combine=...)` is a

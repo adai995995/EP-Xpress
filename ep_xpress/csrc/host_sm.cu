@@ -139,6 +139,12 @@ static_assert(EP_XPRESS_DISPATCH_READ_UNROLL == 0 || EP_XPRESS_DISPATCH_READ_UNR
 #endif
 static_assert(EP_XPRESS_COMBINE_LAST_DATA == 0 || EP_XPRESS_COMBINE_LAST_DATA == 1,
               "unsupported last-data setting");
+#ifndef EP_XPRESS_DECODE_PEER_BATCH
+#define EP_XPRESS_DECODE_PEER_BATCH 0
+#endif
+static_assert(EP_XPRESS_DECODE_PEER_BATCH == 0 || EP_XPRESS_DECODE_PEER_BATCH == 1 ||
+              EP_XPRESS_DECODE_PEER_BATCH == 2 || EP_XPRESS_DECODE_PEER_BATCH == 4,
+              "unsupported decode peer batch");
 __device__ __forceinline__ void host_store128(void* address, uint4 value) {
   // Match the scalar volatile store policy. Each writer still executes a
   // system fence before the Tx leader publishes READY for the whole frame.
@@ -1445,6 +1451,57 @@ __device__ __forceinline__ int mailbox_health(TransportArgs a, uint64_t start,
   return read_status(a.status);
 }
 
+// Issue independent vector reads before consuming their results. Only the
+// load schedule changes: rank order, absent-rank zero additions, intermediate
+// BF16 rounding and the local addition match the scalar mailbox exactly.
+template <int PeerBatch>
+__device__ __forceinline__ void mailbox_reduce_vectors(
+    TransportArgs a, int original, int local_row, uint64_t readers) {
+  for (int h = threadIdx.x; h < a.hidden / 8; h += blockDim.x) {
+    float sums[8] = {};
+    for (int base = 0; base < a.world; base += PeerBatch) {
+      uint4 payload[PeerBatch];
+#pragma unroll
+      for (int p = 0; p < PeerBatch; ++p) {
+        const int peer = base + p;
+        payload[p] = make_uint4(0, 0, 0, 0);
+        if (peer < a.world && peer != a.rank && (readers & (uint64_t(1) << peer)))
+          payload[p] = host_load128(mailbox(a, peer, a.rank, original) + 32 + int64_t(h) * 16);
+      }
+#pragma unroll
+      for (int p = 0; p < PeerBatch; ++p) {
+        const int peer = base + p;
+        if (peer >= a.world || peer == a.rank) continue;
+        const uint32_t bits[4] = {payload[p].x, payload[p].y, payload[p].z, payload[p].w};
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+          const auto packed = *reinterpret_cast<const __nv_bfloat162*>(&bits[v]);
+          const float2 value = __bfloat1622float2(packed);
+          sums[2 * v] += value.x;
+          sums[2 * v + 1] += value.y;
+        }
+      }
+    }
+    const uint4 local = local_row >= 0 ? reinterpret_cast<const uint4*>(
+        a.input + int64_t(local_row) * a.hidden)[h] : make_uint4(0, 0, 0, 0);
+    const uint32_t local_bits[4] = {local.x, local.y, local.z, local.w};
+    uint32_t output_bits[4];
+#pragma unroll
+    for (int v = 0; v < 4; ++v) {
+      const auto packed = *reinterpret_cast<const __nv_bfloat162*>(&local_bits[v]);
+      const float2 value = __bfloat1622float2(packed);
+      const at::BFloat16 rounded0(sums[2 * v]), rounded1(sums[2 * v + 1]);
+      const at::BFloat16 result0(float(rounded0) + value.x);
+      const at::BFloat16 result1(float(rounded1) + value.y);
+      output_bits[v] = uint32_t(result0.x) | (uint32_t(result1.x) << 16);
+    }
+    // Preserve vector ownership through the final GPU store; eight scalar
+    // stores would scatter each warp's writes at a 16-byte thread stride.
+    reinterpret_cast<uint4*>(a.output + int64_t(original) * a.hidden)[h] =
+        make_uint4(output_bits[0], output_bits[1], output_bits[2], output_bits[3]);
+  }
+}
+
 __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
   __shared__ int begin, end, row, token, error, local_row, blocked;
   __shared__ uint64_t readers;
@@ -1529,24 +1586,34 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
     if (tid == 0) error = read_status(a.status);
     __syncthreads();
     if (error) break;
-    for (int h = tid; h < a.hidden / 2; h += blockDim.x) {
-      float sum0 = 0.0f, sum1 = 0.0f;
-      for (int peer = 0; peer < a.world; ++peer) {
-        if (peer == a.rank) continue;
-        uint32_t bits = 0;
-        if (readers & (uint64_t(1) << peer))
-          bits = host_load32(mailbox(a, peer, a.rank, original) + 32 + int64_t(h) * 4);
-        const auto packed = *reinterpret_cast<const __nv_bfloat162*>(&bits);
-        const float2 value = __bfloat1622float2(packed);
-        sum0 += value.x;
-        sum1 += value.y;
+#if EP_XPRESS_DECODE_PEER_BATCH > 0
+    // Mailbox bases/strides are 128-byte aligned, payload begins at +32.
+    // Shifted contiguous tensor views and incomplete vectors stay scalar.
+    if (a.hidden % 8 == 0 &&
+        ((reinterpret_cast<uintptr_t>(a.input) | reinterpret_cast<uintptr_t>(a.output)) & 15) == 0) {
+      mailbox_reduce_vectors<EP_XPRESS_DECODE_PEER_BATCH>(a, original, local_row, readers);
+    } else
+#endif
+    {
+      for (int h = tid; h < a.hidden / 2; h += blockDim.x) {
+        float sum0 = 0.0f, sum1 = 0.0f;
+        for (int peer = 0; peer < a.world; ++peer) {
+          if (peer == a.rank) continue;
+          uint32_t bits = 0;
+          if (readers & (uint64_t(1) << peer))
+            bits = host_load32(mailbox(a, peer, a.rank, original) + 32 + int64_t(h) * 4);
+          const auto packed = *reinterpret_cast<const __nv_bfloat162*>(&bits);
+          const float2 value = __bfloat1622float2(packed);
+          sum0 += value.x;
+          sum1 += value.y;
+        }
+        const at::BFloat16 rounded0(sum0), rounded1(sum1);
+        const int64_t offset = int64_t(local_row) * a.hidden + h * 2;
+        const float local0 = local_row >= 0 ? float(a.input[offset]) : 0.0f;
+        const float local1 = local_row >= 0 ? float(a.input[offset + 1]) : 0.0f;
+        a.output[int64_t(original) * a.hidden + h * 2] = at::BFloat16(float(rounded0) + local0);
+        a.output[int64_t(original) * a.hidden + h * 2 + 1] = at::BFloat16(float(rounded1) + local1);
       }
-      const at::BFloat16 rounded0(sum0), rounded1(sum1);
-      const int64_t offset = int64_t(local_row) * a.hidden + h * 2;
-      const float local0 = local_row >= 0 ? float(a.input[offset]) : 0.0f;
-      const float local1 = local_row >= 0 ? float(a.input[offset + 1]) : 0.0f;
-      a.output[int64_t(original) * a.hidden + h * 2] = at::BFloat16(float(rounded0) + local0);
-      a.output[int64_t(original) * a.hidden + h * 2 + 1] = at::BFloat16(float(rounded1) + local1);
     }
     // ACK follows every reader's final host load, allowing safe next-call reuse.
     __threadfence_system();

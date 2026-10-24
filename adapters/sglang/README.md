@@ -119,6 +119,7 @@ and general combine frame sizing/execution:
 | `EP_XPRESS_PREFILL_WRITE_UNROLL` | `0` | Build-time vector expansion for prepared warp-combine sends: `1`, `2`, `4`, `8`; `0` retains scalar writes. Independent of the read setting. |
 | `EP_XPRESS_DISPATCH_READ_UNROLL` | `0` | Build-time vector expansion for selected dispatch payload reads: `1`, `2`, `4`, `8`; `0` retains scalar reads. Applies to dispatch in both prefill and decode. Preserves multicast selection and falls back to scalar for unaligned layouts. |
 | `EP_XPRESS_COMBINE_LAST_DATA` | `0` | Build-time opt-in for prepared warp combine: `1` marks the final payload frame as LAST, avoiding a separate empty terminal on nonempty queues. Empty queues retain a terminal. All final ACKs are still drained. Does not change fused decode or legacy pair combine. |
+| `EP_XPRESS_DECODE_PEER_BATCH` | `0` | Build-time experimental mailbox reads: `1`, `2`, or `4` remote-rank positions per vector-load group; `0` keeps scalar reads. Uses 128-bit vectors for hidden widths divisible by eight and aligned GPU views, otherwise falls back to scalar. Arithmetic order and READY/ACK are unchanged. Set before worker startup. |
 
 The workspace, fusion and warp-specialization switches accept `0` or `1`;
 both size settings accept integers from `0` through `256`. Core `Config.decode_max_tokens` and

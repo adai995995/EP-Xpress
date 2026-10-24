@@ -1819,3 +1819,90 @@ per-rank median cumulative init, transport and finalize GPU durations of
 0.950, 119.083 and 1.704 ms. This makes init/finalize fusion a lower priority for
 this captured workload than production/publication and arrival dependencies.
 It is not a claim that these kernel sums equal request critical-path latency.
+
+
+## Decode mailbox vector read/reduce/store experiment
+
+The optional `EP_XPRESS_DECODE_PEER_BATCH=2` implementation reads two rank
+positions ahead using cache-volatile 128-bit host loads. It retains vector
+ownership through local GPU partial loads and final GPU output stores. The
+scalar path remains the default (`0`), including all supplied presets. The
+receive arithmetic, intermediate BF16 rounding, producer writes, READY/ACK
+protocol, workspace capacity and NUMA allocation are unchanged. Widths without
+complete vectors and misaligned GPU views fall back to scalar reads/reduction.
+No CPU payload relay or new metadata communication is introduced.
+
+Five focused CUDA cases pass with bitwise equality against the existing pair
+reference: hidden widths 64, 258, 264 and 2048, plus a shifted 2048-wide GPU
+view. Cases retain sparse contributors, an unrelated delayed rank, repeated
+mailbox reuse, changing active channels and reverse-order route handles.
+The tested vector build uses 40 registers versus the scalar build's 46, with
+zero stack/local-memory usage. SASS confirms 128-bit host loads and an aligned
+128-bit GPU output store. Other nonzero peer-batch sizes are tuning options,
+not measured performance recommendations.
+
+Full-model tests keep the same eight GPUs, Qwen3-30B-A3B-Instruct-2507 BF16,
+SGLang v0.5.21, TP8/DP8/EP8, Triton experts, eager execution, 512 input tokens
+and 32 output tokens. Both backends disable P2P/NVLink. NCCL was rerun in this
+series, rather than borrowed from an earlier measurement. Each shape receives
+eight warmups and five timed repeats; all ten input hashes match. The EP
+control and final vector candidate use the prior vector-prefill/LAST preset
+settings: 32 allocated channels, 16-row frames, two slots and prefill/dispatch
+vector expansion four. Automatic decode selection uses one channel at B1
+and four at balanced B32. The decode channel override affects both dispatch
+and combine, so channel experiments are not isolated combine-only changes.
+
+Values below are median [min, max]. TTFT is the last request's first-token
+latency. Decode TPS is aggregate throughput inside the steady decode window,
+not maximum sustained serving throughput.
+
+| Implementation | Batch | TTFT (ms) | Steady TPOT (ms) | Decode TPS |
+|---|---:|---:|---:|---:|
+| Default NCCL | 1 | 191.831 [190.130, 194.547] | 92.538 [92.012, 95.015] | 10.806 [10.525, 10.868] |
+| Default NCCL | 32 | 611.968 [559.296, 631.877] | 90.840 [90.504, 91.482] | 352.268 [349.796, 353.575] |
+| EP scalar, auto channels | 1 | 185.633 [184.164, 186.045] | 85.095 [84.745, 85.356] | 11.752 [11.716, 11.800] |
+| EP scalar, auto channels | 32 | 421.146 [374.875, 438.463] | 88.887 [88.335, 88.975] | 360.008 [359.650, 362.258] |
+| EP vector, auto channels | 1 | 184.654 [183.588, 187.664] | 85.417 [84.382, 86.152] | 11.707 [11.607, 11.851] |
+| EP vector, auto channels | 32 | 416.945 [381.569, 428.407] | 89.123 [88.471, 90.171] | 359.055 [354.881, 361.702] |
+
+The final auto-channel vector candidate is 0.38% slower than the scalar control
+at B1 and 0.26% slower at B32 by median decode TPS, with overlapping observed
+ranges. It provides no demonstrated incremental throughput gain. Its B32 TPS
+is 1.93% above the new NCCL baseline; that is the existing library advantage,
+not a gain attributable to this vector experiment. The scalar control remains
+2.20% above NCCL. The TTFT ranges also overlap; this decode experiment is not
+evidence of a new prefill optimization. Four short greedy prompts match the
+scalar control exactly in text, token IDs and sampled logprobs. This output
+check is limited to those prompts, not exhaustive model routing equivalence.
+
+An earlier receive-vector-only candidate left final BF16 output as scattered
+scalar stores. At B32 its median TPS was 348.109 with auto/four channels,
+359.255 with two channels and 341.623 with eight channels. These results
+reject the assumption that more CTAs or vector host loads alone necessarily
+improve decode. Completing vector GPU stores restored performance near the
+scalar control; this does not establish a large new speedup.
+
+A final two-channel rerun with vector GPU stores gives B32 decode TPS
+358.656 [357.842, 359.909], TPOT 89.222 [88.911, 89.425] ms, and last-request
+TTFT 430.659 [384.489, 456.272] ms. It does not improve on the scalar control
+or the final auto-channel candidate. No new decode preset is promoted.
+
+The final auto-channel candidate was profiled separately after uninstrumented
+measurements. All eight B32 traces resolve, each with eight local DECODE
+forwards. Per-rank GPU forward windows total about 826 ms. Median observed
+device idle fraction is 58.31% (range 36.46% to 73.75%); dispatch kernel
+occupancy is 22.75%, and fused mailbox occupancy is 14.35%. These are per-rank
+GPU-window fractions, not HTTP latency fractions, and their medians should
+not be added. Mailbox time includes waiting and reduction, not pure PCIe
+reads. Profiling increases step latency and affects rank scheduling; B1 local
+IDLE records are kept separate and never guessed to be global decode. An
+earlier eight-channel trace has a very different waiting/idle distribution,
+so its communication fraction is not an ablation result for payload traffic.
+
+The observed gaps and rank variation motivate checking eager submission and
+rank arrival skew before treating payload bandwidth as the only bottleneck.
+The adapter currently immediately waits on each async dispatch/combine while
+the core crosses between producer/consumer and transport streams. A future
+same-stream synchronous fast path could remove redundant event dependencies
+for that use case while retaining the general asynchronous API. Neither that
+fast path nor a specific causal CPU bottleneck is established by this trace.
