@@ -64,6 +64,7 @@ class _Ticket:
     handle: object
     tag: object
     rows: int
+    same_stream: bool = False
 
 
 class HostEPDispatcher(BaseDispatcher):
@@ -95,6 +96,10 @@ class HostEPDispatcher(BaseDispatcher):
         diagnostics = os.environ.get("EP_XPRESS_DIAGNOSTICS", "0")
         if diagnostics not in ("0", "1"):
             raise ValueError("EP_XPRESS_DIAGNOSTICS must be 0 or 1")
+        decode_same_stream = os.environ.get("EP_XPRESS_DECODE_SAME_STREAM", "0")
+        if decode_same_stream not in ("0", "1"):
+            raise ValueError("EP_XPRESS_DECODE_SAME_STREAM must be 0 or 1")
+        self._decode_same_stream = transport == "host_sm" and decode_same_stream == "1"
         decode_workspace = os.environ.get("EP_XPRESS_DECODE_WORKSPACE", "1")
         fused_decode = os.environ.get("EP_XPRESS_FUSED_DECODE", "1")
         combine_warps = os.environ.get("EP_XPRESS_COMBINE_WARP_SPECIALIZATION", "1")
@@ -189,6 +194,7 @@ class HostEPDispatcher(BaseDispatcher):
                if self._config.diagnostics or self._config.transport == "host_ce" else None)
         try:
             dispatch_options = {}
+            same_stream = False
             if self._config.transport == "host_sm":
                 # The pinned scheduler computes this sum once per forward,
                 # after MAX_LEN/SUM_LEN padding. Reuse that exact CPU bound
@@ -209,6 +215,7 @@ class HostEPDispatcher(BaseDispatcher):
                 small_decode = (not is_extend and
                                 0 <= capacity <= self._config.decode_max_tokens and
                                 self._config.decode_max_tokens > 0)
+                same_stream = small_decode and self._decode_same_stream
                 fused = small_decode and self._fused_decode
                 dispatch_options["fused_combine"] = fused
                 if small_decode and self._reuse_decode_workspace:
@@ -225,20 +232,24 @@ class HostEPDispatcher(BaseDispatcher):
                             self._decode_workspaces.pop(next(iter(self._decode_workspaces)))
                         self._decode_workspaces[key] = workspace
                     dispatch_options["workspace"] = workspace
-            batch = self._context().dispatch_async(
+            context = self._context()
+            dispatch = context.dispatch_on_stream if same_stream else context.dispatch_async
+            batch = dispatch(
                 hidden_states,
                 topk_output.topk_ids,
                 topk_output.topk_weights,
                 tag=tag,
                 stream=stream,
                 **dispatch_options,
-            ).wait(stream=stream)
+            )
+            if not same_stream:
+                batch = batch.wait(stream=stream)
             rows = batch.hidden.shape[0]
             if self._config.transport == "host_ce" and batch.valid_count != rows:
                 raise ValueError("The eager adapter requires unpadded dispatch output")
             # host_sm returns fixed capacity. Padding carries IDs=-1 and zero
             # weights; combine consumes only valid rows using its GPU handle.
-            self._tickets.append(_Ticket(batch.handle, tag, rows))
+            self._tickets.append(_Ticket(batch.handle, tag, rows, same_stream))
             self._sequence += 1
             output_type = HostSMDispatchOutput if self._use_valid_count else StandardDispatchOutput
             return output_type(
@@ -264,13 +275,17 @@ class HostEPDispatcher(BaseDispatcher):
         ticket = self._tickets[0]
         stream = torch.cuda.current_stream(self._device)
         try:
-            output = self._context().combine_async(
+            context = self._context()
+            combine = context.combine_on_stream if ticket.same_stream else context.combine_async
+            output = combine(
                 combine_input.hidden_states,
                 ticket.handle,
                 tag=ticket.tag,
                 stream=stream,
                 weights_applied=True,
-            ).wait(stream=stream)
+            )
+            if not ticket.same_stream:
+                output = output.wait(stream=stream)
         except Exception:
             self._failed = True
             raise

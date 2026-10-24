@@ -293,7 +293,10 @@ def prepare_host_sm(
     local_rows int32[local_tokens]. Passing that matching state to combine
     selects receive-and-reduce fusion with remote=None. Mailbox tokens bound
     each source rank's token capacity; their host storage remains owned by the
-    context. Omitting these arguments preserves the rank-pair queue path.
+    context. Native mailbox combine orders stream changes with a CUDA event;
+    consecutive calls on one stream add no event. Callers must keep previous
+    streams alive until their submissions complete. Omitting these arguments
+    preserves the rank-pair queue path.
 
     combine_warp_specialization=True gives prepared pair queues independent
     128-thread send/receive groups. It preserves the grid and frame layout,

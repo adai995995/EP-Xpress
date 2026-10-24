@@ -298,7 +298,8 @@ does not remove the operation ordering contract or provide early token-level
 completion to the expert runner.
 
 The native prepared operator requires increasing fused combine epochs and
-one serialized CUDA transport stream. An epoch belongs to the combine
+a serialized execution sequence. A CUDA event orders mailbox stream changes;
+consecutive submissions on one stream require no transition event. An epoch belongs to the combine
 submission, not to its dispatch handle; independently allocated handles may
 still be combined in a consistent reverse order across ranks. GPU bounds,
 READY/ACK ordering and optional identity diagnostics remain active. Existing
@@ -336,8 +337,9 @@ tensors without repeated tensor allocations. This storage is for communication;
 expert GEMM intermediates remain the runner's responsibility.
 
 Workspace batches, outputs and tickets are borrowed until its next dispatch.
-The previous combine must have been waited, and all consumers of its output
-must have been enqueued on the wait stream before reuse. Retaining output
+For the asynchronous API, the previous combine must have been waited and all
+output consumers enqueued on the wait stream before reuse. With the direct
+API, enqueue those consumers on the combine stream before the next dispatch. Retaining output
 across reuse requires a clone or a different workspace. A new dispatch
 invalidates the old workspace-backed tickets; an unconsumed route cannot be
 overwritten. Generic calls that omit a workspace continue to allocate
@@ -592,3 +594,26 @@ Diagnostic `terminal_sent` and `terminal_received` counters in warp combine
 count end markers, including markers attached to data. They must not be
 interpreted as counts of empty frames. Payload byte/row counts include the
 last data frame normally; frame counters count it once.
+
+
+### Direct-stream eager submission
+
+`HostSMContext.dispatch_on_stream` and `combine_on_stream` enqueue on the
+specified stream (current stream by default) and return tensors directly.
+They do not synchronize the CPU or produce completion tickets. Consume the
+results on that stream. Cross-stream consumers need explicit dependency and
+tensor-lifetime management; the asynchronous API remains the convenient choice
+when a completion must be waited on by another stream.
+
+A context orders transitions between direct streams and its communication
+stream, since all submissions share queue epochs. Consecutive direct operations
+on one stream need no event handshake. Workspace reuse still waits for recorded
+previous consumers; first use on a new stream records its tensor lifetimes and
+orders allocation-stream work. `check_errors`, profile readout and destruction
+also drain direct work before inspecting or releasing mapped storage. The
+READY/ACK and credit protocols are unchanged.
+
+The SGLang adapter exposes this as `EP_XPRESS_DECODE_SAME_STREAM=1` for decode
+within the configured small-token capacity. Its default remains off; the measured `host_sm_bf16_ep8_same_stream.sh` preset
+enables it for the documented workload. This is an eager optimization,
+not CUDA Graph support: Python-controlled epochs still prohibit replay.

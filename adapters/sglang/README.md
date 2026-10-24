@@ -105,11 +105,21 @@ uses the policy above. A positive phase override takes precedence over the
 adaptive switch, must not exceed `EP_XPRESS_CHANNELS`, and is clamped to the
 negotiated cooperative capacity. Set the same options on every rank.
 
+For the measured eager decode stream optimization, source
+`adapters/sglang/presets/host_sm_bf16_ep8_same_stream.sh` before launching the
+server. It retains the vector/LAST prefill preset and enables
+`EP_XPRESS_DECODE_SAME_STREAM=1`. Direct decode submissions return results on
+the framework compute stream without per-operation completion tickets.
+Prefill and larger decode capacities keep the asynchronous path. CUDA Graph
+support remains disabled. See the full-model measurements in
+[`docs/model-performance.md`](../../docs/model-performance.md).
+
 The following `host_sm` options select workspace reuse, bounded decode fusion
 and general combine frame sizing/execution:
 
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
+| `EP_XPRESS_DECODE_SAME_STREAM` | `0` | Opt-in eligible decode dispatch/combine on the SGLang compute stream, without per-operation completion tickets; prefill retains the asynchronous path. |
 | `EP_XPRESS_DECODE_WORKSPACE` | `1` | Cache communication tensors for eligible decode operations; `0` uses independent tensors per call. |
 | `EP_XPRESS_FUSED_DECODE` | `1` | Use mailbox receive/reduce fusion for eligible decode; `0` retains pair queues. |
 | `EP_XPRESS_COMBINE_WARP_SPECIALIZATION` | `1` | Give prepared non-fused combine four Tx warps and four Rx warps per remote-peer CTA; `0` retains the sequential pair-queue kernel. |

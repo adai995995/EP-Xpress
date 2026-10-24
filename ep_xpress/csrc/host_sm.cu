@@ -4,6 +4,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
+#include <ATen/cuda/CUDAEvent.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -1986,8 +1987,14 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
   a.input_rows = int(partial.size(0)); a.capacity = int(output.size(0));
   a.epoch = uint64_t(epoch); a.identity = uint64_t(identity);
   if (fused) {
-    TORCH_CHECK(!impl_->last_mailbox_epoch || impl_->mailbox_stream == stream,
-                "mailbox combine must use one serialized CUDA stream");
+    if (impl_->last_mailbox_epoch && impl_->mailbox_stream != stream) {
+      // Mailbox reuse requires the previous outgoing ACK drain. Preserve this
+      // dependency for native callers too; consecutive same-stream calls do
+      // not allocate or record an event.
+      at::cuda::CUDAEvent transition;
+      transition.record(c10::cuda::getStreamFromExternal(impl_->mailbox_stream, device.index()));
+      transition.block(c10::cuda::getCurrentCUDAStream(device.index()));
+    }
     // No init/finalizer and no world-by-token device scratch for this path.
     if (a.channels == 1) host_sm_mailbox_combine_kernel<<<1, kThreads, 0, stream>>>(a);
     else {

@@ -142,6 +142,8 @@ class HostSMWorkspace:
         self._generation = 0
         self._busy = False
         self._consumer_streams = []
+        self._recorded_streams = []
+        self._allocation_stream = context._work_stream
         hidden, topk = context.config.hidden_size, context.config.topk
         options = {"device": context.device}
         self.hidden = torch.empty((recv_capacity, hidden), dtype=torch.bfloat16, **options)
@@ -159,12 +161,24 @@ class HostSMWorkspace:
         self.local_rows = (torch.empty(local_tokens, dtype=torch.int32, **options)
                            if fused_combine else None)
 
-    def _acquire(self, context, producer):
+    def _record_stream(self, stream):
+        if stream not in self._recorded_streams:
+            if stream != self._allocation_stream:
+                stream.wait_stream(self._allocation_stream)
+            for tensor in (self.hidden, self.local_ids, self.weights, self.inverse, self.count,
+                           self.owner_rows, self.owner_counts, self.output, self.remote,
+                           self.expected_ranks, self.local_rows):
+                if tensor is not None:
+                    tensor.record_stream(stream)
+            self._recorded_streams.append(stream)
+
+    def _acquire(self, context, producer, execution=None):
         # These dependencies protect prior expert/output consumers, including
         # a stream different from the producer supplied for this dispatch.
+        execution = context._work_stream if execution is None else execution
         for consumer in self._consumer_streams:
-            if consumer != producer:  # _begin already ordered this producer.
-                context._work_stream.wait_stream(consumer)
+            if consumer != producer and consumer != execution:
+                execution.wait_stream(consumer)
         self._consumer_streams.clear()
         self._generation += 1
         self._busy = True
@@ -305,6 +319,7 @@ class HostSMContext(Context):
         self._prepared = None
         self._root = None
         self._work_stream = None
+        self._last_stream = None
         self._combine_profile = None
         self._combine_profile_last = None
         self._combine_profile_label = None
@@ -423,6 +438,7 @@ class HostSMContext(Context):
                         mailbox_tokens=self.config.decode_max_tokens,
                         combine_warp_specialization=self.config.combine_warp_specialization)
                 self._work_stream.synchronize()
+                self._last_stream = self._work_stream
         except Exception:
             init_error = "mapped queue registration or CUDA initialization failed"
         errors = [None] * self.world_size
@@ -459,7 +475,7 @@ class HostSMContext(Context):
             if self._closed:
                 raise RuntimeError("Context is closed")
             with torch.cuda.device(self.device):
-                self._work_stream.synchronize()
+                (getattr(self, "_last_stream", None) or self._work_stream).synchronize()
                 code = int(self._status.item())
             if code:
                 error = RuntimeError("host_sm: " + _ERRORS.get(code, "unknown GPU transport error"))
@@ -569,6 +585,9 @@ class HostSMContext(Context):
             used = len(session["operations"])
             # The local session reference retains every GPU slice until all
             # selected operations and their readback have completed.
+            last = getattr(self, "_last_stream", None)
+            if last is not None and last != self._work_stream:
+                self._work_stream.wait_stream(last)
             with torch.cuda.stream(self._work_stream):
                 session["readout"][:used].copy_(session["counters"][:used], non_blocking=True)
                 session["status_readout"].copy_(self._status, non_blocking=True)
@@ -619,7 +638,7 @@ class HostSMContext(Context):
                 raise RuntimeError("no completed combine profile is available")
             return copy.deepcopy(self._combine_profile_last)
 
-    def _begin(self, phase, stream):
+    def _begin(self, phase, stream, *, same_stream=False):
         if self._closed:
             raise RuntimeError("Context is closed")
         if self._failure is not None:
@@ -637,7 +656,15 @@ class HostSMContext(Context):
         self._counter += 1
         if self._epochs[phase] >= 1 << 31:
             raise RuntimeError("operation generation exhausted; recreate the context")
-        self._work_stream.wait_stream(producer)
+        execution = producer if same_stream else self._work_stream
+        previous = getattr(self, "_last_stream", None) or self._work_stream
+        # Queue epochs are shared across APIs. Order only stream transitions;
+        # consecutive direct submissions already have stream ordering.
+        if previous != execution:
+            execution.wait_stream(previous)
+        if producer != execution and producer != previous:
+            execution.wait_stream(producer)
+        self._last_stream = execution
         return self._epochs[phase]
 
     def _finish(self, value, active_channels, workspace=None):
@@ -687,8 +714,30 @@ class HostSMContext(Context):
         if x.requires_grad or weights.requires_grad:
             raise ValueError("dispatch accepts inference tensors only")
 
+    def dispatch_on_stream(self, x, topk_ids, topk_weights, tag=None, stream=None,
+                           recv_capacity=None, active_channels=None, workspace=None,
+                           fused_combine=False):
+        """Enqueue dispatch directly on the consumer stream and return its batch.
+
+        This does not block the CPU. Consume the batch on this stream; callers
+        using another stream must establish its dependency and tensor lifetimes.
+        Shared queue transitions remain ordered with the asynchronous API.
+        CUDA Graph capture is not supported.
+        """
+        return self._dispatch(x, topk_ids, topk_weights, tag, stream, recv_capacity,
+                              active_channels, workspace, fused_combine, same_stream=True)
+
     def dispatch_async(self, x, topk_ids, topk_weights, tag=None, stream=None, recv_capacity=None,
                        active_channels=None, workspace=None, fused_combine=False):
+        """Enqueue on the communication stream; wait on the returned ticket.
+
+        See ``_dispatch`` for capacity, workspace and channel contracts.
+        """
+        return self._dispatch(x, topk_ids, topk_weights, tag, stream, recv_capacity,
+                              active_channels, workspace, fused_combine)
+
+    def _dispatch(self, x, topk_ids, topk_weights, tag=None, stream=None, recv_capacity=None,
+                  active_channels=None, workspace=None, fused_combine=False, *, same_stream=False):
         """Enqueue routed dispatch without reading routes or counts on the CPU.
 
         recv_capacity is a CPU-known upper bound on received rows, normally the
@@ -726,12 +775,16 @@ class HostSMContext(Context):
                         not 1 <= channels <= self.effective_channels):
                     raise ValueError("active_channels must be an integer within the allocated channel count")
                 identity = _operation_identity("dispatch", tag) if self.config.diagnostics else 0
-                epoch = self._begin("dispatch", stream)
+                execution = (stream or torch.cuda.current_stream(self.device)) if same_stream else self._work_stream
+                epoch = (self._begin("dispatch", execution, same_stream=True) if same_stream
+                         else self._begin("dispatch", stream))
                 if workspace is not None:
-                    workspace._acquire(self, stream or torch.cuda.current_stream(self.device))
+                    workspace._acquire(self, stream or torch.cuda.current_stream(self.device), execution)
+                    if same_stream:
+                        workspace._record_stream(execution)
                 for tensor in (x, topk_ids, topk_weights):
-                    tensor.record_stream(self._work_stream)
-                with torch.cuda.stream(self._work_stream), torch.no_grad():
+                    tensor.record_stream(execution)
+                with torch.cuda.stream(execution), torch.no_grad():
                     ids = topk_ids.contiguous()
                     weights = topk_weights.contiguous()
                     if workspace is None:
@@ -769,12 +822,25 @@ class HostSMContext(Context):
                                             active_channels=channels, identity=identity, profile=dispatch_profile, **decode_options)
                     if dispatch_record is not None:
                         dispatch_record["submitted"] = True
-                    return self._finish(DispatchBatch(hidden, local_ids, weights_out, handle, count), channels)
+                    batch = DispatchBatch(hidden, local_ids, weights_out, handle, count)
+                    return batch if same_stream else self._finish(batch, channels)
             except BaseException as error:
                 self._abort(error)
                 raise
 
+    def combine_on_stream(self, partial, handle, tag=None, stream=None, weights_applied=True):
+        """Enqueue combine directly on its consumer stream and return the tensor.
+
+        Enqueue every consumer of borrowed output on this stream before the
+        workspace is reused. For cross-stream consumers use explicit ordering
+        and lifetime management, or use ``combine_async(...).wait(stream=...)``.
+        """
+        return self._combine(partial, handle, tag, stream, weights_applied, same_stream=True)
+
     def combine_async(self, partial, handle, tag=None, stream=None, weights_applied=True):
+        return self._combine(partial, handle, tag, stream, weights_applied)
+
+    def _combine(self, partial, handle, tag=None, stream=None, weights_applied=True, *, same_stream=False):
         with self._lock, torch.cuda.device(self.device):
             # Pure local API misuse is rejected before an epoch is submitted;
             # callers can correct the handle without poisoning healthy peers.
@@ -790,13 +856,21 @@ class HostSMContext(Context):
                 fused_combine = handle._plan.expected_ranks is not None
                 workspace = handle._plan.workspace
                 identity = _operation_identity("combine", tag, handle.operation) if self.config.diagnostics else 0
-                epoch = self._begin("combine", stream)
-                for tensor in (partial, handle._plan.inverse, handle._plan.count,
-                               handle._plan.owner_rows, handle._plan.owner_counts,
-                               handle._plan.expected_ranks, handle._plan.local_rows):
+                execution = (stream or torch.cuda.current_stream(self.device)) if same_stream else self._work_stream
+                epoch = (self._begin("combine", execution, same_stream=True) if same_stream
+                         else self._begin("combine", stream))
+                if same_stream and workspace is not None:
+                    workspace._record_stream(execution)
+                # Workspace storage is registered once per execution stream.
+                # The expert output is external and still needs its lifetime recorded.
+                inputs = ((partial,) if same_stream and workspace is not None else
+                          (partial, handle._plan.inverse, handle._plan.count,
+                           handle._plan.owner_rows, handle._plan.owner_counts,
+                           handle._plan.expected_ranks, handle._plan.local_rows))
+                for tensor in inputs:
                     if tensor is not None:
-                        tensor.record_stream(self._work_stream)
-                with torch.cuda.stream(self._work_stream), torch.no_grad():
+                        tensor.record_stream(execution)
+                with torch.cuda.stream(execution), torch.no_grad():
                     if workspace is None:
                         output = torch.empty((handle.local_token_count, self.config.hidden_size),
                                              dtype=torch.bfloat16, device=self.device)
@@ -816,6 +890,10 @@ class HostSMContext(Context):
                     if profile_record is not None:
                         profile_record["submitted"] = True
                     handle._consumed = True
+                    if same_stream:
+                        if workspace is not None:
+                            workspace._combined(execution)
+                        return output
                     if workspace is None:
                         return self._finish(output, handle.active_channels)
                     return self._finish(output, handle.active_channels, workspace=workspace)
@@ -828,6 +906,9 @@ class HostSMContext(Context):
         # or unmap them while that process's transport stream can still access.
         try:
             with torch.cuda.device(self.device):
+                last = getattr(self, "_last_stream", None)
+                if last is not None and last != self._work_stream:
+                    last.synchronize()
                 if self._work_stream is not None:
                     self._work_stream.synchronize()
                 # An unfinished session is intentionally not read implicitly at

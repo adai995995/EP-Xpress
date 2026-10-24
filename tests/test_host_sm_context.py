@@ -481,3 +481,44 @@ def test_fused_combine_without_workspace_keeps_operation_owned_output():
         assert all(batch.handle._plan.workspace is None for batch in batches)
         assert all(call.args[7] is None for call in context._prepared.combine.call_args_list)
         assert [call.args[5] for call in context._prepared.combine.call_args_list] == [1, 2]
+
+
+def test_direct_workspace_avoids_completion_events_and_orders_api_transitions():
+    context = _workspace_context()
+    producer, other = Mock(device=context.device), Mock(device=context.device)
+    x = torch.zeros((3, 4), dtype=torch.bfloat16)
+    ids = torch.zeros((3, 2), dtype=torch.int64)
+    weights = torch.ones((3, 2), dtype=torch.float32)
+    empty = torch.empty
+
+    def cpu_empty(shape, **kwargs):
+        kwargs.pop("device", None)
+        return empty(shape, **kwargs)
+
+    with patch("ep_xpress.host_sm.torch.cuda.device", side_effect=lambda _: nullcontext()), \
+            patch("ep_xpress.host_sm.torch.cuda.stream", side_effect=lambda _: nullcontext()), \
+            patch("ep_xpress.host_sm.torch.cuda.is_current_stream_capturing", return_value=False), \
+            patch("ep_xpress.host_sm.torch.cuda.Event", side_effect=lambda: Mock()) as event, \
+            patch.object(torch.Tensor, "record_stream"), \
+            patch("ep_xpress.host_sm.torch.empty", side_effect=cpu_empty):
+        workspace = context.create_workspace(5, 3, fused_combine=True)
+        for _ in range(2):
+            batch = context.dispatch_on_stream(x, ids, weights, stream=producer,
+                                               workspace=workspace, fused_combine=True)
+            assert context.combine_on_stream(batch.hidden, batch.handle, stream=producer) is workspace.output
+            producer.wait_stream.reset_mock()
+        event.assert_not_called()
+        assert context._unwaited == 0
+        batch = context.dispatch_on_stream(x, ids, weights, stream=producer,
+                                           workspace=workspace, fused_combine=True)
+        producer.wait_stream.assert_not_called()
+        pending = context.combine_async(batch.hidden, batch.handle, stream=other)
+        context._work_stream.wait_stream.assert_any_call(producer)
+        context._work_stream.wait_stream.assert_any_call(other)
+        pending.wait(stream=other)
+        batch = context.dispatch_on_stream(x, ids, weights, stream=producer,
+                                           workspace=workspace, fused_combine=True)
+        producer.wait_stream.assert_any_call(context._work_stream)
+        producer.wait_stream.assert_any_call(other)
+        context.combine_on_stream(batch.hidden, batch.handle, stream=producer)
+        assert event.call_count == 1

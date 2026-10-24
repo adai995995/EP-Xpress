@@ -1906,3 +1906,72 @@ the core crosses between producer/consumer and transport streams. A future
 same-stream synchronous fast path could remove redundant event dependencies
 for that use case while retaining the general asynchronous API. Neither that
 fast path nor a specific causal CPU bottleneck is established by this trace.
+
+
+## Direct-stream eager decode submission
+
+The candidate adds `dispatch_on_stream` and `combine_on_stream` and selects
+these APIs for eligible SGLang decode with `EP_XPRESS_DECODE_SAME_STREAM=1`.
+Consecutive calls use the compute stream's ordering instead of creating a
+completion event and Pending object for each operation. Borrowed-workspace
+allocator lifetimes are recorded once per execution stream. External inputs
+retain lifetime recording. Stream changes, workspace consumers on other
+streams, mapped-storage cleanup and GPU READY/ACK dependencies remain ordered.
+Native mailbox combine inserts a transition event if its stream changes.
+The kernels' payload schedule, reduction arithmetic and routing are unchanged.
+
+The comparison uses the same eight GPUs, Qwen3-30B-A3B-Instruct-2507 BF16,
+SGLang v0.5.21, TP8/DP8/EP8, Triton experts, FlashInfer attention, eager execution,
+512-token inputs and 32-token outputs. Both backends disable GPU P2P/NVLink,
+custom all-reduce and FlashInfer all-reduce fusion. Available NVLink payload
+counters remain zero and NCCL logs verify SHM-only transport. Each batch size
+receives eight warmups and five timed repeats. New EP, NCCL and the EP async
+control are run sequentially on the same machine.
+
+Both EP paths use 32 allocated channels, 16-row prefill combine frames, two
+slots, vector prefill/dispatch expansion four, payload-bearing LAST frames,
+scalar decode mailbox reads, workspace reuse and fused decode combine. Auto
+selection uses one active channel at B1 and four at balanced B32. The only
+environment difference between the two EP runs is the same-stream switch.
+All ten input hashes match across runs. The NCCL comparisons pass the saved
+hardware, model, framework-setting and transport checks.
+
+Values are median [min, max]. TTFT is the last request's first-token latency,
+including admission and scheduling. Decode TPS is aggregate throughput in the
+steady decode window, not maximum sustained serving throughput.
+
+| Implementation | Batch | TTFT (ms) | Steady TPOT (ms) | Decode TPS |
+|---|---:|---:|---:|---:|
+| Default NCCL | 1 | 191.031 [188.442, 192.573] | 92.519 [91.858, 92.939] | 10.809 [10.760, 10.886] |
+| Default NCCL | 32 | 557.593 [551.518, 622.859] | 91.966 [91.030, 93.776] | 347.954 [341.240, 351.534] |
+| EP async control | 1 | 186.922 [183.131, 188.808] | 85.823 [84.247, 86.069] | 11.652 [11.619, 11.870] |
+| EP async control | 32 | 397.048 [375.067, 444.563] | 89.843 [89.318, 91.179] | 356.176 [350.957, 358.269] |
+| EP direct stream | 1 | 181.343 [179.145, 184.024] | 80.872 [79.739, 82.119] | 12.365 [12.178, 12.541] |
+| EP direct stream | 32 | 412.565 [371.392, 437.224] | 83.657 [83.515, 84.501] | 382.516 [378.693, 383.167] |
+
+Relative to the adjacent EP async control, direct-stream decode TPS improves
+6.12% at B1 and 7.40% at B32; TPOT falls 5.77% and 6.89%. The five-repeat
+observed decode ranges do not overlap. Relative to the fresh NCCL baseline,
+decode TPS improves 14.40% and 9.93%. These are separate comparisons: the
+NCCL advantage includes previously implemented EP-Xpress optimizations.
+
+B32 last-request TTFT is 3.91% higher than the async control, with overlapping
+ranges. Prefill retains its existing asynchronous path, so this experiment
+does not establish a prefill improvement. Overall batch completion time is
+2.688 s at B1 and 3.001 s at B32, versus NCCL's 3.058 s and 3.403 s.
+
+Twenty-four focused host API checks and two two-GPU stream/workspace cases
+pass. The GPU cases cover fused and non-fused combine, repeated workspace
+reuse, changes between direct and asynchronous APIs, different producer
+streams, delayed consumers on another stream, and close before final host
+synchronization. Four greedy full-model prompts match the adjacent EP control
+exactly in text, generated token IDs and sampled logprobs. These checks are
+bounded correctness evidence, not exhaustive numerical equivalence.
+
+Enable the measured candidate with
+`adapters/sglang/presets/host_sm_bf16_ep8_same_stream.sh`, or set
+`EP_XPRESS_DECODE_SAME_STREAM=1` on the same host-SM configuration. The generic
+adapter default stays off. CUDA Graph remains unsupported: replay-safe device
+epochs and graph-lifetime workspaces still need implementation and validation.
+Expert-layout fusion, residual epilogue fusion and independent Tx/Rx tuning
+are not part of this measured change.
