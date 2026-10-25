@@ -172,14 +172,6 @@ combine path has no all-peer terminal frames. General dispatch retains its
 terminal handshake; bounded single-frame dispatch folds completion into its
 only frame. Larger operations use the existing pair queues.
 
-Decode mailbox scheduling can be selected before loading the extension with
-`EP_XPRESS_DECODE_WARP_MODE`: `0` keeps the original CTA loop, `1` uses independent
-thread groups, and `2` splits Tx/drain and Rx/reduction into separate groups.
-Group widths adapt to GPU task counts without CPU routing reads. Required
-publication fences and final outgoing ACK drain remain. The default is `0`;
-these experimental schedulers have not established an end-to-end decode gain
-in the [full-model comparison](docs/model-performance.md#independent-decode-groups-and-txrx-specialization-2026-10-25).
-
 `Config(combine_frame_rows=N)` sets rows per pair-queue frame independently of
 channel count, for `N` in 1 through 256. The default `0` retains the original
 split of `chunk_bytes` across channels and peers. Larger fixed frames consume

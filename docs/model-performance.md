@@ -2190,6 +2190,15 @@ traces do not separate READY waiting from host payload latency or final ACK drai
 
 ## Independent decode groups and Tx/Rx specialization (2026-10-25)
 
+**Rollback status:** The experimental scheduling implementation from commit
+`1d28771` has been removed after the throughput regressions below. Runtime
+sources are restored exactly to `0c46b29`; `EP_XPRESS_DECODE_WARP_MODE` is no
+longer a supported setting. The following measurements and implementation
+descriptions are retained as historical evidence for that experimental commit,
+not as current API documentation. The rollback was verified by source equality;
+no new model benchmark was run for the rollback.
+
+
 Implemented an optional decode mailbox scheduler with independent thread groups
 and a split sending/receiving mode. `EP_XPRESS_DECODE_WARP_MODE=0` retains the
 original CTA loop; `1` uses independent groups with sequential send/receive/drain;

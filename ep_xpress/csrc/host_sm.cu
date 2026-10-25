@@ -146,11 +146,6 @@ static_assert(EP_XPRESS_COMBINE_LAST_DATA == 0 || EP_XPRESS_COMBINE_LAST_DATA ==
 static_assert(EP_XPRESS_DECODE_PEER_BATCH == 0 || EP_XPRESS_DECODE_PEER_BATCH == 1 ||
               EP_XPRESS_DECODE_PEER_BATCH == 2 || EP_XPRESS_DECODE_PEER_BATCH == 4,
               "unsupported decode peer batch");
-#ifndef EP_XPRESS_DECODE_WARP_MODE
-#define EP_XPRESS_DECODE_WARP_MODE 0
-#endif
-static_assert(EP_XPRESS_DECODE_WARP_MODE >= 0 && EP_XPRESS_DECODE_WARP_MODE <= 2,
-              "decode warp mode must be 0 (CTA), 1 (independent warps), or 2 (split Tx/Rx)");
 __device__ __forceinline__ void host_store128(void* address, uint4 value) {
   // Match the scalar volatile store policy. Each writer still executes a
   // system fence before the Tx leader publishes READY for the whole frame.
@@ -1477,8 +1472,8 @@ __device__ __forceinline__ int mailbox_health(TransportArgs a, uint64_t start,
 // BF16 rounding and the local addition match the scalar mailbox exactly.
 template <int PeerBatch>
 __device__ __forceinline__ void mailbox_reduce_vectors(
-    TransportArgs a, int original, int local_row, uint64_t readers, int worker, int workers) {
-  for (int h = worker; h < a.hidden / 8; h += workers) {
+    TransportArgs a, int original, int local_row, uint64_t readers) {
+  for (int h = threadIdx.x; h < a.hidden / 8; h += blockDim.x) {
     float sums[8] = {};
     for (int base = 0; base < a.world; base += PeerBatch) {
       uint4 payload[PeerBatch];
@@ -1613,7 +1608,7 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
     // Shifted contiguous tensor views and incomplete vectors stay scalar.
     if (a.hidden % 8 == 0 &&
         ((reinterpret_cast<uintptr_t>(a.input) | reinterpret_cast<uintptr_t>(a.output)) & 15) == 0) {
-      mailbox_reduce_vectors<EP_XPRESS_DECODE_PEER_BATCH>(a, original, local_row, readers, tid, kThreads);
+      mailbox_reduce_vectors<EP_XPRESS_DECODE_PEER_BATCH>(a, original, local_row, readers);
     } else
 #endif
     {
@@ -1679,229 +1674,6 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
   }
 }
 
-
-// Warp/group-local progress. Named barrier IDs are the first warp plus one,
-// so independently sized Tx/Rx groups never alias a barrier. IDs 1..8 are used;
-// barrier zero is reserved for the final CTA join. No mapped-host RMW is used.
-template <int Width>
-struct MailboxGroup {
-  static_assert(Width == 32 || Width == 64 || Width == 128 || Width == 256);
-  int lane, first_warp;
-  __device__ MailboxGroup() : lane(int(threadIdx.x) % Width),
-      first_warp((int(threadIdx.x) / Width) * (Width / 32)) {}
-  __device__ __forceinline__ void sync() const {
-    if constexpr (Width == 32) __syncwarp();
-    else asm volatile("barrier.sync %0, %1;" :: "r"(first_warp + 1), "n"(Width) : "memory");
-  }
-  __device__ __forceinline__ bool any(bool value) const {
-    if constexpr (Width == 32) return __any_sync(0xffffffff, value);
-    else {
-      int result;
-      // A named reduction barrier broadcasts the vote directly in registers;
-      // no shared scratch or second barrier is needed. Non-aligned form allows
-      // disjoint Tx/Rx groups to execute different barrier instructions.
-      asm volatile("{ .reg .pred p, q; setp.ne.u32 p, %1, 0; "
-                   "barrier.red.or.pred q, %2, %3, p; selp.u32 %0, 1, 0, q; }"
-          : "=r"(result) : "r"(int(value)), "r"(first_warp + 1), "n"(Width) : "memory");
-      return result;
-    }
-  }
-  __device__ __forceinline__ int health(TransportArgs a, uint64_t start, uint32_t iteration) const {
-    const int error = lane == 0 ? mailbox_health(a, start, iteration) : 0;
-    // Only a uniform stop predicate is needed here; the original error code
-    // remains in a.status for final publication and caller diagnostics.
-    return any(error != 0);
-  }
-};
-
-template <bool Drain, int Width>
-__device__ __forceinline__ void mailbox_warp_send(TransportArgs a, int worker,
-                                                 int workers, uint64_t start, MailboxGroup<Width> group) {
-  const int lane = group.lane, channel = blockIdx.x;
-  int error = group.health(a, start, 1);
-  for (int peer = 0; peer < a.world && !error; ++peer) {
-    if (peer == a.rank) continue;
-    const int n = a.owner_counts[peer];
-    if (lane == 0 && (n < 0 || n > a.input_rows)) fail(a.status, 1);
-    error = group.health(a, start, 1);
-    const int begin = int(int64_t(n) * channel / a.channels);
-    const int end = int(int64_t(n) * (channel + 1) / a.channels);
-    for (int index = begin + worker; index < end && !error; index += workers) {
-      const int row = a.owner_rows[int64_t(peer) * a.input_rows + index];
-      int token = 0;
-      if (row < 0 || row >= a.input_rows) {
-        if (lane == 0) fail(a.status, 1);
-      } else {
-        const int64_t original = a.input_inverse[int64_t(row) * 2 + 1];
-        token = int(original);
-        if (lane == 0) {
-          if (original < 0 || original >= a.mailbox_tokens) fail(a.status, 2);
-          if (a.diagnostics && a.input_inverse[int64_t(row) * 2] != peer) fail(a.status, 1);
-        }
-      }
-      error = group.health(a, start, 1);
-      if (error) break;
-      char* box = mailbox(a, a.rank, peer, token);
-      if constexpr (Drain) {
-        uint32_t iteration = 0;
-        int blocked;
-        do {
-          blocked = group.any(lane == 0 && acquire(control(box, 1)) != a.epoch);
-          error = group.health(a, start, iteration++);
-          if (blocked && !error) __nanosleep(64);
-        } while (blocked && !error);
-      } else {
-        const auto* source = reinterpret_cast<const uint32_t*>(a.input + int64_t(row) * a.hidden);
-        for (int h = lane; h < a.hidden / 2; h += Width)
-          host_store32(box + 32 + int64_t(h) * 4, source[h]);
-        // Every writing lane completes its payload before the leader's READY.
-        __threadfence_system();
-        group.sync();
-        if (lane == 0) {
-          if (a.diagnostics) host_store64(box + 16, a.identity);
-          release(control(box, 0), a.epoch);
-        }
-        group.sync();
-      }
-    }
-  }
-}
-
-template <int Width>
-__device__ __forceinline__ void mailbox_warp_receive(TransportArgs a, int worker,
-                                                    int workers, uint64_t start, MailboxGroup<Width> group) {
-  const int lane = group.lane, channel = blockIdx.x;
-  int error = group.health(a, start, 1);
-  const int first = int(int64_t(a.capacity) * channel / a.channels);
-  const int last = int(int64_t(a.capacity) * (channel + 1) / a.channels);
-  for (int original = first + worker; original < last && !error; original += workers) {
-    const uint64_t readers = uint64_t(a.expected_ranks[original]);
-    const int local_row = a.local_rows[original];
-    if (lane == 0 && ((readers >> a.world) || local_row < -1 || local_row >= a.input_rows ||
-        bool(readers & (uint64_t(1) << a.rank)) != (local_row >= 0))) fail(a.status, 1);
-    error = group.health(a, start, 1);
-    if (error) break;
-    uint32_t iteration = 0;
-    bool blocked;
-    do {
-      bool missing = false;
-      // Support the entire rank-mask range, not just one warp's 32 ranks.
-      for (int peer = lane; peer < a.world; peer += Width)
-        if (peer != a.rank && (readers & (uint64_t(1) << peer)))
-          missing |= acquire(control(mailbox(a, peer, a.rank, original), 0)) != a.epoch;
-      blocked = group.any(missing);
-      error = group.health(a, start, iteration++);
-      if (blocked && !error) __nanosleep(64);
-    } while (blocked && !error);
-    if (error) break;
-    if (a.diagnostics)
-      for (int peer = lane; peer < a.world; peer += Width)
-        if (peer != a.rank && (readers & (uint64_t(1) << peer)) &&
-            host_load64(mailbox(a, peer, a.rank, original) + 16) != a.identity) fail(a.status, 5);
-    group.sync();
-    error = group.health(a, start, 1);
-    if (error) break;
-#if EP_XPRESS_DECODE_PEER_BATCH > 0
-    if (a.hidden % 8 == 0 &&
-        ((reinterpret_cast<uintptr_t>(a.input) | reinterpret_cast<uintptr_t>(a.output)) & 15) == 0) {
-      mailbox_reduce_vectors<EP_XPRESS_DECODE_PEER_BATCH>(a, original, local_row, readers, lane, Width);
-    } else
-#endif
-    {
-      for (int h = lane; h < a.hidden / 2; h += Width) {
-        float sum0 = 0.0f, sum1 = 0.0f;
-        // Preserve rank order, intermediate BF16 rounding and local addition.
-        for (int peer = 0; peer < a.world; ++peer) {
-          if (peer == a.rank) continue;
-          uint32_t bits = 0;
-          if (readers & (uint64_t(1) << peer))
-            bits = host_load32(mailbox(a, peer, a.rank, original) + 32 + int64_t(h) * 4);
-          const auto packed = *reinterpret_cast<const __nv_bfloat162*>(&bits);
-          const float2 value = __bfloat1622float2(packed);
-          sum0 += value.x;
-          sum1 += value.y;
-        }
-        const at::BFloat16 rounded0(sum0), rounded1(sum1);
-        const int64_t offset = int64_t(local_row) * a.hidden + h * 2;
-        const float local0 = local_row >= 0 ? float(a.input[offset]) : 0.0f;
-        const float local1 = local_row >= 0 ? float(a.input[offset + 1]) : 0.0f;
-        a.output[int64_t(original) * a.hidden + h * 2] = at::BFloat16(float(rounded0) + local0);
-        a.output[int64_t(original) * a.hidden + h * 2 + 1] = at::BFloat16(float(rounded1) + local1);
-      }
-    }
-    // All lanes finish their final host read before any reader ACK is visible.
-    __threadfence_system();
-    group.sync();
-    for (int peer = lane; peer < a.world; peer += Width)
-      if (peer != a.rank && (readers & (uint64_t(1) << peer)))
-        release(control(mailbox(a, peer, a.rank, original), 1), a.epoch);
-    group.sync();
-  }
-}
-
-
-template <int Width, int Role, int Threads>
-__device__ __forceinline__ void mailbox_group_work(TransportArgs a, int role_thread,
-                                                  uint64_t start) {
-  const int worker = role_thread / Width;
-  constexpr int workers = Threads / Width;
-  MailboxGroup<Width> group;
-  if constexpr (Role != 1) mailbox_warp_send<false>(a, worker, workers, start, group);
-  if constexpr (Role != 0) mailbox_warp_receive(a, worker, workers, start, group);
-  if constexpr (Role != 1) mailbox_warp_send<true>(a, worker, workers, start, group);
-}
-
-template <int Role, int Threads>
-__device__ __forceinline__ void mailbox_choose_groups(TransportArgs a, int role_thread,
-                                                     uint64_t start) {
-  const int channel = blockIdx.x;
-  int tasks = Role == 0 ? 0 : int(int64_t(a.capacity) * (channel + 1) / a.channels) -
-                             int(int64_t(a.capacity) * channel / a.channels);
-  if constexpr (Role != 1) {
-    // Immutable GPU counts, never copied to CPU. Every thread in a role derives
-    // the same grouping, even with empty ranks or asymmetric source loads.
-    for (int peer = 0; peer < a.world; ++peer) {
-      if (peer == a.rank) continue;
-      const int n = a.owner_counts[peer];
-      tasks = max(tasks, int(int64_t(n) * (channel + 1) / a.channels) -
-                         int(int64_t(n) * channel / a.channels));
-    }
-  }
-  if constexpr (Threads == 256) {
-    if (tasks <= 1) { mailbox_group_work<256, Role, Threads>(a, role_thread, start); return; }
-  }
-  if (tasks <= Threads / 128) mailbox_group_work<128, Role, Threads>(a, role_thread, start);
-  else if (tasks <= Threads / 64) mailbox_group_work<64, Role, Threads>(a, role_thread, start);
-  else mailbox_group_work<32, Role, Threads>(a, role_thread, start);
-}
-
-__global__ void host_sm_warp_mailbox_combine_kernel(TransportArgs a) {
-  if (a.device_epoch) a.epoch = *a.device_epoch;
-  const uint64_t start = a.diagnostics ? ticks_ns() : 0;
-#if EP_XPRESS_DECODE_WARP_MODE == 2
-  // Co-resident Tx and Rx roles, with independently selected group widths.
-  if (threadIdx.x < kThreads / 2)
-    mailbox_choose_groups<0, kThreads / 2>(a, threadIdx.x, start);
-  else
-    mailbox_choose_groups<1, kThreads / 2>(a, threadIdx.x - kThreads / 2, start);
-#else
-  // Ablation: independent groups, each with sequential Tx/Rx/ACK phases.
-  mailbox_choose_groups<2, kThreads>(a, threadIdx.x, start);
-#endif
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    const int error = read_status(a.status);
-    if (error) {
-      auto* own = reinterpret_cast<uint64_t*>(a.mailbox_pointers[a.rank]);
-      release(own, uint64_t(error));
-      if (a.fatal_errors || acquire(own + 2)) {
-        __threadfence_system();
-        asm volatile("trap;");
-      }
-    }
-  }
-}
-
 int max_channels_current_device(int world = 1) {
   // Capability is fixed for this extension/device. Validate direct native
   // calls without repeating attribute and occupancy queries on every layer.
@@ -1917,7 +1689,7 @@ int max_channels_current_device(int world = 1) {
   if (!cooperative) { capacities.emplace(key, 0); return 0; }
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
   int a, b, c, diagnostic, selective_a, selective_b, mailbox_capacity, warp_pair_capacity;
-  int single_a, single_b, single_profile_a, single_profile_b, warp_mailbox_capacity;
+  int single_a, single_b, single_profile_a, single_profile_b;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&a, host_sm_transport_kernel<false, int32_t>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&b, host_sm_transport_kernel<false, int64_t>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&c, host_sm_pair_combine_kernel<false>, kThreads, 0));
@@ -1930,8 +1702,7 @@ int max_channels_current_device(int world = 1) {
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&single_b, host_sm_transport_kernel<false, int64_t, false, false, true>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&single_profile_a, host_sm_transport_kernel<false, int32_t, true, false, true>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&single_profile_b, host_sm_transport_kernel<false, int64_t, true, false, true>, kThreads, 0));
-  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&warp_mailbox_capacity, host_sm_warp_mailbox_combine_kernel, kThreads, 0));
-  const int capacity = std::min({32, sms * std::min({a, b, selective_a, selective_b, mailbox_capacity, warp_mailbox_capacity, single_a, single_b, single_profile_a, single_profile_b}),
+  const int capacity = std::min({32, sms * std::min({a, b, selective_a, selective_b, mailbox_capacity, single_a, single_b, single_profile_a, single_profile_b}),
                                  sms * std::min({c, diagnostic, warp_pair_capacity}) / world});
   capacities.emplace(key, capacity);
   return capacity;
@@ -2292,22 +2063,11 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
     // No capacity clear/finalizer or world-by-token scratch for this path.
-#if EP_XPRESS_DECODE_WARP_MODE > 0
-    auto kernel = host_sm_warp_mailbox_combine_kernel;
-#else
-    auto kernel = host_sm_mailbox_combine_kernel;
-#endif
-    if (a.channels == 1) {
-#if EP_XPRESS_DECODE_WARP_MODE > 0
-      host_sm_warp_mailbox_combine_kernel<<<1, kThreads, 0, stream>>>(a);
-#else
-      host_sm_mailbox_combine_kernel<<<1, kThreads, 0, stream>>>(a);
-#endif
-    }
+    if (a.channels == 1) host_sm_mailbox_combine_kernel<<<1, kThreads, 0, stream>>>(a);
     else {
       void* parameters[] = {&a};
       C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
-          reinterpret_cast<const void*>(kernel),
+          reinterpret_cast<const void*>(host_sm_mailbox_combine_kernel),
           dim3(a.channels), dim3(kThreads), parameters, 0, stream));
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
