@@ -3595,3 +3595,116 @@ parallelizing record writes, one focused vector/dynamic-route test passed in
 including token IDs and 29 common-prefix logprobs. NCCL matched their generated
 text; this is a limited output sanity check, not exhaustive numerical validation.
 Full-model performance was tested with each feature independently, not both on.
+
+
+## Balanced decode sends, independent TX/RX and deferred reclamation (2026-10-25)
+
+The first ablation matrix below uses the same runtime source. The original EP schedule remains the
+control; the new schedules are independently selectable build-time options.
+The unchanged baseline is SGLang's default NCCL backend.
+
+The matched configuration is eight H20D GPUs, Qwen3-30B-A3B-Instruct-2507 BF16,
+SGLang v0.5.21, TP=DP=EP8, Triton experts and FlashInfer, eager prefill and full
+decode CUDA Graphs with local buckets 1/2/4/8. Each case uses 512 input and 32
+output tokens, eight warmups and five measured repeats, with greedy sampling
+and cache flush. B1 and B32 have identical timed prompt hashes across variants.
+Profiling is disabled during all measurements; startup and capture are excluded.
+
+Every run verified no external GPU process, producer NUMA placement, NCCL SHM
+transport without P2P/NET/NVLS, and zero delta for all available NVLink counters.
+The image, model configuration, framework source and runtime source manifest
+match. All EP launch arguments match; only the listed build settings differ.
+Receive width remains 256 threads. Requested channel capacity remains 32, with
+the existing global-capacity rule selecting active channels. No batch-specific
+route or token behavior is hardcoded.
+
+The balanced variant partitions the concatenated live remote owner lists. The
+split variant adds a full resident TX CTA for each unchanged RX CTA. Deferred
+reclamation removes outgoing end-of-operation ACK drain, but acquires the last
+actual READY generation and waits for its ACK before overwriting that mailbox.
+Publication batch is eight unless explicitly shown as four. These changes
+affect bounded decode combine, not the prefill pair queues or dispatch.
+
+TTFT is the median of repeat-level request-mean TTFT. Decode TPS is aggregate
+steady-state output throughput after prefill. Ranges are observed extrema, not
+confidence intervals.
+
+| Implementation | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| Default NCCL | 101.816 | 155.068 | 406.694 | 3564.449 |
+| Original EP | 96.868 | 158.434 | 257.568 | 3113.953 |
+| Balanced sends | 96.519 | 158.403 | 320.521 | 3142.826 |
+| Balanced + independent TX/RX | 96.717 | 159.067 | 282.609 | 3129.544 |
+| Balanced + independent TX/RX + deferred reclaim | 97.152 | 158.757 | 315.151 | 3159.860 |
+| Deferred reclaim, publish batch 4 | 97.265 | 160.073 | 257.329 | 3055.239 |
+
+| Implementation | B1 TTFT range | B1 TPS range | B32 TTFT range | B32 TPS range |
+| --- | ---: | ---: | ---: | ---: |
+| Default NCCL | 101.422-105.705 | 154.334-155.747 | 403.610-492.670 | 3525.681-3602.254 |
+| Original EP | 96.444-97.473 | 157.563-158.884 | 256.973-342.355 | 3091.203-3166.656 |
+| Balanced sends | 94.973-99.567 | 158.068-159.182 | 283.610-322.073 | 3127.974-3159.777 |
+| Balanced + independent TX/RX | 95.718-97.848 | 157.317-159.238 | 256.481-322.102 | 3106.485-3135.428 |
+| Balanced + independent TX/RX + deferred reclaim | 97.075-98.819 | 156.321-159.878 | 257.446-341.976 | 3100.106-3161.380 |
+| Deferred reclaim, publish batch 4 | 96.590-104.909 | 158.365-163.240 | 257.142-257.815 | 3031.810-3072.709 |
+
+### Final GPU generation cache and control repeat
+
+The final deferred variant retains the last published generation per mailbox
+in a producer-owned GPU array, initialized once and retained across Graph
+replays. It needs one host ACK acquire at reuse, without a dependent host READY
+read. Unused slots retain zero; absent routes retain the last actual generation.
+The extra storage is eight bytes per configured destination/token slot. There
+is no per-layer allocation, CPU planning or host rendezvous.
+
+Only the CUDA source changed from the first matrix: runtime additions are gated
+by deferred reclamation, and the remaining changes are comments. The opt-in
+cache is validated below together with the unchanged flag-off EP schedule,
+using the same final runtime source, image, model, prompts and configuration.
+All runtime source hashes were checked against the measured manifest. The NCCL
+reference above remains unchanged.
+
+| Implementation | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| GPU generation cache + balanced/split/deferred | 96.577 | 159.609 | 293.116 | 3162.134 |
+| Original EP repeat | 96.727 | 158.453 | 309.046 | 3138.170 |
+
+| Implementation | B1 TTFT range | B1 TPS range | B32 TTFT range | B32 TPS range |
+| --- | ---: | ---: | ---: | ---: |
+| GPU generation cache + balanced/split/deferred | 95.850-97.795 | 159.138-160.393 | 257.219-344.603 | 3137.274-3173.252 |
+| Original EP repeat | 96.081-99.049 | 158.339-159.457 | 257.360-342.949 | 3113.496-3153.926 |
+
+### Outcome and limits
+
+The final B32 Decode TPS is 1.55% above the first EP control
+and 0.76% above the repeated control, but 11.29% below NCCL.
+The first control's repeat range overlaps the final candidate. This does not
+establish a robust throughput advantage; no scheduling option is promoted to
+the default. Publication batch four regresses B32 in this measurement, so it
+is not selected. The generation cache barely changes the previous deferred
+variant's median, despite removing one dependent host control read.
+
+The sending partition now has a provable at-most-one-row difference between
+channels, outgoing ACK drain no longer gates local completion in deferred mode,
+and TX/RX can run independently without reducing receiver width. These changes
+remove specific structural limitations, but this end-to-end comparison does
+not show that they dominate total latency. No new fine-grained model profiling
+was collected, so attributing the remaining gap to payload bandwidth, READY
+waits, dispatch or expert work would require a separate measurement. TTFT varies
+substantially; this decode-focused change does not establish a causal prefill
+improvement. No batch-specific channel rule was introduced to fit these two
+benchmarks. Existing CTA width and tile sizes are retained.
+
+Two initial eight-GPU dynamic-route checks passed in 79.76 s, covering vector
+and scalar hidden widths, int32/int64 routes, empty/skewed ranks, changing
+channel widths and Graph/eager reuse. The final runtime passed three focused
+checks in 84.06 s: eight-GPU dynamic Graph routing, a direct three-GPU mailbox
+reuse test with rotating slow readers and no dispatch/barrier between calls,
+and Graph profiling reset/overflow with both roles. The direct test changes
+routes, skips generations, includes all-empty operations, changes active
+channels and requires exact outputs before collective close. A strengthened
+one-way test also passed in 65.94 s: two ranks only send while the destination
+is deliberately delayed, allowing the producers to attempt next-generation
+reuse before that reader completes. The runtime source was unchanged for this
+additional check. Every EP model variant matched the original on four short greedy prompts and 29 common-prefix
+logprobs. These are bounded correctness checks, not exhaustive proofs of
+numerical equivalence or resilience to failed workers.

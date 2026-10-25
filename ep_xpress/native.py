@@ -82,6 +82,17 @@ def load(*, verbose: bool = False):
         decode_ack_batch = os.environ.get("EP_XPRESS_DECODE_ACK_BATCH", "1")
         if decode_ack_batch not in {"1", "2", "4", "8"}:
             raise ValueError("EP_XPRESS_DECODE_ACK_BATCH must be 1, 2, 4, or 8")
+        combine_options = {}
+        for option in ("BALANCED_SEND", "SPLIT_TX_RX", "DEFER_RECLAIM"):
+            key = "EP_XPRESS_DECODE_" + option
+            value = os.environ.get(key, "0")
+            if value not in {"0", "1"}:
+                raise ValueError(key + " must be 0 or 1")
+            combine_options[option] = value
+        if any(value == "1" for value in combine_options.values()) and decode_descriptor_batch != "32":
+            raise ValueError("decode scheduling options require EP_XPRESS_DECODE_DESCRIPTOR_BATCH=32")
+        if combine_options["DEFER_RECLAIM"] == "1" and combine_options["SPLIT_TX_RX"] != "1":
+            raise ValueError("deferred reclamation requires independent TX/RX progress")
         cuda_flags = ["-O3", "-lineinfo", f"-DEP_XPRESS_PREFILL_READ_UNROLL={read_unroll}",
                       f"-DEP_XPRESS_PREFILL_WRITE_UNROLL={write_unroll}",
                       f"-DEP_XPRESS_DISPATCH_READ_UNROLL={dispatch_read_unroll}",
@@ -95,6 +106,8 @@ def load(*, verbose: bool = False):
                       f"-DEP_XPRESS_DECODE_DISPATCH_PIPELINE={decode_dispatch_pipeline}",
                       f"-DEP_XPRESS_DECODE_CONTROL_RECORDS={decode_control_records}",
                       f"-DEP_XPRESS_DECODE_ACK_BATCH={decode_ack_batch}"]
+        cuda_flags.extend(f"-DEP_XPRESS_DECODE_{key}={value}"
+                          for key, value in combine_options.items())
         digest = hashlib.sha256()
         for source in sources + sorted(source_dir.glob("*.h")):
             digest.update(source.read_bytes())

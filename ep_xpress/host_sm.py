@@ -511,8 +511,10 @@ class HostSMContext(Context):
                 raise ValueError("decode profile stage must be dispatch or combine")
             fields = list(native.load().host_sm_decode_profile_fields(stage == "dispatch"))
             with torch.cuda.stream(self._work_stream):
+                roles = 2 if (stage == "combine" and
+                              os.environ.get("EP_XPRESS_DECODE_SPLIT_TX_RX", "0") == "1") else 1
                 storage = torch.zeros((max_samples_per_channel + 1,
-                                       self.effective_channels, len(fields)),
+                                       self.effective_channels * roles, len(fields)),
                                       dtype=torch.int64, device=self.device)
                 self._prepared.prepare_decode_profile(storage, stage == "dispatch")
             self._work_stream.synchronize()
@@ -575,7 +577,7 @@ class HostSMContext(Context):
             else:
                 phases = ["send_metadata_ns", "send_payload_ns", "publish_fence_ready_ns",
                           "receive_metadata_select_ns", "peer_poll_ns", "receive_payload_ns",
-                          "ack_publish_ns", "idle_final_drain_ns", "other_control_ns"]
+                          "ack_publish_ns", "idle_final_drain_ns", "idle_wait_credit_ns", "other_control_ns"]
             return {
                 "schema_version": 2, "stage": state["stage"],
                 "rank": self.rank, "fields": state["fields"],

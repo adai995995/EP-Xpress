@@ -180,7 +180,9 @@ not a universal speedup. Set it before extension loading or worker startup.
 `EP_XPRESS_DECODE_DESCRIPTOR_BATCH=32` additionally prepares outgoing row and
 mailbox descriptors in bounded GPU tiles and checks each tile's outgoing ACKs
 in parallel. Default `0` retains the original descriptor/check schedule. Both
-paths retain full-CTA reception and wait for every actual reader before return.
+paths retain full-CTA reception and, by default, wait for every actual reader
+before return. The separate deferred-reclamation experiment below changes the
+slot-lifetime rule.
 Routes are rebuilt from current GPU owner lists on each invocation; the tile
 size is independent of token count and does not limit supported routing shapes.
 
@@ -477,3 +479,13 @@ as receive metadata. Dispatch `idle_*` durations overlap its phase view; do not
 add them to phase totals. Unlike combine, a prepared dispatch diagnostic kernel
 still executes its diagnostic barriers while recording is disabled. Always use
 a context without prepared diagnostics for performance comparisons.
+
+Additional bounded-decode scheduling experiments (all default off):
+`EP_XPRESS_DECODE_BALANCED_SEND=1` balances the concatenated live remote send
+rows across channels; `EP_XPRESS_DECODE_SPLIT_TX_RX=1` uses independently resident
+full CTAs for send and receive; `EP_XPRESS_DECODE_DEFER_RECLAIM=1` waits for slot
+credit at reuse instead of draining outgoing ACKs before returning the result.
+All require `EP_XPRESS_DECODE_DESCRIPTOR_BATCH=32`; deferred reclamation also
+requires split TX/RX. Healthy collective context close remains mandatory for
+mapped-memory lifetime. See [the protocol and progress contract](docs/architecture.md#bounded-decode-combine-balanced-sends-and-independent-progress)
+and [measured model results](docs/model-performance.md) before selecting a setting.

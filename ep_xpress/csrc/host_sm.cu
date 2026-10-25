@@ -1,5 +1,5 @@
 // GPU-initiated mapped-host transport. No host atomics, peer pointers or CE
-// payload copies. Each all-resident channel CTA progresses both directions.
+// payload copies. Cooperative grids keep all required progress roles resident.
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
@@ -178,11 +178,27 @@ static_assert(EP_XPRESS_DECODE_CONTROL_RECORDS == 0 || EP_XPRESS_DECODE_CONTROL_
 static_assert(EP_XPRESS_DECODE_ACK_BATCH == 1 || EP_XPRESS_DECODE_ACK_BATCH == 2 ||
               EP_XPRESS_DECODE_ACK_BATCH == 4 || EP_XPRESS_DECODE_ACK_BATCH == 8,
               "unsupported decode ACK batch");
+#ifndef EP_XPRESS_DECODE_BALANCED_SEND
+#define EP_XPRESS_DECODE_BALANCED_SEND 0
+#endif
+#ifndef EP_XPRESS_DECODE_SPLIT_TX_RX
+#define EP_XPRESS_DECODE_SPLIT_TX_RX 0
+#endif
+#ifndef EP_XPRESS_DECODE_DEFER_RECLAIM
+#define EP_XPRESS_DECODE_DEFER_RECLAIM 0
+#endif
+static_assert(!EP_XPRESS_DECODE_DEFER_RECLAIM || EP_XPRESS_DECODE_SPLIT_TX_RX,
+              "deferred credit requires independent receive progress");
+constexpr int kMailboxRoles = EP_XPRESS_DECODE_SPLIT_TX_RX ? 2 : 1;
+
 #ifndef EP_XPRESS_DECODE_DESCRIPTOR_BATCH
 #define EP_XPRESS_DECODE_DESCRIPTOR_BATCH 0
 #endif
 static_assert(EP_XPRESS_DECODE_DESCRIPTOR_BATCH == 0 || EP_XPRESS_DECODE_DESCRIPTOR_BATCH == 32,
               "unsupported decode descriptor batch");
+static_assert(!(EP_XPRESS_DECODE_BALANCED_SEND || EP_XPRESS_DECODE_SPLIT_TX_RX ||
+                EP_XPRESS_DECODE_DEFER_RECLAIM) || EP_XPRESS_DECODE_DESCRIPTOR_BATCH == 32,
+              "decode schedules require bounded parallel descriptors");
 #ifndef EP_XPRESS_DECODE_DISPATCH_INDEXED
 #define EP_XPRESS_DECODE_DISPATCH_INDEXED 0
 #endif
@@ -326,6 +342,9 @@ struct TransportArgs {
   const int32_t* expert_local;
   const int64_t* pointers;
   const int64_t* mailbox_pointers;
+#if EP_XPRESS_DECODE_DEFER_RECLAIM
+  uint64_t* mailbox_sent_epochs;
+#endif
   int64_t* expected_ranks;
   int32_t* local_rows;
   int mailbox_tokens;
@@ -1778,7 +1797,10 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
   if (a.device_epoch) a.epoch = *a.device_epoch;
   __shared__ int begin, end, row, token, error, local_row, blocked;
   __shared__ uint64_t readers;
-  const int tid = threadIdx.x, channel = blockIdx.x;
+  const int tid = threadIdx.x, channel = blockIdx.x % a.channels;
+  const bool send_role = !EP_XPRESS_DECODE_SPLIT_TX_RX || blockIdx.x < a.channels;
+  const bool receive_role = !EP_XPRESS_DECODE_SPLIT_TX_RX || blockIdx.x >= a.channels;
+  const int profile_channel = blockIdx.x;
 #if EP_XPRESS_DECODE_READY_PREFETCH
   extern __shared__ uint4 prefetch_storage[];
   auto* prefetched = reinterpret_cast<uint32_t*>(prefetch_storage);
@@ -1794,7 +1816,7 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
     if (tid == 0) {
       sample = -1;
       if (a.decode_profile[1]) {
-        auto* header = a.decode_profile + int64_t(channel) * stride;
+        auto* header = a.decode_profile + int64_t(profile_channel) * stride;
         const int64_t index = header[0]++;
         if (index < a.decode_profile_samples) sample = int(index);
         else ++header[2];
@@ -1819,14 +1841,24 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
   __shared__ int64_t send_offsets[kMaxRanks + 1];
   __shared__ int send_rows[descriptor_batch];
   __shared__ char* send_boxes[descriptor_batch];
+#if EP_XPRESS_DECODE_DEFER_RECLAIM
+  __shared__ int send_slots[descriptor_batch];
+#endif
   phase(PSendMetadata);
   if (tid < a.world) {
     int n = tid == a.rank ? 0 : a.owner_counts[tid];
     if (n < 0 || n > a.input_rows) { fail(a.status, 1); n = 0; }
+#if EP_XPRESS_DECODE_BALANCED_SEND
+    // Flatten actual rows across all remote peers before partitioning. Per-peer
+    // remainders must not accumulate on the same channel. No route is cached.
+    send_begins[tid] = 0;
+    send_offsets[tid + 1] = n;
+#else
     const int first_send = int(int64_t(n) * channel / a.channels);
     const int last_send = int(int64_t(n) * (channel + 1) / a.channels);
     send_begins[tid] = first_send;
     send_offsets[tid + 1] = last_send - first_send;
+#endif
   }
   __syncthreads();
   if (tid == 0) {
@@ -1836,10 +1868,17 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
     error = read_status(a.status);
   }
   __syncthreads();
-  const int64_t send_count = send_offsets[a.world];
+#if EP_XPRESS_DECODE_BALANCED_SEND
+  const int64_t send_start = send_offsets[a.world] * channel / a.channels;
+  const int64_t send_end = send_offsets[a.world] * (channel + 1) / a.channels;
+  const int64_t send_count = send_role ? send_end - send_start : 0;
+#else
+  const int64_t send_start = 0;
+  const int64_t send_count = send_role ? send_offsets[a.world] : 0;
+#endif
   const auto prepare_descriptors = [&](int64_t base, int count) {
     if (tid < count) {
-      const int64_t item = base + tid;
+      const int64_t item = send_start + base + tid;
       int peer = 0;
       while (peer + 1 < a.world && item >= send_offsets[peer + 1]) ++peer;
       const int index = send_begins[peer] + int(item - send_offsets[peer]);
@@ -1851,6 +1890,9 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
         else {
           send_rows[tid] = r;
           send_boxes[tid] = mailbox(a, a.rank, peer, int(original));
+#if EP_XPRESS_DECODE_DEFER_RECLAIM
+          send_slots[tid] = peer * a.mailbox_tokens + int(original);
+#endif
         }
         if (a.diagnostics && a.input_inverse[int64_t(r) * 2] != peer) fail(a.status, 1);
       }
@@ -1866,6 +1908,28 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
     if (error) break;
     for (int batch = 0; batch < count; batch += EP_XPRESS_DECODE_PUBLISH_BATCH) {
       const int n = min(EP_XPRESS_DECODE_PUBLISH_BATCH, count - batch);
+#if EP_XPRESS_DECODE_DEFER_RECLAIM
+      // The sole producer retains each mailbox's last publication generation
+      // in HBM. This avoids a dependent host READY read before checking ACK.
+      // Skipped routes keep their last actual generation, not epoch - 1.
+      // Independent resident RX CTAs can finish reads while TX awaits credit.
+      phase(PIdleCredit);
+      char* credit_box = tid < n ? send_boxes[batch + tid] : nullptr;
+      const uint64_t previous = tid < n ? a.mailbox_sent_epochs[send_slots[batch + tid]] : 0;
+      bool pending = tid < n && previous != 0;
+      uint32_t credit_iteration = 0;
+      do {
+        if (pending) pending = acquire(control(credit_box, 1)) != previous;
+        const int waiting = __syncthreads_or(pending);
+        if (tid == 0) {
+          blocked = waiting;
+          error = mailbox_health(a, start, credit_iteration++);
+        }
+        __syncthreads();
+        if (blocked && !error) __nanosleep(64);
+      } while (blocked && !error);
+      if (error) break;
+#endif
       phase(PSendPayload);
       for (int j = 0; j < n; ++j) {
         char* box = send_boxes[batch + j];
@@ -1886,6 +1950,11 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
         char* box = send_boxes[batch + tid];
         if (a.diagnostics) host_store64(box + 16, a.identity);
         release(control(box, 0), a.epoch);
+#if EP_XPRESS_DECODE_DEFER_RECLAIM
+        // Serialized invocations order this local cache before future reuse;
+        // it is producer-only state, never a replacement for the remote ACK.
+        a.mailbox_sent_epochs[send_slots[batch + tid]] = a.epoch;
+#endif
       }
       // Finish publication before descriptor storage can be reused. This also
       // flushes a partial batch at the actual last send, including sparse routes.
@@ -1997,7 +2066,7 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
   const int last = int(int64_t(a.capacity) * (channel + 1) / a.channels);
   __shared__ uint64_t ack_readers[EP_XPRESS_DECODE_ACK_BATCH];
   int ack_count = 0, ack_first = first;
-  for (int original = first; original < last && !error; ++original) {
+  for (int original = first; receive_role && original < last && !error; ++original) {
     phase(PReceiveMetadata);
     if (tid == 0) {
       readers = uint64_t(a.expected_ranks[original]);
@@ -2183,6 +2252,7 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
   }
 
   phase(POther);
+#if !EP_XPRESS_DECODE_DEFER_RECLAIM
 #if EP_XPRESS_DECODE_DESCRIPTOR_BATCH > 0
   // Reconstruct one bounded descriptor tile at a time; no capacity-sized
   // allocation or stale route cache is needed. Each lane retires its own ACK
@@ -2254,6 +2324,7 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
     }
   }
 #endif
+#endif  // !EP_XPRESS_DECODE_DEFER_RECLAIM
   if constexpr (Profile) {
     if (sample >= 0) {
       __syncthreads();
@@ -2264,7 +2335,7 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
         profile.values[PElapsed] = now - profile.values[PBegin];
         profile.values[PStatus] = error;
         auto* out = a.decode_profile +
-            (int64_t(sample + 1) * a.decode_profile_channels + channel) * stride;
+            (int64_t(sample + 1) * a.decode_profile_channels + profile_channel) * stride;
         for (int i = 0; i < PFieldCount; ++i) out[i] = profile.values[i];
         out[PFieldCount] = a.epoch;
         out[PFieldCount + 1] = a.capacity;
@@ -2322,7 +2393,7 @@ int max_channels_current_device(int world = 1) {
       host_sm_dispatch_pipeline_kernel<int64_t>, kDispatchPipelineThreads, 0));
   pipeline_capacity = sms * std::min(pipeline_i32, pipeline_i64);
 #endif
-  const int capacity = std::min({32, pipeline_capacity, sms * std::min({a, b, selective_a, selective_b, mailbox_capacity, single_a, single_b, single_profile_a, single_profile_b}),
+  const int capacity = std::min({32, pipeline_capacity, sms * mailbox_capacity / kMailboxRoles, sms * std::min({a, b, selective_a, selective_b, mailbox_capacity, single_a, single_b, single_profile_a, single_profile_b}),
                                  sms * std::min({c, diagnostic, warp_pair_capacity}) / world});
   capacities.emplace(key, capacity);
   return capacity;
@@ -2513,10 +2584,22 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
   TORCH_CHECK(!decode_single_frame || mailbox_tokens > 0, "single-frame dispatch requires a decode mailbox bound");
   impl_->combine_warp_specialization = combine_warp_specialization;
   impl_->decode_single_frame = decode_single_frame;
+#if EP_XPRESS_DECODE_DEFER_RECLAIM
+  torch::Tensor mailbox_sent_epochs;
+  if (mailbox_pointers.has_value()) {
+    mailbox_sent_epochs = torch::zeros({world * mailbox_tokens},
+        torch::TensorOptions().device(device).dtype(torch::kInt64));
+    impl_->retained.push_back(mailbox_sent_epochs);
+  }
+#endif
   for (bool combine : {false, true}) {
     auto& a = combine ? impl_->combine : impl_->dispatch;
     a.pointers = (combine ? combine_pointers : dispatch_pointers).data_ptr<int64_t>();
     a.mailbox_pointers = mailbox_pointers.has_value() ? mailbox_pointers->data_ptr<int64_t>() : nullptr;
+#if EP_XPRESS_DECODE_DEFER_RECLAIM
+    a.mailbox_sent_epochs = mailbox_sent_epochs.defined()
+        ? reinterpret_cast<uint64_t*>(mailbox_sent_epochs.data_ptr<int64_t>()) : nullptr;
+#endif
     a.mailbox_tokens = int(mailbox_tokens);
     a.mailbox_stride = align_up(32 + hidden * 2, 128);
     a.expert_rank = expert_rank.data_ptr<int32_t>();
@@ -2543,7 +2626,7 @@ void PreparedHostSM::prepare_decode_profile(torch::Tensor storage, bool dispatch
               "prepare decode profiling once before any submission or graph capture");
   tensor_check(storage, at::kLong, 3, impl_->device, "decode profile");
   TORCH_CHECK(storage.size(0) >= 2 && storage.size(0) <= 4097 &&
-              storage.size(1) == impl_->combine.channels && storage.size(2) == (pipeline_profile ? DFieldCount : PFieldCount) + 4,
+              storage.size(1) == impl_->combine.channels * (dispatch ? 1 : kMailboxRoles) && storage.size(2) == (pipeline_profile ? DFieldCount : PFieldCount) + 4,
               "invalid decode profile shape");
   int resident = 0, sms = 0;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -2557,7 +2640,7 @@ void PreparedHostSM::prepare_decode_profile(torch::Tensor storage, bool dispatch
     resident = std::min(resident, resident64);
   }
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, impl_->device.index()));
-  TORCH_CHECK(impl_->combine.channels <= resident * sms, "diagnostic grid exceeds resident capacity");
+  TORCH_CHECK(impl_->combine.channels * (dispatch ? 1 : kMailboxRoles) <= resident * sms, "diagnostic grid exceeds resident capacity");
   impl_->retained.push_back(storage);
   args.decode_profile = storage.data_ptr<int64_t>();
   args.decode_profile_samples = int(storage.size(0) - 1);
@@ -2748,9 +2831,9 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
   a.epoch = uint64_t(epoch); a.identity = uint64_t(identity);
   if (fused) {
     if (!a.device_epoch && impl_->last_mailbox_epoch && impl_->mailbox_stream != stream) {
-      // Mailbox reuse requires the previous outgoing ACK drain. Preserve this
-      // dependency for native callers too; consecutive same-stream calls do
-      // not allocate or record an event.
+      // Serialize publication and local-result lifetimes across streams.
+      // Deferred mode checks remote slot credit before reuse; the default
+      // drains outgoing ACKs. Same-stream calls need no extra event.
       at::cuda::CUDAEvent transition;
       transition.record(c10::cuda::getStreamFromExternal(impl_->mailbox_stream, device.index()));
       transition.block(c10::cuda::getCurrentCUDAStream(device.index()));
@@ -2764,7 +2847,8 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
     const int shared_bytes = mailbox_prefetch_bytes(a.world, a.hidden);
     const auto kernel = a.decode_profile ? host_sm_mailbox_combine_kernel<true>
                                          : host_sm_mailbox_combine_kernel<false>;
-    if (a.channels == 1) {
+    const int blocks = a.channels * kMailboxRoles;
+    if (blocks == 1) {
       void* arguments[] = {&a};
       C10_CUDA_CHECK(cudaLaunchKernel(reinterpret_cast<const void*>(kernel),
           dim3(1), dim3(kThreads), arguments, shared_bytes, stream));
@@ -2772,7 +2856,7 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
     else {
       void* arguments[] = {&a};
       C10_CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<const void*>(kernel),
-          dim3(a.channels), dim3(kThreads), arguments, shared_bytes, stream));
+          dim3(blocks), dim3(kThreads), arguments, shared_bytes, stream));
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     impl_->last_mailbox_epoch = uint64_t(epoch);

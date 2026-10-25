@@ -1035,3 +1035,66 @@ than one local output row. With the adapter's balanced eight-rank decode rule
 channels: every nonempty CTA flushes a one-row tail even with ACK_BATCH=4.
 Changing that would require a different scheduling/completion design. The flag
 intentionally does not reduce the receiver grid or add a cross-CTA barrier.
+
+### Bounded decode combine: balanced sends and independent progress
+
+Three build-time experiments require `EP_XPRESS_DECODE_DESCRIPTOR_BATCH=32`:
+
+- `EP_XPRESS_DECODE_BALANCED_SEND=1` prefixes the live GPU owner counts across
+  all remote destinations, then divides the concatenated row range across
+  channels. Per-channel row counts differ by at most one. A descriptor maps a
+  global row ordinal back to its peer and owner-list index. Unequal/empty peers
+  and changing token counts use the same rule; no CPU planning or route cache
+  is introduced. Receive token ownership is unchanged.
+- `EP_XPRESS_DECODE_SPLIT_TX_RX=1` launches two full 256-thread CTAs per logical
+  channel: one sends, the other receives and reduces. Unlike splitting a CTA's
+  warps, this retains all receiver lanes. The cooperative launch and occupancy
+  bound account for both roles, including the single-logical-channel case.
+  There is no grid barrier between sending and receiving. Each rank still
+  completes its local sends and receives before the kernel returns.
+- `EP_XPRESS_DECODE_DEFER_RECLAIM=1` requires independent TX/RX. Outgoing ACKs
+  no longer gate the end of combine. Before overwriting a mailbox, the sender
+  reads that mailbox's last published generation from producer-owned GPU state
+  and waits for its matching host ACK. The generation cache is initialized once
+  with the arenas and updated after each publication, avoiding a host READY
+  read on reuse. This uses the last actual publication, not `epoch - 1`: dynamic
+  routing can leave a mailbox unused for many operations. All pending checks in
+  a bounded publication batch progress concurrently. Initial READY/ACK are zero.
+
+The deferred variant retains the single-bank mailbox layout. It separates
+completion of the local result from reclamation of outgoing host slots; it does
+not create an extra copy or imply unlimited buffering. A slow reader can still
+stall reuse of its specific mailbox. Only the producer writes READY/payload;
+only the designated destination writes ACK. Distinct CTAs own disjoint outgoing
+rows, and subsequent invocations remain serialized on the transport stream.
+Native callers must initialize a fresh, quiescent arena together with its
+producer state, use one prepared producer state per mailbox arena, and provide
+non-overlapping partial/output storage. Resetting only the GPU generation cache
+while readers still use an old arena is invalid. The context supplies these
+lifetimes and does not reset generation state between replays.
+Every payload writer still executes a system fence before READY publication;
+every payload reader completes its reads before its ACK. The established
+ascending-rank reduction and BF16 rounding sequence are unchanged.
+
+Progress does not rely on a blocked TX CTA releasing resources for RX. All TX
+and RX CTAs are admitted together by a cooperative launch, with capacity checked
+at initialization. An earlier invocation's reader can finish and ACK while
+another rank is already waiting to reuse that slot. The required healthy
+collective `Context.close()` drains local work and rendezvous before unregistering
+mapped arenas. Native callers must provide equivalent distributed lifetime
+management: local result completion alone is not proof that remote readers are
+finished. No CPU work or collective is added between model layers.
+
+The independent-role profiler allocates twice the channel storage. Physical CTA
+indices below the operation's active channel count are TX; subsequent active
+indices are RX. Each CTA's phase fields partition its own elapsed interval;
+concurrent role durations must not be added as operation latency. Deferred
+sender credit checks are reported in `idle_wait_credit_ns`, including the check
+and barrier cost even if the first poll succeeds. Production runs allocate no
+profiling storage and use the uninstrumented specialization.
+
+These settings are opt-in pending end-to-end evidence. Full receiver width is
+preserved while publication size can be varied independently. A larger batch
+amortizes fences but delays the first READY; a smaller batch publishes earlier
+but adds fences. Neither one-token workloads nor one particular route pattern
+is baked into the transport's partitioning rule.
