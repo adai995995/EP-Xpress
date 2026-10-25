@@ -894,7 +894,9 @@ barrier makes acquired READY state visible to every payload reader.
 If all contributors are ready before any partial prefetch, the receiver uses
 the existing direct host-read/reduce path. Otherwise, it copies ready peers'
 BF16 payloads into per-peer CTA shared memory while missing peers continue
-producing their results. A loaded-mask prevents duplicate reads. After all
+producing their results. Staging retains `EP_XPRESS_DECODE_PEER_BATCH` load
+grouping: issue each group of independent host reads before storing their
+results to shared memory. A loaded-mask prevents duplicate reads. After all
 expected payloads are present, it reduces them in ascending rank order,
 including the existing absent-rank zero additions, then performs the original
 remote BF16 rounding and local BF16 addition. Scalar tails use the same order.

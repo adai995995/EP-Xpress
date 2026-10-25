@@ -1665,6 +1665,49 @@ __device__ __forceinline__ void mailbox_reduce_vectors(
   }
 }
 
+#if EP_XPRESS_DECODE_READY_PREFETCH
+// Retain the direct reader's cross-peer load grouping: issue independent host
+// reads before storing their results. All 256 threads keep payload ownership.
+template <int PeerBatch, bool Vector>
+__device__ __forceinline__ void mailbox_stage_ready(
+    TransportArgs a, int original, uint64_t ready, uint32_t* staged) {
+  const int units = a.hidden / (Vector ? 8 : 2);
+  for (int h = threadIdx.x; h < units; h += blockDim.x) {
+    for (int base = 0; base < a.world; base += PeerBatch) {
+      if constexpr (Vector) {
+        uint4 values[PeerBatch];
+#pragma unroll
+        for (int p = 0; p < PeerBatch; ++p) {
+          const int peer = base + p;
+          if (peer < a.world && (ready & (uint64_t(1) << peer)))
+            values[p] = host_load128(mailbox(a, peer, a.rank, original) + 32 + int64_t(h) * 16);
+        }
+#pragma unroll
+        for (int p = 0; p < PeerBatch; ++p) {
+          const int peer = base + p;
+          if (peer < a.world && (ready & (uint64_t(1) << peer)))
+            reinterpret_cast<uint4*>(staged + int64_t(peer) * (a.hidden / 2))[h] = values[p];
+        }
+      } else {
+        uint32_t values[PeerBatch];
+#pragma unroll
+        for (int p = 0; p < PeerBatch; ++p) {
+          const int peer = base + p;
+          if (peer < a.world && (ready & (uint64_t(1) << peer)))
+            values[p] = host_load32(mailbox(a, peer, a.rank, original) + 32 + int64_t(h) * 4);
+        }
+#pragma unroll
+        for (int p = 0; p < PeerBatch; ++p) {
+          const int peer = base + p;
+          if (peer < a.world && (ready & (uint64_t(1) << peer)))
+            staged[int64_t(peer) * (a.hidden / 2) + h] = values[p];
+        }
+      }
+    }
+  }
+}
+#endif
+
 // Bounded CTA-local staging, independent of routing and token capacity. Leave
 // room below the default shared-memory limit for descriptors and counters.
 __host__ __device__ inline int mailbox_prefetch_bytes(int world, int hidden) {
@@ -1939,18 +1982,11 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
         if (!loaded && fresh == remote) break;
         if (fresh) {
           phase(PReceivePayload);
-          for (int peer = 0; peer < a.world; ++peer) {
-            if (!(fresh & (uint64_t(1) << peer))) continue;
-            const char* source = mailbox(a, peer, a.rank, original) + 32;
-            auto* destination = prefetched + int64_t(peer) * (a.hidden / 2);
-            if (a.hidden % 8 == 0) {
-              for (int h = tid; h < a.hidden / 8; h += blockDim.x)
-                reinterpret_cast<uint4*>(destination)[h] = host_load128(source + int64_t(h) * 16);
-            } else {
-              for (int h = tid; h < a.hidden / 2; h += blockDim.x)
-                destination[h] = host_load32(source + int64_t(h) * 4);
-            }
-          }
+          constexpr int peer_batch = EP_XPRESS_DECODE_PEER_BATCH > 0 ? EP_XPRESS_DECODE_PEER_BATCH : 1;
+          if (a.hidden % 8 == 0)
+            mailbox_stage_ready<peer_batch, true>(a, original, fresh, prefetched);
+          else
+            mailbox_stage_ready<peer_batch, false>(a, original, fresh, prefetched);
           // Complete the shared copies before reduction or another poll.
           // ACK remains after all reads/reduction, so host slots cannot change.
           __syncthreads();
@@ -1963,24 +1999,24 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
     } else
 #endif
     {
-    phase(PPeerPoll);
-    uint32_t iteration = 0;
-    do {
-      bool missing = false;
-      if (tid < a.world && tid != a.rank && (readers & (uint64_t(1) << tid)))
-        missing = acquire(control(mailbox(a, tid, a.rank, original), 0)) != a.epoch;
-      const int waiting = __syncthreads_or(missing);
-      if (tid == 0) {
-        blocked = waiting;
-        error = mailbox_health(a, start, iteration++);
-      }
-      __syncthreads();
-      if constexpr (Profile) { if (sample >= 0 && tid == 0) {
-        ++profile.values[PReadyPolls];
-        profile.values[PUnreadyObservations] += blocked != 0;
-      }}
-      if (blocked && !error) __nanosleep(64);
-    } while (blocked && !error);
+      phase(PPeerPoll);
+      uint32_t iteration = 0;
+      do {
+        bool missing = false;
+        if (tid < a.world && tid != a.rank && (readers & (uint64_t(1) << tid)))
+          missing = acquire(control(mailbox(a, tid, a.rank, original), 0)) != a.epoch;
+        const int waiting = __syncthreads_or(missing);
+        if (tid == 0) {
+          blocked = waiting;
+          error = mailbox_health(a, start, iteration++);
+        }
+        __syncthreads();
+        if constexpr (Profile) { if (sample >= 0 && tid == 0) {
+          ++profile.values[PReadyPolls];
+          profile.values[PUnreadyObservations] += blocked != 0;
+        }}
+        if (blocked && !error) __nanosleep(64);
+      } while (blocked && !error);
     }
     if (error) break;
     phase(PReceiveMetadata);
