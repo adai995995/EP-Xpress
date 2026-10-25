@@ -694,3 +694,41 @@ fits the allocated cooperative grid. This is a resource-bound decision shared
 by every rank, not a special case for an observed benchmark batch. Explicit
 channel overrides remain authoritative; insufficient grid capacity retains the
 ring fallback. The same width is saved in the handle for combine.
+
+
+## Bounded decode publication batching
+
+The optional `EP_XPRESS_DECODE_PUBLISH_BATCH` build flag accepts 1, 2, 4, 8 or 16.
+Default 1 retains the original per-row publication schedule. Larger values store
+up to that many mailbox addresses in CTA shared memory while all 256 threads
+write the outgoing payloads. Every writing thread executes a system fence before
+a CTA barrier; only then may individual lanes publish the corresponding READY
+words. All publication lanes join before descriptors are reused. A partial batch
+is flushed at the last actual outgoing row, before trailing empty peers are
+scanned, including under sparse or skewed routes. Its last peer is derived from
+the current GPU owner counts and this CTA partition.
+No timer or future-token arrival is needed to flush it.
+
+This batches visibility notifications, not data ownership: each mailbox still
+has one producer and one ACK writer. No extra payload copy, CPU routing, host
+atomic or cross-rank collective is introduced. A batch may include different
+destinations owned by this CTA, but sending never waits for their ACKs; it adds
+no new credit dependency. All-resident launch and the existing final outgoing
+ACK drain retain safe reuse across serialized eager/Graph calls. Receiving keeps
+the original 256-thread CTA, contributor masks, scalar/vector fallback and
+arithmetic order. No receive resources are reserved for a separate send group.
+
+Counts and addresses come from each dispatch's current GPU owner lists. The
+fixed batch bound is unrelated to a benchmark concurrency or model identity.
+Fewer fences can improve throughput, while buffering notifications can delay
+the earliest READY and add descriptor overhead; the option therefore remains
+explicit, with an ordinary per-row path available.
+
+Decode mailbox profiling is prepared once before submissions/capture. Captured
+kernels retain that allocation; a GPU enable word is changed only at synchronized
+request boundaries. Independent per-channel bounded sequences record epochs,
+capacities, active channels and disjoint phase times. Samples never overwrite
+older samples on overflow. Normal kernels instantiate profiling off, so there
+is no diagnostic flag read, counter write, timer or added profile barrier in
+production contexts. Concurrent replay/submission remains unsupported, as for
+the underlying mailbox protocol.

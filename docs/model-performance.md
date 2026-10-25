@@ -2301,3 +2301,129 @@ Inputs for the performance sweep are synthetic. Complete model inference is
 measured, but production request-length distributions, arrival processes, expert
 skew and other GPU/NUMA topologies need their own validation. The mode selection
 is deliberately not hard-coded to the benchmark's concurrency values.
+
+
+## Decode READY publication batching and Graph phase profiling (2026-10-25)
+
+Fused decode now has optional, bounded phase counters that work with serialized
+CUDA Graph replay. Preparation precedes capture; start/stop synchronize at
+quiescent request boundaries. Production contexts use a separate uninstrumented
+specialization. Overflow drops new diagnostic samples and reports the count.
+
+The new build-time `EP_XPRESS_DECODE_PUBLISH_BATCH=8` option batches outgoing
+READY publication after every payload writer has executed a system fence.
+Partial batches flush before reception. It preserves all 256 receive threads,
+current GPU routing/owner lists, exact arithmetic, and final outgoing ACK drain.
+There is no CPU routing read or new collective. Default 1 retains per-row
+publication; larger batches are an explicit workload-dependent option. The final
+implementation flushes a partial batch at its last actual outgoing row, using
+current GPU owner counts to avoid trailing empty-peer scans before READY.
+
+### Full-model comparison
+
+Same eight H20D GPUs, BF16 Qwen3-30B-A3B-Instruct-2507, SGLang v0.5.21,
+TP=DP=EP=8, Triton experts and FlashInfer attention. Full decode Graph uses local
+buckets [1,2,4,8]; prefill stays eager. Producer-local NUMA, 32 allocated channels,
+auto active channels, single-frame dispatch, peer batch 2 and all other transport
+settings match. Inputs have 512 tokens and request 32 output tokens, with eight
+warmups and five timed repeats per load. The initial batch-8 candidate, batch-1
+control, default SGLang NCCL and final early-tail batch-8 candidate were measured sequentially on idle GPUs. The tail
+correction is compiled only into the batch>1 branch; per-row transport is unchanged.
+
+Both backends disable NVLink payloads and GPU P2P. Available NVLink counters all
+remain zero; NCCL transport logs contain SHM only (60 framework connections for
+EP, 120 for NCCL), zero P2P/NET/NVLS. EP arena NUMA placement is verified before
+and after timing. Resolved model/Graph settings and all twenty timed prompt
+hashes match; the comparisons pass the saved-evidence validator.
+
+Values are median [min,max]. TTFT is the last first-token arrival in a batch,
+including scheduling/prefill; Decode TPS is aggregate output tokens per second.
+No phase counters or profiler are enabled during these performance measurements.
+
+| Backend | Batch | TTFT (ms) | Decode TPOT (ms) | Decode TPS | Batch latency (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NCCL | 1 | 101.250 [100.599, 102.806] | 6.459 [6.433, 6.489] | 154.820 [154.105, 155.451] | 302.216 [300.128, 303.132] |
+| NCCL | 8 | 124.767 [124.670, 127.259] | 6.583 [6.510, 6.643] | 1215.275 [1204.364, 1228.868] | 329.207 [328.406, 330.790] |
+| NCCL | 32 | 471.876 [460.341, 477.128] | 9.036 [8.885, 9.098] | 3541.446 [3517.077, 3601.451] | 750.249 [738.412, 752.795] |
+| NCCL | 64 | 964.458 [903.650, 997.347] | 10.755 [10.680, 10.835] | 5950.447 [5906.967, 5992.256] | 1296.927 [1238.769, 1331.128] |
+| EP per-row | 1 | 96.501 [95.820, 100.739] | 7.000 [6.845, 7.060] | 142.857 [141.636, 146.093] | 314.324 [312.302, 314.792] |
+| EP per-row | 8 | 100.889 [100.535, 188.756] | 11.392 [11.378, 11.407] | 702.271 [701.298, 703.123] | 454.671 [453.326, 541.490] |
+| EP per-row | 32 | 307.883 [289.443, 327.760] | 13.960 [13.856, 14.008] | 2292.230 [2284.398, 2309.426] | 737.907 [720.395, 759.292] |
+| EP per-row | 64 | 527.430 [526.425, 531.277] | 14.855 [14.830, 14.942] | 4308.450 [4283.331, 4315.518] | 985.804 [985.133, 988.560] |
+| EP batch 8 initial | 1 | 96.749 [96.306, 100.134] | 7.082 [6.988, 7.093] | 141.210 [140.989, 143.109] | 315.953 [313.459, 320.124] |
+| EP batch 8 initial | 8 | 105.351 [104.996, 105.735] | 10.705 [10.702, 10.721] | 747.302 [746.216, 747.495] | 437.619 [436.893, 437.770] |
+| EP batch 8 initial | 32 | 286.486 [285.098, 289.664] | 12.957 [12.876, 13.014] | 2469.718 [2458.831, 2485.193] | 683.370 [681.410, 689.237] |
+| EP batch 8 initial | 64 | 529.404 [524.631, 591.762] | 13.575 [13.458, 13.682] | 4714.667 [4677.520, 4755.410] | 949.232 [943.138, 1009.153] |
+| EP batch 8 early tail | 1 | 102.540 [96.395, 103.292] | 7.038 [6.970, 7.049] | 142.087 [141.863, 143.481] | 320.157 [313.722, 321.472] |
+| EP batch 8 early tail | 8 | 104.884 [104.456, 105.199] | 10.772 [10.769, 10.784] | 742.666 [741.867, 742.905] | 439.140 [438.518, 439.160] |
+| EP batch 8 early tail | 32 | 287.557 [286.407, 315.362] | 12.973 [12.922, 13.078] | 2466.655 [2446.824, 2476.472] | 687.701 [684.243, 714.162] |
+| EP batch 8 early tail | 64 | 527.763 [522.476, 533.540] | 13.625 [13.614, 13.720] | 4697.278 [4664.655, 4701.107] | 947.656 [943.505, 954.259] |
+
+| Batch | Final batch 8 Decode TPS change vs per-row | Final batch 8 Decode TPS change vs NCCL |
+| --- | ---: | ---: |
+| 1 | -0.54% | -8.22% |
+| 8 | +5.75% | -38.89% |
+| 32 | +7.61% | -30.35% |
+| 64 | +9.02% | -21.06% |
+
+The multi-request decode improvement does not close the gap to NCCL. Prefill is
+unchanged by the mailbox optimization; multi-request TTFT advantages mostly
+predate it, and between-run scheduling variation must not be attributed to decode publication.
+The final B1 TTFT median is higher than both the per-row control and NCCL;
+no single-request TTFT gain is established. Observed ranges are not confidence
+intervals or a production SLA.
+
+### Separate phase measurements (initial batching implementation)
+
+Two instrumented trials per load use the same prompt IDs, with eight requested
+output tokens and matched off/on profiler trials. Each rank records 384 fused
+combines per trial with no overflow or status error. Only rank-local timestamps
+are compared. Per operation, select the CTA whose end timestamp is latest;
+the table averages its phase durations across trials (source rank 0 for B1,
+all eight ranks for B32). This is a diagnostic view of the last-finishing CTA,
+not the sum of concurrent channel/rank durations or global wall latency.
+
+All entries below are microseconds per sampled CTA. READY includes polling and
+its synchronization; payload includes local computation, reduction and output
+stores; ACK drain includes successful checks and waiting. Phase boundaries add
+CTA barriers. These counters do not isolate PCIe wire time, and ACK drain on a
+sender can reflect the same receiver delay already visible on another GPU.
+
+| Load | Variant | Elapsed | Send metadata | Send payload | Fence/READY publish | READY poll | Receive payload/reduce | ACK publish | Final ACK drain | Receive metadata + other |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| B1 | Original | 24.785 | 4.707 | 0.000 | 0.000 | 8.222 | 5.655 | 2.173 | 0.000 | 4.028 |
+| B1 | Batch 8 | 27.750 | 4.757 | 0.000 | 0.000 | 11.237 | 5.574 | 2.147 | 0.000 | 4.034 |
+| B32 | Original | 75.309 | 10.318 | 5.139 | 17.561 | 10.766 | 5.830 | 3.448 | 15.018 | 7.228 |
+| B32 | Batch 8 | 59.989 | 8.826 | 6.231 | 2.928 | 14.618 | 5.907 | 3.493 | 10.654 | 7.332 |
+
+The phase table compares the original path with the initial batching prototype,
+not the final early-tail correction. B32 publication fell from 17.561 to 2.928 us,
+and last-finishing CTA duration from 75.309 to 59.989 us. Receive payload/reduction
+remained approximately 5.8-5.9 us. READY polling increased, so the gain must not be
+described as faster payload reads or elimination of all waits.
+
+For B1, receiver READY polling increased from 8.222 to 11.237 us. Inspection found
+that the initial prototype deferred its partial-batch publication until after
+trailing empty peers. The final correction publishes at the last actual send;
+its performance is measured in the separate early-tail full-model rows above.
+No final early-tail phase profile was collected; do not substitute the prototype
+phase values for a measurement of that final implementation.
+
+### Validation and limits
+
+Three focused GPU cases passed, and all three passed again after the early-tail
+correction: dynamic-route Graph replay with bucket changes,
+eager interleave, empty/skewed ranks and diagnostic reset/overflow; and aligned
+2048-wide plus scalar 258-wide mailbox comparisons against legacy BF16 rounding.
+The latter also cover sparse readers, delayed nonparticipants, reverse handle
+order and repeated reuse. Four full-model greedy output samples match the
+same-source control and prior EP implementation exactly; all 29 compared prefix
+logprobs have zero observed difference. These are bounded checks, not exhaustive
+validation of every shape, placement or interleaving.
+
+Inputs for the throughput sweep are synthetic token IDs running the complete
+model. Production arrival/length distributions, routing skew and other GPU/PCIe
+or NUMA topologies need separate evaluation. No routing is cached across decode
+steps and no benchmark-specific batch-size branch is introduced. The diagnostic
+counter storage is also released at context teardown; that cleanup does not
+change the measured inference path.

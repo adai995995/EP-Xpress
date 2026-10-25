@@ -172,6 +172,11 @@ combine path has no all-peer terminal frames. General dispatch retains its
 terminal handshake; bounded single-frame dispatch folds completion into its
 only frame. Larger operations use the existing pair queues.
 
+`EP_XPRESS_DECODE_PUBLISH_BATCH=8` opts into bounded READY publication batching
+for fused decode. It keeps full-CTA reception and the existing ACK protocol.
+The default `1` retains per-row publication; this is a throughput/latency tradeoff,
+not a universal speedup. Set it before extension loading or worker startup.
+
 `Config(combine_frame_rows=N)` sets rows per pair-queue frame independently of
 channel count, for `N` in 1 through 256. The default `0` retains the original
 split of `chunk_bytes` across channels and peers. Larger fixed frames consume
@@ -245,19 +250,16 @@ run_workload(ep)
 report = ep.stop_combine_profile()
 ```
 
-This instrumentation supports the sequential pair-queue kernel only. Set
-`Config.combine_warp_specialization=False` and do not submit
-`fused_combine=True` during a capture; unsupported combinations are rejected.
-For SGLang diagnostics, set both `EP_XPRESS_COMBINE_WARP_SPECIALIZATION=0`
-and `EP_XPRESS_FUSED_DECODE=0` before starting the workers. Those profiles
-describe the old sequential pair-queue kernel, not warp-specialized execution
-or fused decode.
+This operation capture supports eager dispatch and pair-queue combine, including
+warp-specialized combine. It excludes fused decode and CUDA Graph mode; use the
+separate mailbox capture below for that path. For warp-specialized combine,
+Tx/Rx phase times overlap and must not be summed as latency.
 
 The start call preallocates counters; the stop call bulk-copies them after one
 transport-stream fence. No per-layer CPU readback or collective is added.
 Excess operations run uninstrumented and increment `dropped_operations`.
 `read_combine_profile()` returns the completed report without another fence.
-Schema version 3 contains native field names, operation labels, and
+Schema version 4 contains native field names, operation labels, and
 `active_channels * world_size` rows per operation. Each operation records its
 own `active_channels` and `counter_rows`, which map its raw rows to
 `(channel, peer)` pairs, including local-only rows. Top-level `channels` and
@@ -267,7 +269,7 @@ budget; reduce `max_operations` for larger grids. Diagnostic timing adds CTA
 barriers and must be compared with an uninstrumented run before interpreting
 its overhead.
 
-Nine exclusive phases partition each block's elapsed time: local routing,
+For sequential transport, nine exclusive phases partition each block's elapsed time: local routing,
 send metadata, send payload, publication/fence, peer polling, receive metadata,
 receive payload, ACK publication, and other control. A second view classifies
 iterations with no cursor or frame progress as waiting for ready, credit, both,
@@ -276,6 +278,34 @@ them. Init/final-reduction kernels require separate trace measurement. Raw GPU
 timestamps are device-local; block times must not be summed as wall latency.
 Use `benchmarks.replay --transport host_sm --profile-combine` to validate the
 counter invariants and requested bytes against independently generated routes.
+
+### Optional decode mailbox diagnostics
+
+Prepare fixed diagnostic storage before the first submission or Graph capture:
+
+```python
+ep.prepare_decode_profile(max_samples_per_channel=1024)
+# Optionally enable Graph mode, warm/capture buckets, and finish prior work.
+ep.start_decode_profile()
+run_workload(ep)
+report = ep.stop_decode_profile()
+```
+
+The capture uses the actual fused mailbox kernel and works across dynamic routes,
+Graph bucket changes and serialized eager/Graph execution. Each channel owns a
+bounded sample sequence; overflow increments `dropped_samples` without overwriting
+samples. A fresh start resets counters without recapturing the graphs. Start/stop
+synchronize only at explicit, quiescent request boundaries; no other thread may
+submit work during these boundaries. No per-layer CPU readback is introduced.
+
+The report's `phase_fields` partition each sampled CTA's `elapsed_ns`. READY
+polling is `peer_poll_ns`; `receive_payload_ns` includes reduction and output
+stores; `idle_final_drain_ns` includes all final ACK checks, even successful first
+checks. These are instrumented GPU durations, not PCIe wire times. This mailbox
+schema does not use the pair-queue profiler's overlapping idle view. GPU clocks
+are local, and concurrent CTA/rank durations must not be added as wall latency.
+Normal contexts do not prepare this storage and launch an uninstrumented kernel
+specialization. Use a separate ordinary context/process for headline performance.
 
 ## Validation
 

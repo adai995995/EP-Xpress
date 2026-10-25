@@ -12,7 +12,7 @@ pytestmark = [pytest.mark.cuda, pytest.mark.skipif(
     reason="two CUDA GPUs are required")]
 
 
-def _worker(rank, init_file, fused, single_frame=False, chunk_bytes=4096, id_bits=64):
+def _worker(rank, init_file, fused, single_frame=False, chunk_bytes=4096, id_bits=64, profile=False):
     import torch.distributed as dist
     torch.cuda.set_device(rank)
     dist.init_process_group("gloo", init_method="file://" + init_file, rank=rank, world_size=2)
@@ -20,6 +20,8 @@ def _worker(rank, init_file, fused, single_frame=False, chunk_bytes=4096, id_bit
         128, 2, 8, transport="host_sm", channels=2, chunk_bytes=chunk_bytes,
         decode_max_tokens=8, fatal_errors=True, combine_warp_specialization=True,
         decode_single_frame=single_frame), device=rank)
+    if profile:
+        context.prepare_decode_profile(max_samples_per_channel=3)
     context.enable_cuda_graph()
     capture_stream = torch.cuda.Stream()
     replay_streams = [torch.cuda.Stream(), torch.cuda.Stream()]
@@ -59,6 +61,8 @@ def _worker(rank, init_file, fused, single_frame=False, chunk_bytes=4096, id_bit
             saved.append(workspace)
         # Capture must not consume a generation. Every replay computes fresh
         # routing from mutated GPU IDs, including local dedup and absent ranks.
+        if profile:
+            context.start_decode_profile()
         for step, key in enumerate((0, 4, 1, 3, 0, 2, 4, 1)):
             stream = replay_streams[step % 2]
             with torch.cuda.stream(stream):
@@ -89,6 +93,20 @@ def _worker(rank, init_file, fused, single_frame=False, chunk_bytes=4096, id_bit
         torch.cuda.synchronize()
         for actual, expected in results:
             torch.testing.assert_close(actual.float(), expected, rtol=0, atol=0)
+        if profile:
+            report = context.stop_decode_profile()
+            assert report["status"] == 0 and report["dropped_samples"] > 0
+            assert report["samples"]
+            for sample in report["samples"]:
+                values = dict(zip(report["fields"], sample["values"]))
+                assert values["elapsed_ns"] == sum(values[k] for k in report["phase_fields"])
+                assert values["status"] == 0 and values["epoch"] > 0
+            # A new session resets counters without recapturing the graph.
+            context.start_decode_profile()
+            context.prepare_graph_replay()
+            graphs[1][0].replay()
+            report = context.stop_decode_profile()
+            assert report["dropped_samples"] == 0 and len(report["samples"]) == 2
         for graph, _, _ in graphs.values():
             graph.reset()
         graphs.clear()
@@ -118,4 +136,16 @@ def test_single_frame_graph_and_small_frame_fallback(chunk_bytes, id_bits):
     with tempfile.TemporaryDirectory(prefix="ep-xpress-single-frame-test-") as root:
         torch.multiprocessing.spawn(_worker,
             args=(os.path.join(root, "rendezvous"), True, True, chunk_bytes, id_bits),
+            nprocs=2, join=True)
+
+
+def test_decode_profile_graph_replay_reset_and_overflow():
+    """Bounded counters survive changed routes and do not overwrite on overflow."""
+    from torch.utils.cpp_extension import CUDA_HOME
+    if CUDA_HOME is None:
+        pytest.skip("CUDA toolkit is unavailable")
+    native.load()
+    with tempfile.TemporaryDirectory(prefix="ep-xpress-profile-test-") as root:
+        torch.multiprocessing.spawn(_worker,
+            args=(os.path.join(root, "rendezvous"), True, True, 4096, 32, True),
             nprocs=2, join=True)

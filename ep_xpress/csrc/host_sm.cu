@@ -146,6 +146,12 @@ static_assert(EP_XPRESS_COMBINE_LAST_DATA == 0 || EP_XPRESS_COMBINE_LAST_DATA ==
 static_assert(EP_XPRESS_DECODE_PEER_BATCH == 0 || EP_XPRESS_DECODE_PEER_BATCH == 1 ||
               EP_XPRESS_DECODE_PEER_BATCH == 2 || EP_XPRESS_DECODE_PEER_BATCH == 4,
               "unsupported decode peer batch");
+#ifndef EP_XPRESS_DECODE_PUBLISH_BATCH
+#define EP_XPRESS_DECODE_PUBLISH_BATCH 1
+#endif
+static_assert(EP_XPRESS_DECODE_PUBLISH_BATCH == 1 || EP_XPRESS_DECODE_PUBLISH_BATCH == 2 ||
+              EP_XPRESS_DECODE_PUBLISH_BATCH == 4 || EP_XPRESS_DECODE_PUBLISH_BATCH == 8 ||
+              EP_XPRESS_DECODE_PUBLISH_BATCH == 16, "unsupported decode publish batch");
 __device__ __forceinline__ void host_store128(void* address, uint4 value) {
   // Match the scalar volatile store policy. Each writer still executes a
   // system fence before the Tx leader publishes READY for the whole frame.
@@ -293,6 +299,8 @@ struct TransportArgs {
   at::BFloat16* remote;
   int32_t* status;
   int64_t* profile;
+  int64_t* decode_profile = nullptr;
+  int decode_profile_samples = 0, decode_profile_channels = 0;
   int experts, world, rank, slots, chunk_rows, channels;
   int input_rows, hidden, topk, capacity;
   int64_t slot_stride, channel_stride;
@@ -1518,19 +1526,78 @@ __device__ __forceinline__ void mailbox_reduce_vectors(
   }
 }
 
+template <bool Profile = false>
 __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
   if (a.device_epoch) a.epoch = *a.device_epoch;
   __shared__ int begin, end, row, token, error, local_row, blocked;
   __shared__ uint64_t readers;
   const int tid = threadIdx.x, channel = blockIdx.x;
+  // A separate opt-in specialization is captured with fixed storage. Its
+  // enable flag is toggled only at synchronized request boundaries. Production
+  // kernels have no timer, profile pointer load or diagnostic barrier.
+  constexpr int stride = PFieldCount + 4;
+  __shared__ int sample;
+  ProfileState<Profile> profile;
+  if constexpr (Profile) {
+    if (tid == 0) {
+      sample = -1;
+      if (a.decode_profile[1]) {
+        auto* header = a.decode_profile + int64_t(channel) * stride;
+        const int64_t index = header[0]++;
+        if (index < a.decode_profile_samples) sample = int(index);
+        else ++header[2];
+      }
+    }
+    __syncthreads();
+    if (sample >= 0) profile_init(profile);
+  }
+  const auto phase = [&](int field) {
+    if constexpr (Profile) { if (sample >= 0) profile_phase(profile, field); }
+  };
   const uint64_t start = a.diagnostics ? ticks_ns() : 0;
   if (tid == 0) error = read_status(a.status);
   __syncthreads();
+
+  // Bound publication batching independently of token count, routing and
+  // channel count. Every writer fences its own payload stores before ANY
+  // lane publishes READY. Queues remain single-writer and final ACK drain is
+  // unchanged. Flush the final partial batch even for asymmetric/empty ranks.
+#if EP_XPRESS_DECODE_PUBLISH_BATCH > 1
+  __shared__ char* publish_boxes[EP_XPRESS_DECODE_PUBLISH_BATCH];
+  __shared__ int last_send_peer;
+  // Publish the partial batch at the last actual row, before scanning trailing
+  // empty peers. Counts are GPU-produced and immutable for this invocation.
+  // The first peer's existing CTA barrier broadcasts this value.
+  if (tid == 0) {
+    last_send_peer = -1;
+    for (int peer = 0; peer < a.world; ++peer) {
+      const int n = a.owner_counts[peer];
+      if (peer != a.rank && n > 0 && n <= a.input_rows &&
+          int64_t(n) * channel / a.channels < int64_t(n) * (channel + 1) / a.channels)
+        last_send_peer = peer;
+    }
+  }
+  int pending = 0;  // Uniform CTA cursor; descriptor ownership is lane zero.
+  const auto flush_publishes = [&]() {
+    if (!pending) return;
+    phase(PPublish);
+    __threadfence_system();
+    __syncthreads();
+    if (tid < pending) {
+      char* destination = publish_boxes[tid];
+      if (a.diagnostics) host_store64(destination + 16, a.identity);
+      release(control(destination, 0), a.epoch);
+    }
+    __syncthreads();
+    pending = 0;
+  };
+#endif
 
   // No intermediate HBM copy or capacity-sized clear. All sends are bounded
   // by dispatch's owner list; each payload is written exactly once.
   for (int peer = 0; peer < a.world && !error; ++peer) {
     if (peer == a.rank) continue;
+    phase(PSendMetadata);
     if (tid == 0) {
       int n = a.owner_counts[peer];
       if (n < 0 || n > a.input_rows) { fail(a.status, 1); n = 0; }
@@ -1540,6 +1607,7 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
     }
     __syncthreads();
     for (int index = begin; index < end && !error; ++index) {
+      phase(PSendMetadata);
       if (tid == 0) {
         row = a.owner_rows[int64_t(peer) * a.input_rows + index];
         if (row < 0 || row >= a.input_rows) fail(a.status, 1);
@@ -1555,8 +1623,20 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
       if (error) break;
       char* box = mailbox(a, a.rank, peer, token);
       const auto* source = reinterpret_cast<const uint32_t*>(a.input + int64_t(row) * a.hidden);
+      phase(PSendPayload);
       for (int h = tid; h < a.hidden / 2; h += blockDim.x)
         host_store32(box + 32 + int64_t(h) * 4, source[h]);
+      if constexpr (Profile) { if (sample >= 0 && tid == 0) {
+        ++profile.values[PSendRows];
+        profile.values[PWrittenBytes] += a.hidden * 2;
+      }}
+#if EP_XPRESS_DECODE_PUBLISH_BATCH > 1
+      if (tid == 0) publish_boxes[pending] = box;
+      __syncthreads();
+      if (++pending == EP_XPRESS_DECODE_PUBLISH_BATCH ||
+          (peer == last_send_peer && index + 1 == end)) flush_publishes();
+#else
+      phase(PPublish);
       // All payload writers publish their system writes before READY's owner.
       __threadfence_system();
       __syncthreads();
@@ -1565,8 +1645,13 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
         release(control(box, 0), a.epoch);
       }
       __syncthreads();
+#endif
     }
   }
+
+#if EP_XPRESS_DECODE_PUBLISH_BATCH > 1
+  flush_publishes();
+#endif
 
   // A token CTA waits only for its actual remote contributors, then performs
   // the exact legacy arithmetic: ascending-rank FP32 sum -> BF16 -> add local
@@ -1574,6 +1659,7 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
   const int first = int(int64_t(a.capacity) * channel / a.channels);
   const int last = int(int64_t(a.capacity) * (channel + 1) / a.channels);
   for (int original = first; original < last && !error; ++original) {
+    phase(PReceiveMetadata);
     if (tid == 0) {
       readers = uint64_t(a.expected_ranks[original]);
       local_row = a.local_rows[original];
@@ -1582,6 +1668,7 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
       error = read_status(a.status);
     }
     __syncthreads();
+    phase(PPeerPoll);
     uint32_t iteration = 0;
     do {
       bool missing = false;
@@ -1593,9 +1680,14 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
         error = mailbox_health(a, start, iteration++);
       }
       __syncthreads();
+      if constexpr (Profile) { if (sample >= 0 && tid == 0) {
+        ++profile.values[PReadyPolls];
+        profile.values[PUnreadyObservations] += blocked != 0;
+      }}
       if (blocked && !error) __nanosleep(64);
     } while (blocked && !error);
     if (error) break;
+    phase(PReceiveMetadata);
     if (a.diagnostics && tid < a.world && tid != a.rank &&
         (readers & (uint64_t(1) << tid)) &&
         host_load64(mailbox(a, tid, a.rank, original) + 16) != a.identity) fail(a.status, 5);
@@ -1603,6 +1695,7 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
     if (tid == 0) error = read_status(a.status);
     __syncthreads();
     if (error) break;
+    phase(PReceivePayload);
 #if EP_XPRESS_DECODE_PEER_BATCH > 0
     // Mailbox bases/strides are 128-byte aligned, payload begins at +32.
     // Shifted contiguous tensor views and incomplete vectors stay scalar.
@@ -1632,6 +1725,13 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
         a.output[int64_t(original) * a.hidden + h * 2 + 1] = at::BFloat16(float(rounded1) + local1);
       }
     }
+    phase(PAck);
+    if constexpr (Profile) { if (sample >= 0 && tid == 0) {
+      const int peers = __popcll(readers & ~(uint64_t(1) << a.rank));
+      profile.values[PReceiveRows] += peers;
+      profile.values[PReadBytes] += int64_t(peers) * a.hidden * 2;
+      profile.values[PLocalRows] += local_row >= 0;
+    }}
     // ACK follows every reader's final host load, allowing safe next-call reuse.
     __threadfence_system();
     __syncthreads();
@@ -1640,6 +1740,7 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
     __syncthreads();
   }
 
+  phase(POther);
   // Each CTA drains only the rows it published. There is no terminal frame or
   // all-rank ACK: a rank with no incoming/outgoing rows can finish immediately.
   for (int peer = 0; peer < a.world && !error; ++peer) {
@@ -1653,6 +1754,7 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
         token = int(a.input_inverse[int64_t(sent_row) * 2 + 1]);
       }
       __syncthreads();
+      phase(PIdleDrain);
       uint32_t iteration = 0;
       do {
         if (tid == 0) {
@@ -1662,6 +1764,26 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
         __syncthreads();
         if (blocked && !error) __nanosleep(64);
       } while (blocked && !error);
+      phase(POther);
+    }
+  }
+  if constexpr (Profile) {
+    if (sample >= 0) {
+      __syncthreads();
+      if (tid == 0) {
+        const uint64_t now = ticks_ns();
+        profile.values[profile.phase] += now - profile.mark;
+        profile.values[PEnd] = now;
+        profile.values[PElapsed] = now - profile.values[PBegin];
+        profile.values[PStatus] = error;
+        auto* out = a.decode_profile +
+            (int64_t(sample + 1) * a.decode_profile_channels + channel) * stride;
+        for (int i = 0; i < PFieldCount; ++i) out[i] = profile.values[i];
+        out[PFieldCount] = a.epoch;
+        out[PFieldCount + 1] = a.capacity;
+        out[PFieldCount + 2] = a.input_rows;
+        out[PFieldCount + 3] = a.channels;
+      }
     }
   }
   if (tid == 0 && error) {
@@ -1696,7 +1818,7 @@ int max_channels_current_device(int world = 1) {
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&diagnostic, host_sm_pair_combine_kernel<true>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&selective_a, host_sm_transport_kernel<false, int32_t, false, true>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&selective_b, host_sm_transport_kernel<false, int64_t, false, true>, kThreads, 0));
-  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&mailbox_capacity, host_sm_mailbox_combine_kernel, kThreads, 0));
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&mailbox_capacity, host_sm_mailbox_combine_kernel<false>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&warp_pair_capacity, host_sm_warp_pair_combine_kernel<false>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&single_a, host_sm_transport_kernel<false, int32_t, false, false, true>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&single_b, host_sm_transport_kernel<false, int64_t, false, false, true>, kThreads, 0));
@@ -1911,6 +2033,32 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
   }
 }
 
+void PreparedHostSM::prepare_decode_profile(torch::Tensor storage) {
+  const c10::cuda::CUDAGuard guard(impl_->device);
+  eager_stream(impl_->device);
+  TORCH_CHECK(!impl_->submitted && !impl_->combine.decode_profile,
+              "prepare decode profiling once before any submission or graph capture");
+  tensor_check(storage, at::kLong, 3, impl_->device, "decode profile");
+  TORCH_CHECK(storage.size(0) >= 2 && storage.size(0) <= 4097 &&
+              storage.size(1) == impl_->combine.channels && storage.size(2) == PFieldCount + 4,
+              "invalid decode profile shape");
+  int resident = 0, sms = 0;
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &resident, host_sm_mailbox_combine_kernel<true>, kThreads, 0));
+  C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, impl_->device.index()));
+  TORCH_CHECK(impl_->combine.channels <= resident * sms, "diagnostic grid exceeds resident capacity");
+  impl_->retained.push_back(storage);
+  impl_->combine.decode_profile = storage.data_ptr<int64_t>();
+  impl_->combine.decode_profile_samples = int(storage.size(0) - 1);
+  impl_->combine.decode_profile_channels = int(storage.size(1));
+}
+
+std::vector<std::string> host_sm_decode_profile_fields() {
+  auto fields = kProfileFields;
+  fields.insert(fields.end(), {"epoch", "local_tokens", "input_capacity", "active_channels"});
+  return fields;
+}
+
 void PreparedHostSM::enable_device_epochs() {
   const c10::cuda::CUDAGuard guard(impl_->device);
   eager_stream(impl_->device);
@@ -2063,12 +2211,17 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
     // No capacity clear/finalizer or world-by-token scratch for this path.
-    if (a.channels == 1) host_sm_mailbox_combine_kernel<<<1, kThreads, 0, stream>>>(a);
+    const auto kernel = a.decode_profile ? host_sm_mailbox_combine_kernel<true>
+                                         : host_sm_mailbox_combine_kernel<false>;
+    if (a.channels == 1) {
+      void* arguments[] = {&a};
+      C10_CUDA_CHECK(cudaLaunchKernel(reinterpret_cast<const void*>(kernel),
+          dim3(1), dim3(kThreads), arguments, 0, stream));
+    }
     else {
-      void* parameters[] = {&a};
-      C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
-          reinterpret_cast<const void*>(host_sm_mailbox_combine_kernel),
-          dim3(a.channels), dim3(kThreads), parameters, 0, stream));
+      void* arguments[] = {&a};
+      C10_CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<const void*>(kernel),
+          dim3(a.channels), dim3(kThreads), arguments, 0, stream));
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     impl_->last_mailbox_epoch = uint64_t(epoch);

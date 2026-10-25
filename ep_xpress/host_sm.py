@@ -491,6 +491,71 @@ class HostSMContext(Context):
 
     check = check_errors
 
+    def prepare_decode_profile(self, max_samples_per_channel=1024):
+        """Install bounded fused-combine counters before the first submission.
+
+        Optional diagnostic specialization, including Graph replay. Start/stop
+        at quiescent request boundaries only; never overlap submission from
+        another thread. Normal contexts allocate no storage and use no timers.
+        """
+        with self._lock, torch.cuda.device(self.device):
+            if self._closed or self._counter or torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("prepare decode profiling before submissions, outside capture")
+            if getattr(self, "_decode_profile", None) is not None:
+                raise RuntimeError("decode profiling is already prepared")
+            if (type(max_samples_per_channel) is not int or
+                    not 1 <= max_samples_per_channel <= 4096):
+                raise ValueError("max_samples_per_channel must be in [1, 4096]")
+            fields = list(native.load().host_sm_decode_profile_fields())
+            with torch.cuda.stream(self._work_stream):
+                storage = torch.zeros((max_samples_per_channel + 1,
+                                       self.effective_channels, len(fields)),
+                                      dtype=torch.int64, device=self.device)
+                self._prepared.prepare_decode_profile(storage)
+            self._work_stream.synchronize()
+            self._decode_profile = {"storage": storage, "fields": fields,
+                                    "max_samples": max_samples_per_channel, "active": False}
+
+    def start_decode_profile(self):
+        """Reset and enable previously captured counters at a completed boundary."""
+        with self._lock, torch.cuda.device(self.device):
+            state = getattr(self, "_decode_profile", None)
+            if self._closed or state is None or state["active"] or torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("decode profiling must be prepared, inactive and outside capture")
+            torch.cuda.synchronize(self.device)
+            state["storage"].zero_()
+            state["storage"][0, 0, 1].fill_(1)
+            torch.cuda.synchronize(self.device)
+            state["active"] = True
+
+    def stop_decode_profile(self):
+        """Read counters once after work completes; no per-layer CPU reads."""
+        with self._lock, torch.cuda.device(self.device):
+            state = getattr(self, "_decode_profile", None)
+            if self._closed or state is None or not state["active"] or torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("decode profiling must be active and outside capture")
+            torch.cuda.synchronize(self.device)
+            state["storage"][0, 0, 1].zero_()
+            raw = state["storage"].cpu().tolist()
+            state["active"] = False
+            samples = []
+            for channel, header in enumerate(raw[0]):
+                for i in range(min(header[0], state["max_samples"])):
+                    samples.append({"channel": channel, "values": raw[i + 1][channel]})
+            return {
+                "schema_version": 1, "rank": self.rank, "fields": state["fields"],
+                "samples": samples, "dropped_samples": sum(row[2] for row in raw[0]),
+                "status": int(self._status.item()),
+                "phase_fields": ["send_metadata_ns", "send_payload_ns", "publish_fence_ready_ns",
+                                 "receive_metadata_select_ns", "peer_poll_ns", "receive_payload_ns",
+                                 "ack_publish_ns", "idle_final_drain_ns", "other_control_ns"],
+                "scope": "fused mailbox combine only; per-CTA samples include eager and Graph invocations",
+                "timing": "Disjoint phase durations sum to elapsed_ns. peer_poll_ns is READY polling; "
+                          "receive_payload_ns includes reduction/output and local-only tokens; "
+                          "idle_final_drain_ns includes ACK checks, not just unsuccessful polling. "
+                          "Includes instrumentation barriers; not pure PCIe time. GPU clocks are local.",
+            }
+
     def start_combine_profile(self, max_operations=1024):
         """Start bounded, opt-in GPU diagnostics at a request boundary.
 
@@ -998,6 +1063,7 @@ class HostSMContext(Context):
                 # shutdown. Stop it explicitly to retain its diagnostic report.
                 self._combine_profile = None
                 self._combine_profile_label = None
+                self._decode_profile = None
                 # Release the prepared object's retained device tensors only
                 # after draining transport, and before unregistering mappings.
                 self._prepared = None
