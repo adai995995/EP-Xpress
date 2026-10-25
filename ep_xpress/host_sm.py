@@ -340,11 +340,12 @@ class HostSMContext(Context):
 
     def _bootstrap(self, shared_directory):
         signature = (socket.gethostname(), asdict(self.config), self.expert_to_rank,
-                     str(torch.cuda.get_device_properties(self.device).uuid), self._channel_capacity)
+                     str(torch.cuda.get_device_properties(self.device).uuid), self._channel_capacity,
+                     native.load().__name__)
         signatures = [None] * self.world_size
         dist.all_gather_object(signatures, signature, group=self.group)
-        if any(item[:3] != signature[:3] for item in signatures):
-            raise ValueError("EP ranks must share one host, configuration and expert placement")
+        if any(item[:3] != signature[:3] or item[5] != signature[5] for item in signatures):
+            raise ValueError("EP ranks must share one host, configuration, native build and expert placement")
         if len({item[3] for item in signatures}) != self.world_size:
             raise ValueError("each EP rank must use a distinct CUDA device")
         # The dispatch and pairwise combine grids must fit every device. This
@@ -491,8 +492,8 @@ class HostSMContext(Context):
 
     check = check_errors
 
-    def prepare_decode_profile(self, max_samples_per_channel=1024):
-        """Install bounded fused-combine counters before the first submission.
+    def prepare_decode_profile(self, max_samples_per_channel=1024, *, stage="combine"):
+        """Install bounded decode dispatch or fused-combine counters before the first submission.
 
         Optional diagnostic specialization, including Graph replay. Start/stop
         at quiescent request boundaries only; never overlap submission from
@@ -506,15 +507,17 @@ class HostSMContext(Context):
             if (type(max_samples_per_channel) is not int or
                     not 1 <= max_samples_per_channel <= 4096):
                 raise ValueError("max_samples_per_channel must be in [1, 4096]")
+            if stage not in ("dispatch", "combine"):
+                raise ValueError("decode profile stage must be dispatch or combine")
             fields = list(native.load().host_sm_decode_profile_fields())
             with torch.cuda.stream(self._work_stream):
                 storage = torch.zeros((max_samples_per_channel + 1,
                                        self.effective_channels, len(fields)),
                                       dtype=torch.int64, device=self.device)
-                self._prepared.prepare_decode_profile(storage)
+                self._prepared.prepare_decode_profile(storage, stage == "dispatch")
             self._work_stream.synchronize()
             self._decode_profile = {"storage": storage, "fields": fields,
-                                    "max_samples": max_samples_per_channel, "active": False}
+                                    "max_samples": max_samples_per_channel, "active": False, "stage": stage}
 
     def start_decode_profile(self):
         """Reset and enable previously captured counters at a completed boundary."""
@@ -542,17 +545,29 @@ class HostSMContext(Context):
             for channel, header in enumerate(raw[0]):
                 for i in range(min(header[0], state["max_samples"])):
                     samples.append({"channel": channel, "values": raw[i + 1][channel]})
+            if state["stage"] == "dispatch":
+                phases = ["route_local_ns", "send_metadata_ns", "send_payload_ns",
+                          "publish_fence_ready_ns", "peer_poll_ns", "receive_metadata_select_ns",
+                          "receive_payload_ns", "ack_publish_ns", "ack_drain_check_ns", "other_control_ns"]
+            else:
+                phases = ["send_metadata_ns", "send_payload_ns", "publish_fence_ready_ns",
+                          "receive_metadata_select_ns", "peer_poll_ns", "receive_payload_ns",
+                          "ack_publish_ns", "idle_final_drain_ns", "other_control_ns"]
             return {
-                "schema_version": 1, "rank": self.rank, "fields": state["fields"],
+                "schema_version": 2, "stage": state["stage"],
+                "rank": self.rank, "fields": state["fields"],
                 "samples": samples, "dropped_samples": sum(row[2] for row in raw[0]),
                 "status": int(self._status.item()),
-                "phase_fields": ["send_metadata_ns", "send_payload_ns", "publish_fence_ready_ns",
-                                 "receive_metadata_select_ns", "peer_poll_ns", "receive_payload_ns",
-                                 "ack_publish_ns", "idle_final_drain_ns", "other_control_ns"],
-                "scope": "fused mailbox combine only; per-CTA samples include eager and Graph invocations",
-                "timing": "Disjoint phase durations sum to elapsed_ns. peer_poll_ns is READY polling; "
-                          "receive_payload_ns includes reduction/output and local-only tokens; "
-                          "idle_final_drain_ns includes ACK checks, not just unsuccessful polling. "
+                "phase_fields": phases,
+                "scope": state["stage"] + " decode only; per-CTA eager and Graph samples",
+                "dispatch_note": "Dispatch metadata includes host IDs/weights and compact indices; "
+                                 "idle durations overlap phases. Disabled dispatch diagnostics still "
+                                 "execute diagnostic barriers; use ordinary contexts for performance.",
+                "timing": "Disjoint phase durations sum to elapsed_ns. peer_poll_ns includes READY "
+                          "checks and progress-loop overhead. Dispatch payload excludes routing IDs/weights; "
+                          "combine payload includes reduction/output and local-only tokens. Dispatch "
+                          "ack_drain_check_ns counts checks/completion, whereas idle_* fields overlap phases. "
+                          "Combine idle_final_drain_ns is its explicit ACK-check phase. "
                           "Includes instrumentation barriers; not pure PCIe time. GPU clocks are local.",
             }
 

@@ -60,13 +60,17 @@ def load(*, verbose: bool = False):
         decode_descriptor_batch = os.environ.get("EP_XPRESS_DECODE_DESCRIPTOR_BATCH", "0")
         if decode_descriptor_batch not in {"0", "32"}:
             raise ValueError("EP_XPRESS_DECODE_DESCRIPTOR_BATCH must be 0 or 32")
+        decode_dispatch_indexed = os.environ.get("EP_XPRESS_DECODE_DISPATCH_INDEXED", "0")
+        if decode_dispatch_indexed not in {"0", "1"}:
+            raise ValueError("EP_XPRESS_DECODE_DISPATCH_INDEXED must be 0 or 1")
         cuda_flags = ["-O3", "-lineinfo", f"-DEP_XPRESS_PREFILL_READ_UNROLL={read_unroll}",
                       f"-DEP_XPRESS_PREFILL_WRITE_UNROLL={write_unroll}",
                       f"-DEP_XPRESS_DISPATCH_READ_UNROLL={dispatch_read_unroll}",
                       f"-DEP_XPRESS_COMBINE_LAST_DATA={combine_last_data}",
                       f"-DEP_XPRESS_DECODE_PEER_BATCH={decode_peer_batch}",
                       f"-DEP_XPRESS_DECODE_PUBLISH_BATCH={decode_publish_batch}",
-                      f"-DEP_XPRESS_DECODE_DESCRIPTOR_BATCH={decode_descriptor_batch}"]
+                      f"-DEP_XPRESS_DECODE_DESCRIPTOR_BATCH={decode_descriptor_batch}",
+                      f"-DEP_XPRESS_DECODE_DISPATCH_INDEXED={decode_dispatch_indexed}"]
         digest = hashlib.sha256()
         for source in sources + sorted(source_dir.glob("*.h")):
             digest.update(source.read_bytes())

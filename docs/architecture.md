@@ -758,3 +758,58 @@ before return and no unrelated rank obligation, host atomic, additional payload
 copy, or credit bypass. Tiling reduces metadata barriers and serialized checks;
 it cannot remove a remote consumer's genuine delay. All-resident launch and
 serialized eager/Graph workspace lifetime requirements remain unchanged.
+
+
+## Direct decode receiver indices and batched ACK commits
+
+The optional `EP_XPRESS_DECODE_DISPATCH_INDEXED=1` build setting extends bounded
+single-frame dispatch. All ranks check the same native build at bootstrap;
+mixed build/protocol settings fail before communication starts. The default
+remains the original mask-scanning path.
+
+For each channel, let `R = ceil(decode_max_tokens / active_channels)`. After
+reserving room for `R` BF16 payload rows, each destination needs a 64-bit count
+and at most `R` descriptors, each packing the original source token index and
+its compact wire row. This index region uses otherwise unused slot capacity;
+it does not overlap the fixed ID/weight arrays or the reserved payload prefix.
+The region is naturally aligned, and its entire extent must fit within the
+existing slot stride. When the payload suffix is too small and at least two
+slots were allocated, the single-frame protocol instead borrows the idle second
+slot's payload area. It preserves that slot's READY/ACK header so the general
+ring can later reuse it. The entire index list must fit in that payload area;
+no additional host allocation is needed. All quantities come from configured
+group-wide bounds. If neither extent fits, all ranks use the existing scan protocol,
+including empty ranks. General prefill is unchanged and can reuse the same
+storage only after the preceding operation has drained its ACKs.
+
+A sender warp builds one destination's list from the current GPU rank masks,
+using warp ballots over bounded tiles. It does not transfer a second payload
+copy per destination. Each destination appears once per source token, regardless
+of how many experts on that destination were selected. Counts, descriptors,
+IDs, weights and payload are all covered by the existing writer system fences,
+CTA barrier and frame READY release. Every replay rebuilds the lists; there is
+no CPU route readback or reuse of a previous route.
+
+A receiver acquires the producer READY and reads only its own count and indices.
+It reserves compact GPU rows and builds the same inverse/owner lists without a
+host mask scan or receiver CUB compaction. A zero count explicitly completes that
+producer's metadata frame. It is not permission to ignore publication or ACK.
+
+All frames found ready in one progress iteration are consumed independently.
+After their last payload/metadata reads, all CTA readers fence and synchronize
+once, then peer lanes release their separate ACK words in parallel. No new
+all-rank commit word or host atomic RMW is introduced. A missing READY is left
+for a later iteration and never needed to fill a commit batch. Final outgoing
+ACK drain remains mandatory, including metadata-only readers; returning early
+would allow the next layer or Graph replay to overwrite a live index region,
+including one placed in the second slot.
+The tradeoff is that an early frame's ACK may wait for other already-ready
+frames in the same local batch. This is measured rather than assumed beneficial.
+
+`prepare_decode_profile(stage="dispatch")` installs optional bounded per-channel
+records before capture. The report separates host ID/weight processing from
+payload reads and distinguishes final ACK checks from READY polling. Idle-loop
+classification overlaps the ten disjoint phase totals. Generic eager diagnostic
+schemas retain their previous phase partition. Normal contexts do not allocate
+these counters or execute diagnostic timers/barriers. Diagnostic samples are
+not a substitute for ordinary full-model TTFT and Decode TPS measurements.

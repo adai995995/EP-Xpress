@@ -26,8 +26,10 @@ constexpr int64_t kSlotHeader = 640;
 constexpr int64_t kRowsOffset = 512;
 constexpr int64_t kIdentityOffset = 520;
 
-// Diagnostic schema v1. Times are GPU-local nanoseconds; begin/end must not be
-// compared across GPUs. The nine phase durations partition elapsed_ns exactly.
+// Times are GPU-local nanoseconds; begin/end must not be compared across GPUs.
+// Legacy sequential diagnostics have nine disjoint phases. Bounded decode
+// dispatch additionally splits out ack_drain_check_ns; its ten phases partition
+// elapsed_ns exactly.
 // Idle durations are a SECOND, overlapping view of completed loop iterations:
 // only iterations with no cursor/frame progress are classified, exclusively.
 // Do not add idle durations to phase durations or sum channel times as latency.
@@ -39,14 +41,16 @@ constexpr int64_t kIdentityOffset = 520;
 // frame, including terminal/nonrecipient frames. Ready/credit flags are the
 // snapshots observed during that iteration, not a continuously sampled state.
 // Credit poll counts cover the next producer slot; final-drain slot checks are
-// in other_control and idle_final_drain, not in the credit poll counters.
+// in other_control (ack_drain_check for bounded decode) and idle_final_drain,
+// not in the credit poll counters.
 // Frames include terminals; rows/bytes count payload actually written/read,
 // exclude local bypass, and receive rows count only this rank's selected rows.
 // first_receive is first observed ready frame; first_payload_receive is the
 // start of the first selected payload read. Publish milestones follow release.
 // Missing milestones are -1. Error exits may leave an iteration unclassified;
 // phase partition and observed status are still written. completion_phase is
-// 0..8 in the nine-phase order below (the phase where completion is observed).
+// the enum offset from PRouteLocal; bounded dispatch may finish in the appended
+// ACK-check field. It is not necessarily an index into a compact phase list.
 enum ProfileField {
   PBegin, PEnd, PElapsed,
   PRouteLocal, PSendMetadata, PSendPayload, PPublish, PPeerPoll,
@@ -58,7 +62,7 @@ enum ProfileField {
   PCreditBlockedObservations, PIdleIterations, PCreditProgressIterations,
   PUnreadyProgressIterations, PStatus, PCompletionPhase,
   PFirstPayloadPublish, PFirstPayloadReceive, PTerminalSent,
-  PTerminalReceived, PProgressIterations, PLastProgress, PFieldCount
+  PTerminalReceived, PProgressIterations, PLastProgress, PAckDrainCheck, PFieldCount
 };
 const std::vector<std::string> kProfileFields = {
   "begin_ns", "end_ns", "elapsed_ns", "route_local_ns", "send_metadata_ns",
@@ -74,7 +78,7 @@ const std::vector<std::string> kProfileFields = {
   "ready_missing_progress_iterations", "status", "completion_phase",
   "first_payload_publish_elapsed_ns", "first_payload_receive_elapsed_ns",
   "terminal_sent", "terminal_received", "progress_iterations",
-  "last_progress_elapsed_ns"
+  "last_progress_elapsed_ns", "ack_drain_check_ns"
 };
 
 template <bool Enabled> struct ProfileState {};
@@ -157,6 +161,11 @@ static_assert(EP_XPRESS_DECODE_PUBLISH_BATCH == 1 || EP_XPRESS_DECODE_PUBLISH_BA
 #endif
 static_assert(EP_XPRESS_DECODE_DESCRIPTOR_BATCH == 0 || EP_XPRESS_DECODE_DESCRIPTOR_BATCH == 32,
               "unsupported decode descriptor batch");
+#ifndef EP_XPRESS_DECODE_DISPATCH_INDEXED
+#define EP_XPRESS_DECODE_DISPATCH_INDEXED 0
+#endif
+static_assert(EP_XPRESS_DECODE_DISPATCH_INDEXED == 0 || EP_XPRESS_DECODE_DISPATCH_INDEXED == 1,
+              "unsupported indexed decode dispatch setting");
 __device__ __forceinline__ void host_store128(void* address, uint4 value) {
   // Match the scalar volatile store policy. Each writer still executes a
   // system fence before the Tx leader publishes READY for the whole frame.
@@ -258,7 +267,7 @@ __device__ __forceinline__ void profile_finish(ProfileState<Enabled>& p,
       p.values[PElapsed] = now - p.values[PBegin];
       p.values[PStatus] = status;
       p.values[PCompletionPhase] = p.phase - PRouteLocal;
-      for (int i = 0; i < PFieldCount; ++i)
+      if (output) for (int i = 0; i < PFieldCount; ++i)
         output[int64_t(blockIdx.x) * PFieldCount + i] = p.values[i];
       __threadfence();
     }
@@ -314,6 +323,8 @@ struct TransportArgs {
   bool diagnostics = true;
   bool trusted_placement = false;
   bool fatal_errors = false;
+  bool indexed_dispatch = false;
+  int64_t dispatch_index_offset = 0;
 };
 
 // Notifications are independent of payload READY: only selected readers see a
@@ -325,6 +336,19 @@ __device__ __forceinline__ uint64_t* dispatch_notify(TransportArgs a, char* base
 }
 __device__ __forceinline__ uint64_t* dispatch_terminal(TransportArgs a, char* base) {
   return dispatch_notify(a, base, a.slots, 0);
+}
+
+// The bounded single frame may borrow unused payload capacity for receiver
+// indices, or use the payload area of the idle second slot. Selection uses
+// the configured source bound on ALL ranks, never live local token counts.
+// If neither fits, all ranks retain mask scanning. ACKs protect the complete
+// descriptor region, including across single-frame/prefill transitions.
+__host__ __device__ int decode_index_rows(TransportArgs a) {
+  return (a.mailbox_tokens + a.channels - 1) / a.channels;
+}
+__device__ __forceinline__ char* dispatch_index(TransportArgs a, char* slot, int reader) {
+  const int rows = decode_index_rows(a);
+  return slot + a.dispatch_index_offset + int64_t(reader) * (rows + 1) * 8;
 }
 
 // These atomics address this GPU's VRAM only. Host synchronization words retain
@@ -415,6 +439,20 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
   __shared__ ProfileState<Profile> profile;
   profile_init(profile);
   const int tid = threadIdx.x, channel = blockIdx.x;
+  // Diagnostic-only bounded records. A channel is owned by exactly one CTA;
+  // contexts serialize submissions, so the sample cursor needs no atomic.
+  __shared__ int sample;
+  if constexpr (Profile) {
+    if (tid == 0) {
+      sample = -1;
+      if (a.decode_profile && a.decode_profile[1]) {
+        auto* header = a.decode_profile + int64_t(channel) * (PFieldCount + 4);
+        const int64_t index = header[0]++;
+        if (index < a.decode_profile_samples) sample = int(index);
+        else ++header[2];
+      }
+    }
+  }
   char* own = reinterpret_cast<char*>(a.pointers[a.rank]) + channel * a.channel_stride;
   const Id* ids = static_cast<const Id*>(a.ids);
   const int wire_topk = Combine ? 0 : a.topk;
@@ -556,7 +594,7 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
           if (tid == 0) profile.values[PLocalRows] += num_local;
         }
         profile_phase(profile, PSendMetadata);
-        if (tid < num_remote) {
+        if (tid < num_remote && !(SingleFrame && a.indexed_dispatch)) {
           int source = remote_rows[tid];
           host_store64(send_slot + kSlotHeader + tid * 8, masks[source] & ~(uint64_t(1) << a.rank));
           host_store32(send_slot + kSlotHeader + int64_t(a.chunk_rows) * 8 + tid * 4, tokens[source]);
@@ -569,6 +607,29 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
             host_store64(send_slot + id_offset + int64_t(i) * 8, uint64_t(expert));
             host_store32(send_slot + weight_offset + int64_t(i) * 4,
                          __float_as_uint(expert >= 0 ? a.weights[int64_t(source) * a.topk + k] : 0.0f));
+          }
+        }
+        if constexpr (SingleFrame) {
+          if (a.indexed_dispatch) {
+            const int lane = tid % 32;
+            for (int peer = tid / 32; peer < a.world; peer += kThreads / 32) {
+              if (peer == a.rank) continue;
+              char* index = dispatch_index(a, send_slot, peer);
+              int count = 0;
+              for (int base = 0; base < num_remote; base += 32) {
+                const int wire = base + lane;
+                const int source = wire < num_remote ? remote_rows[wire] : 0;
+                const bool selected = wire < num_remote && (masks[source] & (uint64_t(1) << peer));
+                const uint32_t bits = __ballot_sync(0xffffffffu, selected);
+                if (selected) {
+                  const int offset = count + __popc(bits & ((uint32_t(1) << lane) - 1));
+                  host_store64(index + (int64_t(offset) + 1) * 8,
+                               (uint64_t(uint32_t(tokens[source])) << 32) | uint32_t(wire));
+                }
+                count += __popc(bits);
+              }
+              if (lane == 0) host_store64(index, uint64_t(count));
+            }
           }
         }
         profile_phase(profile, PSendPayload);
@@ -662,7 +723,11 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
           if (acquire(control(candidate, 0)) == expected) slot = candidate;
         }
         if (slot) {
-          rows = int32_t(host_load32(slot + kRowsOffset));
+          if (SingleFrame && a.indexed_dispatch) {
+            const uint64_t count = host_load64(dispatch_index(a, slot, a.rank));
+            if (count > uint64_t(decode_index_rows(a))) fail(a.status, 1);
+            rows = count ? int(count) : -1;
+          } else rows = int32_t(host_load32(slot + kRowsOffset));
           if (a.diagnostics && peer_chunk[tid] == 0 &&
               host_load64(slot + kIdentityOffset) != a.identity) fail(a.status, 5);
           if (rows < (Selective ? 1 : -1) || rows == 0 || rows > a.chunk_rows) fail(a.status, 1);
@@ -699,19 +764,32 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
       for (int tile = 0; tile < rows; tile += kThreads) {
         profile_phase(profile, PReceiveMetadata);
         const int wire_row = tile + tid;
-        bool selected = false;
-        int token = 0;
-        if (wire_row < rows) {
-          uint64_t mask = host_load64(slot + kSlotHeader + int64_t(wire_row) * 8);
-          token = int(host_load32(slot + kSlotHeader + int64_t(a.chunk_rows) * 8 + wire_row * 4));
-          selected = (mask & (uint64_t(1) << a.rank)) != 0;
-          if (selected && (token < 0 || (Combine && token >= a.capacity))) fail(a.status, 2);
-        }
-        uint64_t prefix, aggregate;
-        Scan(scan_storage).ExclusiveSum(uint64_t(selected), prefix, aggregate);
-        if (selected) {
-          selected_rows[prefix] = wire_row;
-          selected_tokens[prefix] = token;
+        uint64_t aggregate = 0;
+        if (SingleFrame && a.indexed_dispatch) {
+          aggregate = min(kThreads, rows - tile);
+          if (tid < aggregate) {
+            const uint64_t descriptor = host_load64(
+                dispatch_index(a, slot, a.rank) + (int64_t(wire_row) + 1) * 8);
+            selected_rows[tid] = int(uint32_t(descriptor));
+            selected_tokens[tid] = int(descriptor >> 32);
+            if (selected_rows[tid] < 0 || selected_rows[tid] >= decode_index_rows(a) || selected_tokens[tid] < 0 ||
+                selected_tokens[tid] >= a.mailbox_tokens) fail(a.status, 2);
+          }
+        } else {
+          bool selected = false;
+          int token = 0;
+          if (wire_row < rows) {
+            uint64_t mask = host_load64(slot + kSlotHeader + int64_t(wire_row) * 8);
+            token = int(host_load32(slot + kSlotHeader + int64_t(a.chunk_rows) * 8 + wire_row * 4));
+            selected = (mask & (uint64_t(1) << a.rank)) != 0;
+            if (selected && (token < 0 || (Combine && token >= a.capacity))) fail(a.status, 2);
+          }
+          uint64_t prefix;
+          Scan(scan_storage).ExclusiveSum(uint64_t(selected), prefix, aggregate);
+          if (selected) {
+            selected_rows[prefix] = wire_row;
+            selected_tokens[prefix] = token;
+          }
         }
         if (tid == 0) {
           num_selected = int(aggregate);
@@ -770,6 +848,7 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
             dst[h] = packed;
           } else reinterpret_cast<uint32_t*>(a.output + int64_t(output_base + row) * a.hidden)[h] = packed;
         }
+        profile_phase(profile, PReceiveMetadata);
         if (!Combine) {
           for (int i = tid; i < num_selected * a.topk; i += blockDim.x) {
             const int row = i / a.topk, k = i % a.topk;
@@ -794,25 +873,56 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
           }
         }
       }
+      if (!(SingleFrame && a.indexed_dispatch)) {
+        profile_phase(profile, PAck);
+        __threadfence_system();
+        __syncthreads();
+        if (tid == 0) {
+          if constexpr (Selective) {
+            if (rows == -1) release(dispatch_terminal(a, peer_base) + 1 + a.rank, a.epoch << 32);
+            else release(control(slot, 1 + a.rank), received_sequence[peer]);
+          } else release(control(slot, 1 + a.rank), (a.epoch << 32) | uint64_t(peer_chunk[peer] + 1));
+          ++peer_chunk[peer];
+          if (SingleFrame || rows == -1) peer_done[peer] = 1;
+          if constexpr (Profile) {
+            ++profile.values[PReceiveFrames];
+            profile.values[PTerminalReceived] += rows == -1;
+            profile.progress = true;
+          }
+        }
+        __syncthreads();
+      }
+      if (error) break;
+      profile_phase(profile, POther);
+    }
+    if (SingleFrame && a.indexed_dispatch &&
+        __syncthreads_or(tid < a.world && received_rows[tid] != 0)) {
+      // Each available producer frame is independent. Do not wait for an
+      // absent peer to fill a batch. The barrier closes ALL CTA readers before
+      // parallel lanes release their own ACK words; no host atomic RMW.
       profile_phase(profile, PAck);
       __threadfence_system();
       __syncthreads();
-      if (tid == 0) {
-        if constexpr (Selective) {
-          if (rows == -1) release(dispatch_terminal(a, peer_base) + 1 + a.rank, a.epoch << 32);
-          else release(control(slot, 1 + a.rank), received_sequence[peer]);
-        } else release(control(slot, 1 + a.rank), (a.epoch << 32) | uint64_t(peer_chunk[peer] + 1));
-        ++peer_chunk[peer];
-        if (SingleFrame || rows == -1) peer_done[peer] = 1;
-        if constexpr (Profile) {
-          ++profile.values[PReceiveFrames];
-          profile.values[PTerminalReceived] += rows == -1;
-          profile.progress = true;
+      if (tid < a.world && received_rows[tid]) {
+        char* slot = reinterpret_cast<char*>(a.pointers[tid]) +
+                     channel * a.channel_stride + kArenaHeader;
+        release(control(slot, 1 + a.rank), (a.epoch << 32) | uint64_t(1));
+        ++peer_chunk[tid];
+        peer_done[tid] = 1;
+      }
+      if constexpr (Profile) {
+        if (tid == 0) for (int peer = 0; peer < a.world; ++peer) {
+          if (received_rows[peer]) {
+            ++profile.values[PReceiveFrames];
+            profile.values[PTerminalReceived] += received_rows[peer] == -1;
+            profile.progress = true;
+          }
         }
       }
       __syncthreads();
-      if (error) break;
-      profile_phase(profile, POther);
+    }
+    if constexpr (!Combine) {
+      if (a.decode_profile) profile_phase(profile, PAckDrainCheck);
     }
     const int unfinished_peers = __syncthreads_or(tid < a.world && !peer_done[tid]);
     bool unacked = false;
@@ -856,6 +966,17 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
     profile_iteration_end(profile, producer_done && !unfinished_peers && outstanding);
   }
   profile_finish(profile, a.profile, error);
+  if constexpr (Profile) {
+    if (tid == 0 && sample >= 0) {
+      auto* out = a.decode_profile +
+          (int64_t(sample + 1) * a.decode_profile_channels + channel) * (PFieldCount + 4);
+      for (int i = 0; i < PFieldCount; ++i) out[i] = profile.values[i];
+      out[PFieldCount] = a.epoch;
+      out[PFieldCount + 1] = a.input_rows;
+      out[PFieldCount + 2] = a.capacity;
+      out[PFieldCount + 3] = a.channels;
+    }
+  }
   if (tid == 0 && error) {
     release(reinterpret_cast<uint64_t*>(own), uint64_t(error));
     if (a.fatal_errors || host_load64(own + 16)) {
@@ -2149,10 +2270,11 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
   }
 }
 
-void PreparedHostSM::prepare_decode_profile(torch::Tensor storage) {
+void PreparedHostSM::prepare_decode_profile(torch::Tensor storage, bool dispatch) {
   const c10::cuda::CUDAGuard guard(impl_->device);
   eager_stream(impl_->device);
-  TORCH_CHECK(!impl_->submitted && !impl_->combine.decode_profile,
+  auto& args = dispatch ? impl_->dispatch : impl_->combine;
+  TORCH_CHECK(!impl_->submitted && !args.decode_profile,
               "prepare decode profiling once before any submission or graph capture");
   tensor_check(storage, at::kLong, 3, impl_->device, "decode profile");
   TORCH_CHECK(storage.size(0) >= 2 && storage.size(0) <= 4097 &&
@@ -2164,9 +2286,9 @@ void PreparedHostSM::prepare_decode_profile(torch::Tensor storage) {
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, impl_->device.index()));
   TORCH_CHECK(impl_->combine.channels <= resident * sms, "diagnostic grid exceeds resident capacity");
   impl_->retained.push_back(storage);
-  impl_->combine.decode_profile = storage.data_ptr<int64_t>();
-  impl_->combine.decode_profile_samples = int(storage.size(0) - 1);
-  impl_->combine.decode_profile_channels = int(storage.size(1));
+  args.decode_profile = storage.data_ptr<int64_t>();
+  args.decode_profile_samples = int(storage.size(0) - 1);
+  args.decode_profile_channels = int(storage.size(1));
 }
 
 std::vector<std::string> host_sm_decode_profile_fields() {
@@ -2248,13 +2370,30 @@ void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Ten
   // mailboxes fall back to the general selective ring on every rank.
   const bool single_frame = impl_->decode_single_frame && expected_ranks.has_value() &&
       (a.mailbox_tokens + a.channels - 1) / a.channels <= std::min(a.chunk_rows, kThreads);
-  if (single_frame && profile.has_value()) {
+  const int index_rows = decode_index_rows(a);
+  const int64_t index_bytes = int64_t(a.world) * (index_rows + 1) * 8;
+  a.dispatch_index_offset = align_up(payload_offset(a.chunk_rows, a.topk) +
+                                    int64_t(index_rows) * a.hidden * 2, 8);
+  int64_t index_limit = a.slot_stride;
+  if (a.dispatch_index_offset + index_bytes > index_limit && a.slots > 1) {
+    // Single-frame decode publishes only slot zero. Preserve slot one's READY
+    // and ACK header for later ring reuse; borrow only its payload area. The
+    // previous operation drained all readers, and this frame's ACK drains all
+    // index readers before a future operation may reuse either payload area.
+    a.dispatch_index_offset = a.slot_stride + kSlotHeader;
+    index_limit = 2 * a.slot_stride;
+  }
+  a.indexed_dispatch = EP_XPRESS_DECODE_DISPATCH_INDEXED && single_frame &&
+                       a.dispatch_index_offset + index_bytes <= index_limit;
+  // Bounded decode diagnostics never record eager prefill in the same context.
+  if (!expected_ranks.has_value()) a.decode_profile = nullptr;
+  if (single_frame && (profile.has_value() || a.decode_profile)) {
     if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t, true, false, false, true>(a, stream);
     else launch_transport<false, int64_t, true, false, false, true>(a, stream);
   } else if (single_frame) {
     if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t, false, false, false, true>(a, stream);
     else launch_transport<false, int64_t, false, false, false, true>(a, stream);
-  } else if (profile.has_value()) {
+  } else if (profile.has_value() || a.decode_profile) {
     if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t, true, true>(a, stream);
     else launch_transport<false, int64_t, true, true>(a, stream);
   } else if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t, false, true>(a, stream);

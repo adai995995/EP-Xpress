@@ -184,6 +184,16 @@ paths retain full-CTA reception and wait for every actual reader before return.
 Routes are rebuilt from current GPU owner lists on each invocation; the tile
 size is independent of token count and does not limit supported routing shapes.
 
+`EP_XPRESS_DECODE_DISPATCH_INDEXED=1` opts bounded single-frame dispatch into
+GPU-generated receiver index lists and batched ACK publication (default `0`).
+The payload is still written once for all selected readers. Receivers read their
+own compact indices instead of scanning every transmitted token's rank mask.
+All completed reads share one fence/barrier before separate ACK words are
+published in parallel; an unavailable peer never holds up a commit batch.
+The index lists borrow unused frame space or the idle second slot's payload area. Selection uses
+group-wide capacity bounds and falls back to the original protocol when space
+is insufficient; no assumption about live routing or a particular model is used.
+
 `Config(combine_frame_rows=N)` sets rows per pair-queue frame independently of
 channel count, for `N` in 1 through 256. The default `0` retains the original
 split of `chunk_bytes` across channels and peers. Larger fixed frames consume
@@ -286,19 +296,20 @@ timestamps are device-local; block times must not be summed as wall latency.
 Use `benchmarks.replay --transport host_sm --profile-combine` to validate the
 counter invariants and requested bytes against independently generated routes.
 
-### Optional decode mailbox diagnostics
+### Optional decode dispatch/combine diagnostics
 
 Prepare fixed diagnostic storage before the first submission or Graph capture:
 
 ```python
-ep.prepare_decode_profile(max_samples_per_channel=1024)
+ep.prepare_decode_profile(max_samples_per_channel=1024, stage="dispatch")
+# stage="combine" (the default) samples fused mailbox combine instead.
 # Optionally enable Graph mode, warm/capture buckets, and finish prior work.
 ep.start_decode_profile()
 run_workload(ep)
 report = ep.stop_decode_profile()
 ```
 
-The capture uses the actual fused mailbox kernel and works across dynamic routes,
+The capture uses the actual decode transport kernel and works across dynamic routes,
 Graph bucket changes and serialized eager/Graph execution. Each channel owns a
 bounded sample sequence; overflow increments `dropped_samples` without overwriting
 samples. A fresh start resets counters without recapturing the graphs. Start/stop
@@ -394,3 +405,11 @@ repository. Findings report rule names and paths without echoing secret values.
 For persistent local checks, set `git config epxpress.privatePatternsFile
 "$PRIVATE_PATTERN_FILE"`; this setting stays in local Git configuration and is
 not published. An environment override takes precedence.
+
+Dispatch diagnostics split GPU routing/local copies, send metadata, payload writes,
+fence/READY publication, peer polling, receive metadata, payload reads, ACK
+publication, final ACK checks and other control work. IDs/weights are counted
+as receive metadata. Dispatch `idle_*` durations overlap its phase view; do not
+add them to phase totals. Unlike combine, a prepared dispatch diagnostic kernel
+still executes its diagnostic barriers while recording is disabled. Always use
+a context without prepared diagnostics for performance comparisons.

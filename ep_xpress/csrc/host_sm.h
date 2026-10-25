@@ -20,7 +20,7 @@ class PreparedHostSM {
   // this object and its arenas alive until every captured graph is destroyed.
   void enable_device_epochs();
   // Fixed diagnostic storage; install once before submissions/Graph capture.
-  void prepare_decode_profile(torch::Tensor storage);
+  void prepare_decode_profile(torch::Tensor storage, bool dispatch);
   void dispatch(torch::Tensor input, torch::Tensor ids, torch::Tensor weights,
       int64_t epoch, torch::Tensor output, torch::Tensor output_ids,
       torch::Tensor output_weights, torch::Tensor inverse, torch::Tensor count,
