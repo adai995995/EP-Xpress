@@ -15,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <type_traits>
 #include <cub/block/block_scan.cuh>
 #include "host_sm.h"
 
@@ -189,7 +190,18 @@ static_assert(EP_XPRESS_DECODE_ACK_BATCH == 1 || EP_XPRESS_DECODE_ACK_BATCH == 2
 #endif
 static_assert(!EP_XPRESS_DECODE_DEFER_RECLAIM || EP_XPRESS_DECODE_SPLIT_TX_RX,
               "deferred credit requires independent receive progress");
-constexpr int kMailboxRoles = EP_XPRESS_DECODE_SPLIT_TX_RX ? 2 : 1;
+#ifndef EP_XPRESS_DECODE_PACKET_ROWS
+#define EP_XPRESS_DECODE_PACKET_ROWS 0
+#endif
+#ifndef EP_XPRESS_DECODE_PACKET_CHANNELS
+#define EP_XPRESS_DECODE_PACKET_CHANNELS 0
+#endif
+static_assert(EP_XPRESS_DECODE_PACKET_CHANNELS >= 0 && EP_XPRESS_DECODE_PACKET_CHANNELS <= 32,
+              "packet channel override must fit the prepared cooperative capacity");
+static_assert(EP_XPRESS_DECODE_PACKET_ROWS == 0 || EP_XPRESS_DECODE_PACKET_ROWS == 2 ||
+              EP_XPRESS_DECODE_PACKET_ROWS == 4 || EP_XPRESS_DECODE_PACKET_ROWS == 8,
+              "unsupported decode packet rows");
+constexpr int kMailboxRoles = (EP_XPRESS_DECODE_SPLIT_TX_RX || EP_XPRESS_DECODE_PACKET_ROWS) ? 2 : 1;
 
 #ifndef EP_XPRESS_DECODE_DESCRIPTOR_BATCH
 #define EP_XPRESS_DECODE_DESCRIPTOR_BATCH 0
@@ -344,6 +356,15 @@ struct TransportArgs {
   const int64_t* mailbox_pointers;
 #if EP_XPRESS_DECODE_DEFER_RECLAIM
   uint64_t* mailbox_sent_epochs;
+#endif
+#if EP_XPRESS_DECODE_PACKET_ROWS > 0
+  int32_t* packet_rows;
+  int32_t* packet_tasks;
+  int32_t* packet_counts;
+  uint32_t* packet_send_masks;
+  uint32_t* packet_recv_masks;
+  uint64_t* packet_sent_epochs;
+  at::BFloat16* packet_scratch;
 #endif
   int64_t* expected_ranks;
   int32_t* local_rows;
@@ -1691,7 +1712,9 @@ __device__ __forceinline__ int mailbox_poll_warp(
 // BF16 rounding and the local addition match the scalar mailbox exactly.
 template <int PeerBatch, bool Staged = false>
 __device__ __forceinline__ void mailbox_reduce_vectors(
-    TransportArgs a, int original, int local_row, uint64_t readers, const uint32_t* staged = nullptr) {
+    TransportArgs a, int original, int local_row, uint64_t readers, const uint32_t* staged = nullptr,
+    int64_t staged_peer_stride = 0) {
+  if (!staged_peer_stride) staged_peer_stride = a.hidden / 2;
   for (int h = threadIdx.x; h < a.hidden / 8; h += blockDim.x) {
     float sums[8] = {};
     for (int base = 0; base < a.world; base += PeerBatch) {
@@ -1701,7 +1724,7 @@ __device__ __forceinline__ void mailbox_reduce_vectors(
         const int peer = base + p;
         payload[p] = make_uint4(0, 0, 0, 0);
         if (peer < a.world && peer != a.rank && (readers & (uint64_t(1) << peer)))
-          payload[p] = Staged ? reinterpret_cast<const uint4*>(staged + int64_t(peer) * (a.hidden / 2))[h]
+          payload[p] = Staged ? reinterpret_cast<const uint4*>(staged + int64_t(peer) * staged_peer_stride)[h]
                               : host_load128(mailbox(a, peer, a.rank, original) + 32 + int64_t(h) * 16);
       }
 #pragma unroll
@@ -2355,6 +2378,7 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
 }
 
 #include "host_sm_dispatch_pipeline.h"
+#include "host_sm_packet.h"
 
 int max_channels_current_device(int world = 1) {
   // Capability is fixed for this extension/device. Validate direct native
@@ -2392,6 +2416,12 @@ int max_channels_current_device(int world = 1) {
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&pipeline_i64,
       host_sm_dispatch_pipeline_kernel<int64_t>, kDispatchPipelineThreads, 0));
   pipeline_capacity = sms * std::min(pipeline_i32, pipeline_i64);
+#endif
+#if EP_XPRESS_DECODE_PACKET_ROWS > 0
+  int packet_capacity;
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &packet_capacity, host_sm_packet_transport_kernel<false>, kThreads, 0));
+  mailbox_capacity = std::min(mailbox_capacity, packet_capacity);
 #endif
   const int capacity = std::min({32, pipeline_capacity, sms * mailbox_capacity / kMailboxRoles, sms * std::min({a, b, selective_a, selective_b, mailbox_capacity, single_a, single_b, single_profile_a, single_profile_b}),
                                  sms * std::min({c, diagnostic, warp_pair_capacity}) / world});
@@ -2592,6 +2622,20 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
     impl_->retained.push_back(mailbox_sent_epochs);
   }
 #endif
+#if EP_XPRESS_DECODE_PACKET_ROWS > 0
+  torch::Tensor packet_rows, packet_masks, packet_epochs, packet_scratch, packet_tasks, packet_counts;
+  if (mailbox_pointers.has_value()) {
+    const auto options = torch::TensorOptions().device(device);
+    packet_tasks = torch::empty({2, world * packet_tiles(mailbox_tokens)}, options.dtype(torch::kInt32));
+    packet_counts = torch::empty({2, world}, options.dtype(torch::kInt32));
+    packet_rows = torch::empty({world * mailbox_tokens}, options.dtype(torch::kInt32));
+    packet_masks = torch::empty({2, world * packet_tiles(mailbox_tokens)}, options.dtype(torch::kInt32));
+    packet_epochs = torch::zeros({world * packet_tiles(mailbox_tokens) * kPacketBanks}, options.dtype(torch::kInt64));
+    packet_scratch = torch::empty({world, mailbox_tokens, hidden}, options.dtype(torch::kBFloat16));
+    for (auto tensor : {packet_rows, packet_masks, packet_epochs, packet_scratch, packet_tasks, packet_counts})
+      impl_->retained.push_back(tensor);
+  }
+#endif
   for (bool combine : {false, true}) {
     auto& a = combine ? impl_->combine : impl_->dispatch;
     a.pointers = (combine ? combine_pointers : dispatch_pointers).data_ptr<int64_t>();
@@ -2599,6 +2643,17 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
 #if EP_XPRESS_DECODE_DEFER_RECLAIM
     a.mailbox_sent_epochs = mailbox_sent_epochs.defined()
         ? reinterpret_cast<uint64_t*>(mailbox_sent_epochs.data_ptr<int64_t>()) : nullptr;
+#endif
+#if EP_XPRESS_DECODE_PACKET_ROWS > 0
+    if (mailbox_pointers.has_value()) {
+      a.packet_rows = packet_rows.data_ptr<int32_t>();
+      a.packet_tasks = packet_tasks.data_ptr<int32_t>();
+      a.packet_counts = packet_counts.data_ptr<int32_t>();
+      a.packet_send_masks = reinterpret_cast<uint32_t*>(packet_masks.data_ptr<int32_t>());
+      a.packet_recv_masks = a.packet_send_masks + world * packet_tiles(mailbox_tokens);
+      a.packet_sent_epochs = reinterpret_cast<uint64_t*>(packet_epochs.data_ptr<int64_t>());
+      a.packet_scratch = packet_scratch.data_ptr<at::BFloat16>();
+    }
 #endif
     a.mailbox_tokens = int(mailbox_tokens);
     a.mailbox_stride = align_up(32 + hidden * 2, 128);
@@ -2631,6 +2686,10 @@ void PreparedHostSM::prepare_decode_profile(torch::Tensor storage, bool dispatch
   int resident = 0, sms = 0;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &resident, host_sm_mailbox_combine_kernel<true>, kThreads, 0));
+#if EP_XPRESS_DECODE_PACKET_ROWS > 0
+  if (!dispatch) C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &resident, host_sm_packet_transport_kernel<true>, kThreads, 0));
+#endif
   if (pipeline_profile) {
     int resident64;
     C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -2843,10 +2902,23 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
       advance_mailbox_epoch<<<1, 1, 0, stream>>>(a.device_epoch);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
-    // No capacity clear/finalizer or world-by-token scratch for this path.
+#if EP_XPRESS_DECODE_PACKET_ROWS > 0
+    // Packet tasks are peer/tile jobs, not token-owned CTAs. Keep their optional
+    // concurrency control independent of dispatch, bounded by bootstrap's
+    // cooperative occupancy and allocated profile capacity.
+    if (EP_XPRESS_DECODE_PACKET_CHANNELS)
+      a.channels = std::min(impl_->combine.channels, EP_XPRESS_DECODE_PACKET_CHANNELS);
+    host_sm_packet_prepare_kernel<<<a.world, kThreads, 0, stream>>>(a);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    const int shared_bytes = 0;
+    const auto kernel = a.decode_profile ? host_sm_packet_transport_kernel<true>
+                                        : host_sm_packet_transport_kernel<false>;
+#else
+    // Legacy mailbox path has no capacity clear/finalizer or staging scratch.
     const int shared_bytes = mailbox_prefetch_bytes(a.world, a.hidden);
     const auto kernel = a.decode_profile ? host_sm_mailbox_combine_kernel<true>
                                          : host_sm_mailbox_combine_kernel<false>;
+#endif
     const int blocks = a.channels * kMailboxRoles;
     if (blocks == 1) {
       void* arguments[] = {&a};
@@ -2859,6 +2931,10 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
           dim3(blocks), dim3(kThreads), arguments, shared_bytes, stream));
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+#if EP_XPRESS_DECODE_PACKET_ROWS > 0
+    host_sm_packet_reduce_kernel<<<std::max(1, std::min(a.capacity, 4096)), kThreads, 0, stream>>>(a);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
     impl_->last_mailbox_epoch = uint64_t(epoch);
     impl_->mailbox_stream = stream;
   } else if (impl_->combine_warp_specialization) {
@@ -2868,11 +2944,17 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
   else launch_transport<true, int64_t>(a, stream);
 }
 
+int64_t host_sm_packet_rows() { return EP_XPRESS_DECODE_PACKET_ROWS; }
+
 int64_t host_sm_mailbox_bytes(int64_t hidden, int64_t tokens, int64_t world) {
   TORCH_CHECK(hidden > 0 && hidden <= INT32_MAX && hidden % 2 == 0 &&
                   tokens > 0 && tokens <= 65536 && world > 0 && world <= kMaxRanks,
               "invalid mailbox dimensions");
+#if EP_XPRESS_DECODE_PACKET_ROWS > 0
+  return align_up(kArenaHeader + world * packet_tiles(tokens) * kPacketBanks * packet_stride(hidden), 4096);
+#else
   return align_up(kArenaHeader + world * tokens * align_up(32 + hidden * 2, 128), 4096);
+#endif
 }
 
 int64_t host_sm_max_channels(int64_t world) {

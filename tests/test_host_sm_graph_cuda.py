@@ -141,7 +141,8 @@ def _worker(rank, init_file, fused, single_frame=False, chunk_bytes=4096, id_bit
             graphs[1][0].replay()
             report = context.stop_decode_profile()
             roles = 2 if (profile == "combine" and
-                          os.environ.get("EP_XPRESS_DECODE_SPLIT_TX_RX") == "1") else 1
+                          (os.environ.get("EP_XPRESS_DECODE_SPLIT_TX_RX") == "1" or
+                           os.environ.get("EP_XPRESS_DECODE_PACKET_ROWS", "0") != "0")) else 1
             assert report["dropped_samples"] == 0 and len(report["samples"]) == 2 * roles
         for graph, _, _ in graphs.values():
             graph.reset()

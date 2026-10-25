@@ -1098,3 +1098,85 @@ preserved while publication size can be varied independently. A larger batch
 amortizes fences but delays the first READY; a smaller batch publishes earlier
 but adds fences. Neither one-token workloads nor one particular route pattern
 is baked into the transport's partitioning rule.
+
+### Experimental decode packets and early host-slot reclamation
+
+`EP_XPRESS_DECODE_PACKET_ROWS=2`, `4`, or `8` selects a separate build-time
+combine transport; zero retains the existing mailbox implementation. Disable
+the legacy balanced-send, split-TX/RX, deferred-reclaim and READY-prefetch options
+when selecting packets. Dispatch, expert placement, token deduplication, routing
+weights and prefill pair queues are unchanged. This is a measured experiment,
+not a default performance policy or a batch-size-specific fast path.
+
+One packet represents `(producer, destination, original-token tile, bank)`.
+Its payload has fixed row positions within the tile and a single READY/ACK
+pair. Only live rows cross PCIe; holes consume reserved arena space but no
+payload traffic. Partial tiles publish immediately. The receiver already knows
+the current contributor masks from dispatch and does not fetch a host count
+or perform a metadata collective to discover packet membership.
+
+A GPU preparation kernel rebuilds row indexes and packet masks from the current
+owner lists. Each peer compacts its nonempty send/receive tasks on the GPU.
+Transport CTAs partition the concatenated live task lists, including empty and
+skewed peers. The lists are rebuilt for every invocation, including Graph
+replays; task completion order may vary without changing reduction arithmetic.
+No Python route inspection, per-call allocation, CPU planning, or host barrier
+is added. Preparation still scans the configured bounded token index, so its
+cost is part of the end-to-end comparison rather than assumed negligible.
+
+The transport launches one full 256-thread TX CTA and one full 256-thread RX
+CTA per active channel, all cooperatively resident. A control warp polls up to
+32 assigned tasks and selects an available task without waiting for the other
+tasks in that window. RX stages the chosen peer's live payload into persistent,
+rank-private HBM. Every payload reader completes before a single ACK releases
+the whole packet. A subsequent stream-ordered GPU kernel reduces staged data
+in ascending rank order, rounds the remote sum to BF16, then adds the local
+BF16 result exactly as the legacy path does. Absent peers are never read from
+scratch. Host slots can be reused before this local reduction completes.
+
+Lookahead is bounded: a CTA drains its current window before scanning the next.
+The window-retirement barrier protects the exhausted/error selection before
+the control warp can overwrite shared selection state for the next window.
+There is no claim of global work-conserving scheduling. Transport completion
+still joins local TX and RX before the separate reduction launch; this does not
+overlap the next expert computation with unfinished outgoing payload writes.
+
+Each packet has two payload banks selected by operation epoch. The producer
+retains each bank's last *actual* publication in GPU memory. Before reuse it
+requires an ACK for that exact generation; skipping routes or operation epochs
+does not turn `epoch - 2` into a valid credit rule. No outgoing final ACK drain
+is performed. All READY/ACK release/acquire operations, writer/reader fences,
+stream ordering and distributed arena lifetime requirements remain. Bounded
+buffers can still apply backpressure if a reader is late; double buffering
+does not remove this correctness dependency.
+
+Bootstrap queries the compiled packet layout, checks its Python/native size
+agreement, includes both banks in the host memory budget, and allocates GPU
+metadata and scratch once. `Config.mailbox_arena_bytes(world, packet_rows=...)`
+can estimate this optional arena; its default and `Config.pool_bytes` describe
+the default mailbox. Packet scratch requires `world * decode_max_tokens *
+hidden_size * 2` bytes of HBM per prepared context, in addition to integer
+indexes, task lists and generation state. Each arena and producer generation
+state must share a lifetime; native callers must not attach multiple independent
+prepared producers to the same arena or alias partial/output storage.
+
+The optional combine profiler samples transport CTAs only. Sending metadata
+includes credit polling; receive polling includes ready-task selection. Packet
+payload receive time excludes the later HBM reduction. Frame counters count
+nonempty packets, whereas row/byte counters count actual live payload. Preparation
+and final reduction are separate kernels and must be included from a model GPU
+timeline when assessing latency. Instrumented CTA times are not additive across
+concurrent roles or ranks. Production uses the uninstrumented specialization.
+
+`EP_XPRESS_DECODE_PACKET_CHANNELS=4/8/16/32` optionally selects packet-only
+parallelism, clamped to the prepared cooperative channel capacity. Zero inherits
+the caller's active channels. This setting does not change dispatch channels or
+the token routing rule. A full TX and RX CTA are reserved per selected channel;
+empty assigned lists finish immediately. More CTAs are a measurement variable,
+not a guaranteed improvement for small payloads.
+
+The vector packet implementation issues up to four independent host loads
+before their dependent HBM stores, uses one aligned 128-bit host store instead
+of four strided 32-bit stores, and reuses rank-ordered vector reduction on the
+staged HBM layout. Scalar/unaligned cases retain a bounded fallback. Neither
+transfer width nor packet capacity changes which rows are routed or weighted.

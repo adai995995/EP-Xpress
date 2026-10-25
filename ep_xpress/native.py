@@ -82,6 +82,14 @@ def load(*, verbose: bool = False):
         decode_ack_batch = os.environ.get("EP_XPRESS_DECODE_ACK_BATCH", "1")
         if decode_ack_batch not in {"1", "2", "4", "8"}:
             raise ValueError("EP_XPRESS_DECODE_ACK_BATCH must be 1, 2, 4, or 8")
+        decode_packet_rows = os.environ.get("EP_XPRESS_DECODE_PACKET_ROWS", "0")
+        if decode_packet_rows not in {"0", "2", "4", "8"}:
+            raise ValueError("EP_XPRESS_DECODE_PACKET_ROWS must be 0, 2, 4, or 8")
+        packet_channels = os.environ.get("EP_XPRESS_DECODE_PACKET_CHANNELS", "0")
+        if packet_channels not in {"0", "4", "8", "16", "32"}:
+            raise ValueError("EP_XPRESS_DECODE_PACKET_CHANNELS must be 0, 4, 8, 16, or 32")
+        if packet_channels != "0" and decode_packet_rows == "0":
+            raise ValueError("packet channel override requires packet transport")
         combine_options = {}
         for option in ("BALANCED_SEND", "SPLIT_TX_RX", "DEFER_RECLAIM"):
             key = "EP_XPRESS_DECODE_" + option
@@ -93,7 +101,11 @@ def load(*, verbose: bool = False):
             raise ValueError("decode scheduling options require EP_XPRESS_DECODE_DESCRIPTOR_BATCH=32")
         if combine_options["DEFER_RECLAIM"] == "1" and combine_options["SPLIT_TX_RX"] != "1":
             raise ValueError("deferred reclamation requires independent TX/RX progress")
-        cuda_flags = ["-O3", "-lineinfo", f"-DEP_XPRESS_PREFILL_READ_UNROLL={read_unroll}",
+        if decode_packet_rows != "0" and (any(v == "1" for v in combine_options.values())
+                                         or decode_ready_prefetch != "0"):
+            raise ValueError("packet transport replaces legacy combine scheduling; disable those options")
+        cuda_flags = [f"-DEP_XPRESS_DECODE_PACKET_ROWS={decode_packet_rows}", "-O3", "-lineinfo", f"-DEP_XPRESS_PREFILL_READ_UNROLL={read_unroll}",
+                      f"-DEP_XPRESS_DECODE_PACKET_CHANNELS={packet_channels}",
                       f"-DEP_XPRESS_PREFILL_WRITE_UNROLL={write_unroll}",
                       f"-DEP_XPRESS_DISPATCH_READ_UNROLL={dispatch_read_unroll}",
                       f"-DEP_XPRESS_COMBINE_LAST_DATA={combine_last_data}",

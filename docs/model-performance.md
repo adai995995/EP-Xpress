@@ -3708,3 +3708,129 @@ reuse before that reader completes. The runtime source was unchanged for this
 additional check. Every EP model variant matched the original on four short greedy prompts and 29 common-prefix
 logprobs. These are bounded correctness checks, not exhaustive proofs of
 numerical equivalence or resilience to failed workers.
+
+## Bounded decode packets, ready-task reception and two-bank credit (2026-10-25)
+
+A separate opt-in combine path groups dynamic token routes into bounded packets,
+commits one READY and one ACK per nonempty peer/tile, and stages independently
+ready receive tasks in HBM before the original rank-ordered reduction. Two host
+banks per packet retain exact per-bank publication generations; only the actual
+reader releases credit. Packet rows remain sparse and partial packets flush
+immediately. All receive CTAs retain 256 threads. Dispatch and prefill pair
+queues are unchanged.
+
+The first two-row implementation uses inherited active channels. The final
+vector implementation adds coalesced host stores, four independent receive
+loads before dependent HBM stores, and vector reduction of staged data. Its
+four-row variants separately compare inherited and eight packet-only channels.
+The two-row to four-row comparison changes several factors and does not isolate
+packet size. The final channel comparison holds source and all other settings
+fixed. A final-source original-EP repeat checks the opt-out path.
+
+Matched full-model configuration: eight H20D GPUs, Qwen3-30B-A3B-Instruct-2507
+BF16, SGLang v0.5.21, TP=DP=EP8, Triton experts, FlashInfer, eager prefill and full
+decode Graph buckets 1/2/4/8. Each run has 512 input and 32 output tokens, eight
+warmups and five measured repeats. Timing excludes startup, capture and profiling;
+the diagnostic traces are collected afterwards. Timed prompt hashes match.
+Both implementations disable P2P/NVLink communication, verify NCCL SHM without
+P2P/NET/NVLS, and observe zero increments in every available NVLink counter.
+No external GPU process was observed; producer NUMA placement is verified for
+every EP run. The image, model configuration and framework source match. The
+fresh NCCL reference was collected before the EP source changes; it does not
+invoke the EP extension. The vector channel ablation and original-EP repeat share one source manifest.
+A later packet-only window-retirement fix is separately revalidated and retimed;
+its recorded runtime source matches the committed files. The fix is compiled
+out of the unchanged original-EP path.
+
+TTFT is the median of repeat-level mean request TTFT. Decode TPS is aggregate
+steady-state output throughput. Ranges below are observed extrema, not confidence
+intervals. TTFT is variable and these decode changes do not establish a causal
+prefill speedup.
+
+| Implementation | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| Default NCCL | 102.140 | 155.297 | 408.849 | 3576.224 |
+| Original EP, publish 8 | 96.535 | 158.323 | 283.511 | 3136.536 |
+| Initial two-row packets | 97.332 | 147.097 | 287.815 | 2883.731 |
+| Vector four-row packets, eight channels | 96.888 | 156.556 | 266.648 | 3195.791 |
+| Vector four-row packets, inherited channels | 97.281 | 150.725 | 273.223 | 3109.955 |
+| Final-source original EP repeat | 96.564 | 158.371 | 274.174 | 3119.277 |
+| Final window-safe four-row packets, eight channels | 97.389 | 157.185 | 274.658 | 3160.533 |
+
+| Implementation | B1 TPS range | B32 TPS range |
+| --- | ---: | ---: |
+| Default NCCL | 154.683-155.919 | 3523.191-3592.283 |
+| Original EP, publish 8 | 157.438-159.022 | 3108.017-3145.568 |
+| Initial two-row packets | 146.236-148.071 | 2865.443-2901.170 |
+| Vector four-row packets, eight channels | 155.620-157.510 | 3159.980-3202.895 |
+| Vector four-row packets, inherited channels | 150.362-151.184 | 3083.476-3158.026 |
+| Final-source original EP repeat | 157.117-158.454 | 3105.292-3138.170 |
+| Final window-safe four-row packets, eight channels | 156.535-157.586 | 3127.889-3168.098 |
+
+### Separate diagnostic timeline
+
+Values are medians across active DECODE ranks of each rank's mean per complete
+Graph replay. One replay includes all 48 MoE layers. These are source-attributed
+GPU intervals, including waiting; they are not PCIe wire time or unprofiled HTTP
+TPOT. No GPU clocks or CTA durations are summed across ranks. Packet preparation
+and HBM reduction are included explicitly.
+
+| Implementation | B32 GPU forward (ms) | Dispatch transport (ms) | Combine transport/fused (ms) | Packet preparation (ms) | Packet HBM reduction (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Original EP, publish 8 | 10.251 | 2.965 | 1.821 | 0.000 | 0.000 |
+| Initial two-row packets | 11.106 | 3.040 | 2.116 | 0.121 | 0.316 |
+| Vector four-row packets, eight channels | 10.091 | 2.975 | 1.328 | 0.134 | 0.136 |
+| Vector four-row packets, inherited channels | 10.301 | 2.996 | 1.553 | 0.133 | 0.131 |
+| Final-source original EP repeat | 10.271 | 2.990 | 1.813 | 0.000 | 0.000 |
+| Final window-safe four-row packets, eight channels | 10.204 | 2.969 | 1.443 | 0.135 | 0.136 |
+
+The final window-safe four-row/eight-channel candidate achieves 3160.533 B32
+Decode TPS: 1.32% above the original-EP repeat and 0.77% above the first control.
+The observed repeat ranges overlap, so this is a small measured difference,
+not an established robust throughput gain. It remains 11.62% below default NCCL.
+B1 throughput is 0.75% below the original-EP repeat. No packet option is enabled
+by default. The earlier 3195.791 result predates the final window-retirement
+barrier and is retained as development evidence, not the final candidate result.
+
+The initial two-row implementation regresses: independently ready reception
+and reduced per-packet signaling do not by themselves pay for staging, extra
+kernels and reduced load concurrency. Vector transfers and more independent
+packet channels recover much of that cost. The same-source channel ablation
+achieves 3195.791 TPS with eight channels versus 3109.955 with inherited channels;
+it changes only packet-channel count. The subsequent window-safe retest is a
+separate measurement and cannot isolate the barrier cost from run variation.
+
+For the final candidate, the median across active ranks of the complete combine
+stage (preparation, transport and reduction together) is 1.721 ms per Decode
+step, versus 1.813 ms for the original fused path. The individual component
+medians are approximately 0.135 ms preparation, 1.443 ms transport and 0.136 ms
+HBM reduction; medians need not add to the median of the total. Dispatch remains
+about 2.969 ms and is unchanged by this experiment. Extra preparation/reduction
+consumes a substantial part of the transport improvement. The next investigation
+should account for dispatch scheduling and these kernel boundaries rather than
+assuming fewer READY/ACK records guarantees NCCL-level end-to-end throughput.
+These are model GPU-stage observations, not an attribution of dispatch time
+specifically to payload, READY or ACK.
+
+The initial packet build passed five focused GPU checks in 102.79 seconds:
+lagging readers and consecutive reuse without dispatch/host rendezvous; scalar
+width and shifted-storage exact comparison against legacy arithmetic;
+eight-GPU changing routes and bucket reuse under Graph; and profile reset/overflow.
+The vector/four-row build passed three focused checks in 88.34 seconds:
+scalar delayed-reader bank reuse, vector-width bitwise legacy comparison, and
+eight-GPU dynamic Graph routes. The final window-retirement fix additionally
+passed a 129-token delayed-reader check in 67.92 seconds. That check forces one
+channel, asserts more than 32 actual packet tasks per CTA, and queues 32 changing
+route invocations without intervening dispatch or CPU rendezvous, exercising
+multiple descriptor windows and both payload banks. Tests cover empty/skewed
+ranks, skipped generations, partial tiles and changing channel counts. Eight
+existing CPU configuration tests also pass. Each measured EP variant matches
+the original on four short greedy model prompts and all 29 common-prefix
+logprobs. These checks are bounded evidence, not exhaustive correctness or
+failure-tolerance proofs. Two- and four-row layouts were exercised; eight-row
+tuning was not evaluated in this experiment.
+
+To opt into the measured candidate, use `EP_XPRESS_DECODE_PACKET_ROWS=4` and
+`EP_XPRESS_DECODE_PACKET_CHANNELS=8` with the existing bounded fused-decode
+configuration. Leave legacy combine balanced/split/deferred/prefetch options
+disabled. Setting packet rows/channels back to zero retains the original path.

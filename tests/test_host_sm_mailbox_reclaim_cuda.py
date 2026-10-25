@@ -12,17 +12,22 @@ pytestmark = [pytest.mark.cuda, pytest.mark.skipif(
     reason="three CUDA GPUs are required")]
 
 
-def _reclaim_worker(rank, init_file):
+def _reclaim_worker(rank, init_file, tokens):
     import torch.distributed as dist
-    world, hidden, tokens = 3, 258, 7
+    world, hidden = 3, 258
     torch.cuda.set_device(rank)
     dist.init_process_group("gloo", init_method="file://" + init_file,
                             rank=rank, world_size=world)
+    # Force more than 32 live packet tasks per CTA even when the build requests
+    # extra packet channels (the native override clamps to prepared capacity).
+    channels = 1 if tokens > 128 else 4
     context = Context(None, list(range(world)), Config(
-        hidden, 1, world * tokens, transport="host_sm", channels=4,
+        hidden, 1, world * tokens, transport="host_sm", channels=channels,
         decode_max_tokens=tokens, fatal_errors=True), device=rank)
     stream = torch.cuda.current_stream()
     context._last_stream = stream
+    packet_rows = native.load().host_sm_packet_rows()
+    max_packet_tasks = 0
 
     def selected(producer, destination, token, step):
         # Empty routes, skipped mailbox generations and changing row counts.
@@ -46,6 +51,9 @@ def _reclaim_worker(rank, init_file):
                         inverse.append([destination, token])
                         values.append(rank + token + step + 1)
             rows = len(inverse)
+            if packet_rows:
+                max_packet_tasks = max(max_packet_tasks,
+                    len({(d, t // packet_rows) for d, t in inverse}))
             owner_rows = torch.zeros((world, rows), dtype=torch.int32, device="cuda")
             for destination, indices in enumerate(owner_lists):
                 if indices:
@@ -64,6 +72,8 @@ def _reclaim_worker(rank, init_file):
             output = torch.empty((tokens, hidden), dtype=torch.bfloat16, device="cuda")
             expected = torch.tensor(expected, dtype=torch.bfloat16, device="cuda")[:, None].expand(tokens, hidden)
             prepared.append((partial, inverse, count, owner_rows, counts, masks, local_rows, output, expected))
+        if tokens > 128 and packet_rows:
+            assert channels == 1 and max_packet_tasks > 32
         torch.cuda.synchronize()
         dist.barrier()
         # Delays rotate between ranks. Do not insert a dispatch or rendezvous
@@ -74,7 +84,7 @@ def _reclaim_worker(rank, init_file):
             elif step % 8 not in (0, 1) and step % world == rank:
                 torch.cuda._sleep(500_000)
             context._prepared.combine(partial, inverse, count, owner_rows, counts,
-                step + 1, output, None, active_channels=1 + step % 4,
+                step + 1, output, None, active_channels=1 + step % channels,
                 expected_ranks=masks, local_rows=local_rows)
         stream.synchronize()
         for *_, output, expected in prepared:
@@ -86,10 +96,12 @@ def _reclaim_worker(rank, init_file):
         dist.destroy_process_group()
 
 
-def test_deferred_mailbox_reuse_with_lagging_readers():
-    if os.environ.get("EP_XPRESS_DECODE_DEFER_RECLAIM") != "1":
+@pytest.mark.parametrize("tokens", [7, 129])
+def test_deferred_mailbox_reuse_with_lagging_readers(tokens):
+    if (os.environ.get("EP_XPRESS_DECODE_DEFER_RECLAIM") != "1" and
+            os.environ.get("EP_XPRESS_DECODE_PACKET_ROWS", "0") == "0"):
         pytest.skip("enable deferred mailbox reclamation")
     native.load()
     with tempfile.TemporaryDirectory(prefix="ep-xpress-reclaim-") as root:
         torch.multiprocessing.spawn(_reclaim_worker,
-            args=(os.path.join(root, "rendezvous"),), nprocs=3, join=True)
+            args=(os.path.join(root, "rendezvous"), tokens), nprocs=3, join=True)

@@ -109,12 +109,19 @@ class Config:
         rows = self.channel_chunk_rows(channels)
         return max(1, (rows + queue_peers - 1) // queue_peers)
 
-    def mailbox_arena_bytes(self, world_size):
-        """One producer's decode mailbox, matching the native mapped layout."""
+    def mailbox_arena_bytes(self, world_size, *, packet_rows=0):
+        """One producer's mailbox; bootstrap supplies the compiled packet ABI."""
         if isinstance(world_size, bool) or not isinstance(world_size, int) or not 1 <= world_size <= 63:
             raise ValueError("world_size must be an integer in [1, 63]")
         if not self.decode_max_tokens:
             return 0
+        if (isinstance(packet_rows, bool) or not isinstance(packet_rows, int) or
+                packet_rows not in (0, 2, 4, 8)):
+            raise ValueError("packet_rows must be 0, 2, 4, or 8")
+        if packet_rows:
+            tiles = (self.decode_max_tokens + packet_rows - 1) // packet_rows
+            stride = ((128 + packet_rows * self.hidden_size * 2 + 127) // 128) * 128
+            return ((128 + world_size * tiles * 2 * stride + 4095) // 4096) * 4096
         token_bytes = ((32 + self.hidden_size * 2 + 127) // 128) * 128
         return ((128 + world_size * self.decode_max_tokens * token_bytes + 4095) // 4096) * 4096
 

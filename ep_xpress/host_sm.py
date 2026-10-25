@@ -300,6 +300,7 @@ class HostSMContext(Context):
             raise ValueError("total receive capacity must fit int32")
         with torch.cuda.device(self.device):
             native.load()
+            self._decode_packet_rows = native.load().host_sm_packet_rows()
             self._channel_capacity = native.host_sm_max_channels(self.world_size)
         members = dist.get_process_group_ranks(group) if group is not None else list(range(dist.get_world_size()))
         self.group = dist.new_group(ranks=members, backend="gloo",
@@ -371,7 +372,8 @@ class HostSMContext(Context):
             with torch.cuda.device(self.device):
                 self._arena_sizes["mailbox"] = native.host_sm_mailbox_bytes(
                     self.config.hidden_size, self.config.decode_max_tokens, self.world_size)
-            if self._arena_sizes["mailbox"] != self.config.mailbox_arena_bytes(self.world_size):
+            if self._arena_sizes["mailbox"] != self.config.mailbox_arena_bytes(
+                    self.world_size, packet_rows=self._decode_packet_rows):
                 raise RuntimeError("mapped decode mailbox allocation ABI mismatch")
         self._pool_bytes = sum(self._arena_sizes.values()) * self.world_size
         if self._pool_bytes > self.config.host_pool_budget_bytes:
@@ -512,7 +514,8 @@ class HostSMContext(Context):
             fields = list(native.load().host_sm_decode_profile_fields(stage == "dispatch"))
             with torch.cuda.stream(self._work_stream):
                 roles = 2 if (stage == "combine" and
-                              os.environ.get("EP_XPRESS_DECODE_SPLIT_TX_RX", "0") == "1") else 1
+                              (os.environ.get("EP_XPRESS_DECODE_SPLIT_TX_RX", "0") == "1" or
+                               self._decode_packet_rows != 0)) else 1
                 storage = torch.zeros((max_samples_per_channel + 1,
                                        self.effective_channels * roles, len(fields)),
                                       dtype=torch.int64, device=self.device)
@@ -593,7 +596,11 @@ class HostSMContext(Context):
                           "combine payload includes reduction/output and local-only tokens. Dispatch "
                           "ack_drain_check_ns counts checks/completion, whereas idle_* fields overlap phases. "
                           "Combine idle_final_drain_ns is its explicit ACK-check phase. "
-                          "Includes instrumentation barriers; not pure PCIe time. GPU clocks are local.",
+                          "Includes instrumentation barriers; not pure PCIe time. GPU clocks are local. " +
+                          ("Packet mode samples transport only: send_metadata includes credit checks; "
+                           "receive_payload excludes the separate HBM reduction; preparation and reduction "
+                           "kernels must be included separately from a GPU timeline."
+                           if state["stage"] == "combine" and self._decode_packet_rows else ""),
             }
 
     def start_combine_profile(self, max_operations=1024):
