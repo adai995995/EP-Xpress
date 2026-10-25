@@ -63,6 +63,11 @@ def load(*, verbose: bool = False):
         decode_dispatch_indexed = os.environ.get("EP_XPRESS_DECODE_DISPATCH_INDEXED", "0")
         if decode_dispatch_indexed not in {"0", "1"}:
             raise ValueError("EP_XPRESS_DECODE_DISPATCH_INDEXED must be 0 or 1")
+        decode_dispatch_pipeline = os.environ.get("EP_XPRESS_DECODE_DISPATCH_PIPELINE", "0")
+        if decode_dispatch_pipeline not in {"0", "1"}:
+            raise ValueError("EP_XPRESS_DECODE_DISPATCH_PIPELINE must be 0 or 1")
+        if decode_dispatch_pipeline == "1" and decode_dispatch_indexed != "1":
+            raise ValueError("decode dispatch pipeline requires EP_XPRESS_DECODE_DISPATCH_INDEXED=1")
         cuda_flags = ["-O3", "-lineinfo", f"-DEP_XPRESS_PREFILL_READ_UNROLL={read_unroll}",
                       f"-DEP_XPRESS_PREFILL_WRITE_UNROLL={write_unroll}",
                       f"-DEP_XPRESS_DISPATCH_READ_UNROLL={dispatch_read_unroll}",
@@ -70,7 +75,8 @@ def load(*, verbose: bool = False):
                       f"-DEP_XPRESS_DECODE_PEER_BATCH={decode_peer_batch}",
                       f"-DEP_XPRESS_DECODE_PUBLISH_BATCH={decode_publish_batch}",
                       f"-DEP_XPRESS_DECODE_DESCRIPTOR_BATCH={decode_descriptor_batch}",
-                      f"-DEP_XPRESS_DECODE_DISPATCH_INDEXED={decode_dispatch_indexed}"]
+                      f"-DEP_XPRESS_DECODE_DISPATCH_INDEXED={decode_dispatch_indexed}",
+                      f"-DEP_XPRESS_DECODE_DISPATCH_PIPELINE={decode_dispatch_pipeline}"]
         digest = hashlib.sha256()
         for source in sources + sorted(source_dir.glob("*.h")):
             digest.update(source.read_bytes())

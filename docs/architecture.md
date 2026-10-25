@@ -813,3 +813,72 @@ classification overlaps the ten disjoint phase totals. Generic eager diagnostic
 schemas retain their previous phase partition. Normal contexts do not allocate
 these counters or execute diagnostic timers/barriers. Diagnostic samples are
 not a substitute for ordinary full-model TTFT and Decode TPS measurements.
+
+
+## Experimental decode dispatch prefetch pipeline
+
+Status: implemented locally, CUDA compilation, protocol checks and full-model
+measurements pending. The build flag `EP_XPRESS_DECODE_DISPATCH_PIPELINE=1`
+requires `EP_XPRESS_DECODE_DISPATCH_INDEXED=1`; both remain opt-in. This does not
+change prefill, combine, active channels, arena allocation or routing weights.
+
+Eligibility is derived exclusively from group-wide configuration: bounded
+single-frame dispatch, a fitting index region and no more than 32 configured
+source rows per active channel. Larger bounds or insufficient space use the
+existing indexed or general-ring path. Empty local inputs do not change the
+wire protocol. The native build identity is already included in bootstrap.
+
+The sender writes the same deduplicated payload once and constructs each
+reader's compact descriptor list. After every writer fences and the CTA joins,
+it release-stores `(epoch << 32) | (count + 1)` into each reader's aligned 64-bit
+index header. An acquire of this word establishes both readiness and count;
+there is no separate host count load. Count zero is encoded as one, so an
+empty current-generation frame is distinguishable from uninitialized storage.
+The original slot READY is retained for transitions back to the general ring.
+
+A 320-thread CTA has two control warps and eight payload RX warps. Initial
+routing, local bypass and TX publication complete before the receive pipeline;
+this version does not overlap the local TX phase with RX. The control warps
+own disjoint incoming peers by rank parity. Each has one shared-memory stage
+and polls its pending peers concurrently; an unavailable peer cannot block a
+ready peer in that group. Descriptors and route IDs/weights are fetched for up
+to two peers concurrently. Control warps reserve output/owner ranges, populate
+metadata and inverse maps, and publish the corresponding stage to RX.
+
+The 256-thread RX group consumes ready stages fairly, retaining the vectorized
+host payload reader and scalar-tail fallback. Stage states are:
+
+- Control-owned: descriptors may be replaced.
+- RX-owned: descriptors and output ranges are immutable.
+- Read-complete: all RX threads have fenced and joined; control may ACK.
+- Finished: no incoming stage or outgoing ACK remains in that group.
+
+Shared stage transfers use CTA acquire/release operations. Only the RX group
+participates in its 256-thread named barrier; control warps use warp barriers.
+Each metadata reader fences before stage publication. Every payload reader
+fences before the RX leader release-publishes completion. The control leader
+acquires completion before publishing the remote ACK. The other control group
+and RX can keep progressing during that ACK store. No ACK depends on unrelated
+peer completion, and no mutable host atomic counter is introduced. Count-only
+readers ACK without a payload transfer. Each group also drains its actual
+outgoing ACK words before operation completion and arena reuse.
+
+The relevant ordering primitives follow NVIDIA's
+[PTX memory and barrier specification](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-bar).
+Source review is not a substitute for running the CUDA validation below.
+
+The pipeline deliberately retains per-frame reader fences. Their cost, the
+extra control-warps' register footprint, shared handoff latency and a possible
+imbalance between parity groups can offset overlap gains. No numerical speedup
+is assumed. The old nine/ten sequential phase counters cannot describe these
+overlapping groups: preparing dispatch phase sampling is rejected for this
+build rather than silently profiling a different kernel. Combine sampling and
+ordinary CUDA timelines remain available.
+
+Required focused validation: dynamic Graph routes and eager-prefill transitions,
+int32/int64 IDs, empty/skewed ranks, scalar payload tails, both prefetch stages
+refilled across multiple peers, and transitions between eligible/fallback channel
+counts. Then compare complete SGLang inference against the previous indexed
+implementation and default NCCL on identical GPUs with P2P/NVLink disabled,
+reporting single-request and 32-request TTFT and Decode TPS. Record both compiler
+and runtime outcomes before treating this specialization as validated.

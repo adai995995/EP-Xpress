@@ -166,6 +166,13 @@ static_assert(EP_XPRESS_DECODE_DESCRIPTOR_BATCH == 0 || EP_XPRESS_DECODE_DESCRIP
 #endif
 static_assert(EP_XPRESS_DECODE_DISPATCH_INDEXED == 0 || EP_XPRESS_DECODE_DISPATCH_INDEXED == 1,
               "unsupported indexed decode dispatch setting");
+#ifndef EP_XPRESS_DECODE_DISPATCH_PIPELINE
+#define EP_XPRESS_DECODE_DISPATCH_PIPELINE 0
+#endif
+static_assert(EP_XPRESS_DECODE_DISPATCH_PIPELINE == 0 || EP_XPRESS_DECODE_DISPATCH_PIPELINE == 1,
+              "unsupported decode dispatch pipeline setting");
+static_assert(!EP_XPRESS_DECODE_DISPATCH_PIPELINE || EP_XPRESS_DECODE_DISPATCH_INDEXED,
+              "decode dispatch pipeline requires indexed dispatch");
 __device__ __forceinline__ void host_store128(void* address, uint4 value) {
   // Match the scalar volatile store policy. Each writer still executes a
   // system fence before the Tx leader publishes READY for the whole frame.
@@ -2033,6 +2040,8 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
   }
 }
 
+#include "host_sm_dispatch_pipeline.h"
+
 int max_channels_current_device(int world = 1) {
   // Capability is fixed for this extension/device. Validate direct native
   // calls without repeating attribute and occupancy queries on every layer.
@@ -2061,31 +2070,43 @@ int max_channels_current_device(int world = 1) {
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&single_b, host_sm_transport_kernel<false, int64_t, false, false, true>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&single_profile_a, host_sm_transport_kernel<false, int32_t, true, false, true>, kThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&single_profile_b, host_sm_transport_kernel<false, int64_t, true, false, true>, kThreads, 0));
-  const int capacity = std::min({32, sms * std::min({a, b, selective_a, selective_b, mailbox_capacity, single_a, single_b, single_profile_a, single_profile_b}),
+  int pipeline_capacity = 32;
+#if EP_XPRESS_DECODE_DISPATCH_PIPELINE
+  int pipeline_i32, pipeline_i64;
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&pipeline_i32,
+      host_sm_dispatch_pipeline_kernel<int32_t>, kDispatchPipelineThreads, 0));
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&pipeline_i64,
+      host_sm_dispatch_pipeline_kernel<int64_t>, kDispatchPipelineThreads, 0));
+  pipeline_capacity = sms * std::min(pipeline_i32, pipeline_i64);
+#endif
+  const int capacity = std::min({32, pipeline_capacity, sms * std::min({a, b, selective_a, selective_b, mailbox_capacity, single_a, single_b, single_profile_a, single_profile_b}),
                                  sms * std::min({c, diagnostic, warp_pair_capacity}) / world});
   capacities.emplace(key, capacity);
   return capacity;
 }
 
-template <bool Combine, typename Id, bool Profile = false, bool Selective = false, bool WarpCombine = false, bool SingleFrame = false>
+template <bool Combine, typename Id, bool Profile = false, bool Selective = false, bool WarpCombine = false, bool SingleFrame = false, bool Pipeline = false>
 void launch_transport(TransportArgs args, cudaStream_t stream) {
   const int64_t elements = int64_t(args.capacity) * args.hidden * (Combine ? args.world : 1);
   const int blocks = int(std::max<int64_t>(1, std::min<int64_t>(4096, (elements + kThreads - 1) / kThreads)));
   host_sm_init_kernel<Combine><<<blocks, kThreads, 0, stream>>>(args);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   const int lanes = args.channels * (Combine ? args.world : 1);
+  constexpr int transport_threads = Pipeline ? kDispatchPipelineThreads : kThreads;
   if (lanes == 1) {
-    if constexpr (WarpCombine) host_sm_warp_pair_combine_kernel<Profile><<<1, kThreads, 0, stream>>>(args);
+    if constexpr (Pipeline) host_sm_dispatch_pipeline_kernel<Id><<<1, transport_threads, 0, stream>>>(args);
+    else if constexpr (WarpCombine) host_sm_warp_pair_combine_kernel<Profile><<<1, kThreads, 0, stream>>>(args);
     else if constexpr (Combine) host_sm_pair_combine_kernel<Profile><<<1, kThreads, 0, stream>>>(args);
     else host_sm_transport_kernel<false, Id, Profile, Selective, SingleFrame><<<1, kThreads, 0, stream>>>(args);
   } else {
     void* parameters[] = {&args};
     const void* kernel;
-    if constexpr (WarpCombine) kernel = reinterpret_cast<const void*>(host_sm_warp_pair_combine_kernel<Profile>);
+    if constexpr (Pipeline) kernel = reinterpret_cast<const void*>(host_sm_dispatch_pipeline_kernel<Id>);
+    else if constexpr (WarpCombine) kernel = reinterpret_cast<const void*>(host_sm_warp_pair_combine_kernel<Profile>);
     else if constexpr (Combine) kernel = reinterpret_cast<const void*>(host_sm_pair_combine_kernel<Profile>);
     else kernel = reinterpret_cast<const void*>(host_sm_transport_kernel<false, Id, Profile, Selective, SingleFrame>);
     C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
-        kernel, dim3(lanes), dim3(kThreads), parameters, 0, stream));
+        kernel, dim3(lanes), dim3(transport_threads), parameters, 0, stream));
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   // Fatal inference contexts terminate on a device error; zeroing count after
@@ -2271,6 +2292,8 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
 }
 
 void PreparedHostSM::prepare_decode_profile(torch::Tensor storage, bool dispatch) {
+  TORCH_CHECK(!(dispatch && EP_XPRESS_DECODE_DISPATCH_PIPELINE),
+              "pipeline dispatch does not support sequential phase counters; use a CUDA timeline");
   const c10::cuda::CUDAGuard guard(impl_->device);
   eager_stream(impl_->device);
   auto& args = dispatch ? impl_->dispatch : impl_->combine;
@@ -2387,6 +2410,17 @@ void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Ten
                        a.dispatch_index_offset + index_bytes <= index_limit;
   // Bounded decode diagnostics never record eager prefill in the same context.
   if (!expected_ranks.has_value()) a.decode_profile = nullptr;
+  const bool pipeline = EP_XPRESS_DECODE_DISPATCH_PIPELINE && a.indexed_dispatch &&
+                        index_rows <= kDispatchPipelineRows;
+  TORCH_CHECK(!(pipeline && (profile.has_value() || a.decode_profile)),
+              "pipeline dispatch requires a CUDA timeline, not sequential phase counters");
+  if constexpr (EP_XPRESS_DECODE_DISPATCH_PIPELINE) {
+    if (pipeline) {
+      if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t, false, false, false, true, true>(a, stream);
+      else launch_transport<false, int64_t, false, false, false, true, true>(a, stream);
+      return;
+    }
+  }
   if (single_frame && (profile.has_value() || a.decode_profile)) {
     if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t, true, false, false, true>(a, stream);
     else launch_transport<false, int64_t, true, false, false, true>(a, stream);

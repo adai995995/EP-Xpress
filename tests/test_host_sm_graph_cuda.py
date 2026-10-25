@@ -35,7 +35,17 @@ def _worker(rank, init_file, fused, single_frame=False, chunk_bytes=4096, id_bit
         if world == 3:
             patterns = ([[0, 1], [2, 4], [0, 4], [-1, -1]],
                         [[4, 5], [0, 3], [1, 5], [2, -1]])
-        ids = torch.tensor([patterns[step % 2][i % 4] for i in range(n)],
+        routes = [patterns[step % 2][i % 4] for i in range(n)]
+        if world > 3:
+            # Multiple queued peers per control warp; destinations change every
+            # replay, including same-rank dedup, absent routes and zero readers.
+            routes = []
+            for i in range(n):
+                peer = (rank + step + i) % world
+                routes.append(([-1, -1] if i % 4 == 3 else
+                               [2 * peer, 2 * peer + 1] if i % 4 == 0 else
+                               [2 * peer, 2 * ((peer + 1) % world) + 1]))
+        ids = torch.tensor(routes,
                            dtype=torch.int32 if id_bits == 32 else torch.int64, device="cuda").reshape(n, 2)
         weights = torch.full((n, 2), 0.5, device="cuda")
         return x, ids, weights
@@ -185,3 +195,19 @@ def test_indexed_dispatch_multi_warp_route_tail():
         torch.multiprocessing.spawn(_worker,
             args=(os.path.join(root, "rendezvous"), True, True, 262144, 32, False, 3, 258, True),
             nprocs=3, join=True)
+
+
+def test_dispatch_pipeline_multi_peer_stage_reuse():
+    """Both prefetch stages refill while route shapes and graph epochs change."""
+    if os.environ.get("EP_XPRESS_DECODE_DISPATCH_PIPELINE") != "1":
+        pytest.skip("enable the experimental decode dispatch pipeline")
+    if torch.cuda.device_count() < 5:
+        pytest.skip("five CUDA GPUs are required")
+    from torch.utils.cpp_extension import CUDA_HOME
+    if CUDA_HOME is None:
+        pytest.skip("CUDA toolkit is unavailable")
+    native.load()
+    with tempfile.TemporaryDirectory(prefix="ep-xpress-pipeline-test-") as root:
+        torch.multiprocessing.spawn(_worker,
+            args=(os.path.join(root, "rendezvous"), True, True, 262144, 64, False, 5, 258, True),
+            nprocs=5, join=True)
