@@ -2289,14 +2289,14 @@ void launch_transport(TransportArgs args, cudaStream_t stream) {
   const int lanes = args.channels * (Combine ? args.world : 1);
   constexpr int transport_threads = Pipeline ? kDispatchPipelineThreads : kThreads;
   if (lanes == 1) {
-    if constexpr (Pipeline) host_sm_dispatch_pipeline_kernel<Id><<<1, transport_threads, 0, stream>>>(args);
+    if constexpr (Pipeline) host_sm_dispatch_pipeline_kernel<Id, Profile><<<1, transport_threads, 0, stream>>>(args);
     else if constexpr (WarpCombine) host_sm_warp_pair_combine_kernel<Profile><<<1, kThreads, 0, stream>>>(args);
     else if constexpr (Combine) host_sm_pair_combine_kernel<Profile><<<1, kThreads, 0, stream>>>(args);
     else host_sm_transport_kernel<false, Id, Profile, Selective, SingleFrame><<<1, kThreads, 0, stream>>>(args);
   } else {
     void* parameters[] = {&args};
     const void* kernel;
-    if constexpr (Pipeline) kernel = reinterpret_cast<const void*>(host_sm_dispatch_pipeline_kernel<Id>);
+    if constexpr (Pipeline) kernel = reinterpret_cast<const void*>(host_sm_dispatch_pipeline_kernel<Id, Profile>);
     else if constexpr (WarpCombine) kernel = reinterpret_cast<const void*>(host_sm_warp_pair_combine_kernel<Profile>);
     else if constexpr (Combine) kernel = reinterpret_cast<const void*>(host_sm_pair_combine_kernel<Profile>);
     else kernel = reinterpret_cast<const void*>(host_sm_transport_kernel<false, Id, Profile, Selective, SingleFrame>);
@@ -2487,8 +2487,7 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
 }
 
 void PreparedHostSM::prepare_decode_profile(torch::Tensor storage, bool dispatch) {
-  TORCH_CHECK(!(dispatch && EP_XPRESS_DECODE_DISPATCH_PIPELINE),
-              "pipeline dispatch does not support sequential phase counters; use a CUDA timeline");
+  const bool pipeline_profile = dispatch && EP_XPRESS_DECODE_DISPATCH_PIPELINE;
   const c10::cuda::CUDAGuard guard(impl_->device);
   eager_stream(impl_->device);
   auto& args = dispatch ? impl_->dispatch : impl_->combine;
@@ -2496,11 +2495,19 @@ void PreparedHostSM::prepare_decode_profile(torch::Tensor storage, bool dispatch
               "prepare decode profiling once before any submission or graph capture");
   tensor_check(storage, at::kLong, 3, impl_->device, "decode profile");
   TORCH_CHECK(storage.size(0) >= 2 && storage.size(0) <= 4097 &&
-              storage.size(1) == impl_->combine.channels && storage.size(2) == PFieldCount + 4,
+              storage.size(1) == impl_->combine.channels && storage.size(2) == (pipeline_profile ? DFieldCount : PFieldCount) + 4,
               "invalid decode profile shape");
   int resident = 0, sms = 0;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &resident, host_sm_mailbox_combine_kernel<true>, kThreads, 0));
+  if (pipeline_profile) {
+    int resident64;
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &resident, host_sm_dispatch_pipeline_kernel<int32_t, true>, kDispatchPipelineThreads, 0));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &resident64, host_sm_dispatch_pipeline_kernel<int64_t, true>, kDispatchPipelineThreads, 0));
+    resident = std::min(resident, resident64);
+  }
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, impl_->device.index()));
   TORCH_CHECK(impl_->combine.channels <= resident * sms, "diagnostic grid exceeds resident capacity");
   impl_->retained.push_back(storage);
@@ -2509,8 +2516,8 @@ void PreparedHostSM::prepare_decode_profile(torch::Tensor storage, bool dispatch
   args.decode_profile_channels = int(storage.size(1));
 }
 
-std::vector<std::string> host_sm_decode_profile_fields() {
-  auto fields = kProfileFields;
+std::vector<std::string> host_sm_decode_profile_fields(bool dispatch) {
+  auto fields = dispatch && EP_XPRESS_DECODE_DISPATCH_PIPELINE ? kDispatchProfileFields : kProfileFields;
   fields.insert(fields.end(), {"epoch", "local_tokens", "input_capacity", "active_channels"});
   return fields;
 }
@@ -2607,12 +2614,20 @@ void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Ten
   if (!expected_ranks.has_value()) a.decode_profile = nullptr;
   const bool pipeline = EP_XPRESS_DECODE_DISPATCH_PIPELINE && a.indexed_dispatch &&
                         index_rows <= kDispatchPipelineRows;
-  TORCH_CHECK(!(pipeline && (profile.has_value() || a.decode_profile)),
-              "pipeline dispatch requires a CUDA timeline, not sequential phase counters");
+  TORCH_CHECK(!(pipeline && profile.has_value()),
+              "pipeline dispatch requires prepared role counters, not sequential phase counters");
+  // Pipeline diagnostics have a separate schema; ineligible operations retain
+  // their ordinary fallback without falsely recording a different schedule.
+  if (EP_XPRESS_DECODE_DISPATCH_PIPELINE && !pipeline) a.decode_profile = nullptr;
   if constexpr (EP_XPRESS_DECODE_DISPATCH_PIPELINE) {
     if (pipeline) {
+      if (a.decode_profile) {
+        if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t, true, false, false, true, true>(a, stream);
+        else launch_transport<false, int64_t, true, false, false, true, true>(a, stream);
+      } else {
       if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t, false, false, false, true, true>(a, stream);
       else launch_transport<false, int64_t, false, false, false, true, true>(a, stream);
+      }
       return;
     }
   }

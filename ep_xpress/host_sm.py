@@ -509,7 +509,7 @@ class HostSMContext(Context):
                 raise ValueError("max_samples_per_channel must be in [1, 4096]")
             if stage not in ("dispatch", "combine"):
                 raise ValueError("decode profile stage must be dispatch or combine")
-            fields = list(native.load().host_sm_decode_profile_fields())
+            fields = list(native.load().host_sm_decode_profile_fields(stage == "dispatch"))
             with torch.cuda.stream(self._work_stream):
                 storage = torch.zeros((max_samples_per_channel + 1,
                                        self.effective_channels, len(fields)),
@@ -545,6 +545,29 @@ class HostSMContext(Context):
             for channel, header in enumerate(raw[0]):
                 for i in range(min(header[0], state["max_samples"])):
                     samples.append({"channel": channel, "values": raw[i + 1][channel]})
+            if "ctrl0_ready_poll_ns" in state["fields"]:
+                tx = ["tx_route_local_ns", "tx_metadata_ns", "tx_payload_ns", "tx_publish_ns"]
+                controls = {f"ctrl{g}": [f"ctrl{g}_{f}_ns" for f in (
+                    "ready_poll", "descriptor_alloc", "metadata", "metadata_commit", "stage_wait",
+                    "ack_publish", "ack_drain", "other")] for g in range(2)}
+                rx = [f"rx_{f}_ns" for f in ("stage_wait", "payload", "completion", "ack_drain_wait", "other")]
+                return {
+                    "schema_version": 3, "stage": "dispatch_pipeline", "rank": self.rank,
+                    "fields": state["fields"], "samples": samples,
+                    "dropped_samples": sum(row[2] for row in raw[0]), "status": int(self._status.item()),
+                    "phase_fields": [], "role_phase_fields": {"tx": tx, **controls, "rx": rx},
+                    "timing": "Concurrent role-leader timelines; never sum roles as wall time. "
+                        "TX phases partition tx_end_offset_ns; control/RX phases partition their "
+                        "end-minus-begin offsets. No additional synchronization barriers. "
+                        "TX/payload phases are leader instruction intervals; publication/completion "
+                        "include other-thread stragglers and fences. READY polling includes host "
+                        "flag accesses, votes and loop overhead, not only remote lateness. "
+                        "RX stage wait includes metadata preparation and scheduling; ACK drain wait "
+                        "starts once both control groups complete incoming reads/ACK publication. "
+                        "Only eligible pipeline decode operations are sampled; prefill/fallback excluded. "
+                        "Prepared but disabled kernels retain instrumentation resources. "
+                        "GPU clocks are local; record writes excluded.",
+                }
             if state["stage"] == "dispatch":
                 phases = ["route_local_ns", "send_metadata_ns", "send_payload_ns",
                           "publish_fence_ready_ns", "peer_poll_ns", "receive_metadata_select_ns",

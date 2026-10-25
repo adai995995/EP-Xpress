@@ -3216,3 +3216,151 @@ option available for further work, not claiming that control-warp polling alone
 resolves the throughput gap. Further work should identify which dispatch and
 producer-readiness dependencies lie on the critical path before changing more
 synchronization or sacrificing receive parallelism.
+
+
+## Fine-grained dispatch pipeline attribution (2026-10-25)
+
+This change adds opt-in diagnostics to the current dispatch pipeline; transport
+scheduling, routing, payload arithmetic and ACK lifetimes are unchanged. Schema 3
+records TX and three concurrent role-leader timelines instead of treating the
+pipeline as the legacy sequential kernel. No new synchronization barriers are
+inserted. Phase transitions, protocol counts and diagnostic-only shared completion
+flags are recorded; ordinary contexts retain the uninstrumented specialization.
+The final implementation timestamps phase transitions only, avoiding repeated
+clock reads while polling in the same phase.
+
+### Workload and validation
+
+The full Qwen3-30B-A3B-Instruct-2507 BF16 model runs on eight H20D GPUs using
+SGLang v0.5.21, TP=DP=EP8, Triton experts, FlashInfer attention, full decode
+Graphs and eager prefill. The current dispatch pipeline remains enabled;
+combine control-warp polling and ready-peer prefetch remain disabled. Existing
+channel/frame/descriptor/publish/peer settings are unchanged. P2P/NVLink paths
+are disabled; NCCL transport logs show SHM only and available NVLink counters
+show zero delta. The ownership sampler observed no external GPU process.
+
+Each B1/B32 diagnostic load uses 512-token prompts after eight warmups and then
+identical requests in off/on/on/off order, generating eight tokens. B1 is pinned
+to DP rank 0; B32 places four requests on each rank. Every on trial records 384
+pipeline dispatches per rank, with zero status errors or dropped samples. B1
+uses two active channels; B32 uses four. All role partitions and received-byte
+identities passed. Prompt hashes and payload/empty-notification totals match
+across repetitions and between initial and transition-only instrumentation.
+The final runtime source hashes were verified against the recorded manifest.
+
+A focused five-GPU Graph check passed in 69.22 seconds, covering changing routes,
+empty/skewed ranks, scalar tails, eager transitions, profile reset and sample
+buffer overflow. The transition-only refinement was then validated by the full
+model's partition/status/count assertions. No transport optimization is included.
+
+### Ordinary-path reference and probe perturbation
+
+A separate ordinary context, without prepared counters, used eight warmups and
+five timed repeats at 512/32 input/output tokens. B1 TTFT/Decode TPS were
+96.834 ms / 155.450; B32 were 292.164 ms / 2912.860. Its complete Graph trace
+measured B32 dispatch 3.581 ms, fused combine 1.959 ms and forward 11.003 ms,
+consistent with the preceding reference. B1 dispatch/forward were 1.525/6.757 ms.
+These ordinary timings are separate from the eight-token diagnostic requests;
+B1 placement and tracing also differ, so they are not a strict probe A/B.
+
+Prepared-but-disabled counters still use the diagnostic specialization. The
+following within-server off/on comparison measures active counter perturbation,
+not the total difference from the ordinary kernel:
+
+| Batch | Counter-off TPOT (ms) | Counter-on TPOT (ms) | Increase |
+| --- | ---: | ---: | ---: |
+| 1 | 6.590 | 7.099 | 7.73% |
+| 32 | 11.827 | 12.899 | 9.07% |
+
+The B32 dispatch kernel itself rises from 78.005 to 98.881 us in the matched
+trace (+26.76%). The initial per-iteration probe measured 76.989/98.102 us;
+transition-only timing did not eliminate observer cost. Thus the detailed values
+below characterize instrumented execution and do not precisely partition the
+ordinary 3.581 ms. The hotspot ordering remained stable across both probe forms.
+Kernel trace durations include entry/record emission; the internal elapsed field
+excludes record emission and initial counter setup.
+
+### B32 role timelines
+
+For every rank-local operation, select its latest-finishing CTA. Then average
+per rank/trial and across eight ranks and two trials. The control column uses
+that CTA's latest-finishing control group; it is not the sum of both groups.
+TX, control and RX have separate denominators and overlap after the TX prefix.
+No cross-GPU timestamp subtraction or concurrent-duration summation is used.
+
+Sampled CTA residence is 95.997 us: TX prefix 12.120 us, RX role 83.709 us, plus a small start/join remainder.
+
+| TX leader interval | Mean (us) |
+| --- | ---: |
+| Route/local copy | 5.280 |
+| Metadata writes | 0.592 |
+| Payload writes | 1.130 |
+| Writer fence/READY publication | 5.118 |
+
+| Latest control-group interval | Mean (us) | Share of that role |
+| --- | ---: | ---: |
+| READY polling | 6.780 | 8.1% |
+| Descriptor read/output allocation | 12.108 | 14.6% |
+| Expert IDs/weights | 7.725 | 9.3% |
+| Metadata fence/stage handoff | 18.204 | 21.9% |
+| Occupied-stage waiting | 16.321 | 19.6% |
+| ACK publication | 7.006 | 8.4% |
+| Outgoing ACK drain | 14.697 | 17.7% |
+| Other | 0.358 | 0.4% |
+
+| RX interval | Mean (us) | Share of RX role |
+| --- | ---: | ---: |
+| Waiting for an available stage | 50.016 | 59.8% |
+| Payload instructions | 8.428 | 10.1% |
+| Reader fence/completion handoff | 12.176 | 14.5% |
+| Waiting after both groups finished incoming work | 13.088 | 15.6% |
+
+RX stage waiting includes delayed READY, descriptor/metadata preparation, ACK
+handoff and scheduling; it is not entirely metadata time. Control stage waiting
+and RX payload/completion overlap and must not be added. Metadata-commit and RX
+completion include system fences, warp/group barriers and handoff, so this run
+cannot attribute their entire cost to one fence instruction. Leader payload
+intervals exclude other-lane stragglers charged to completion. Nevertheless,
+both probes show that payload instructions are a small share of RX residence,
+while control preparation, stage supply and completion dominate the measured
+schedule. This is not a PCIe bandwidth utilization measurement.
+
+### READY rounds, empty notifications and B1
+
+At B1, the first on trial has 41,243 empty notifications and 1,765 payload-bearing notifications (95.90% empty), with 7,229,440 requested payload-read bytes. 66.03% of control polling rounds observe no ready peer.
+
+At B32, the first on trial has 28,993 empty notifications and 57,023 payload-bearing notifications (33.71% empty), with 233,566,208 requested payload-read bytes. 5.06% of control polling rounds observe no ready peer.
+
+The B1 source rank has no incoming payload: its sampled CTA takes 37.654 us,
+including a 12.553 us TX prefix; its latest control group's READY/ACK-publication/drain
+intervals are 6.933/5.006/10.520 us. Other ranks,
+including nonrecipient routes, average 50.571 us, with 20.905 us READY polling
+in the selected control group. Round fractions are counts, not waiting-time
+fractions. B1 and B32 therefore have different control bottlenecks.
+
+The B1 captured local shape is one row per rank but uses two channels, leaving
+one source-row partition empty. The current adapter raises channel width to
+accommodate the configured single-frame source bound. This preserves arbitrary
+legal skew but creates empty-channel signaling for the small Graph bucket.
+Zero-count notifications are still required by today's completion/reuse protocol;
+the measurements do not authorize dropping them without replacing that contract.
+
+### Optimization priorities suggested by the measurements
+
+1. Allow payload reception once descriptors and output locations are available,
+   while control reads IDs/weights. Join metadata and payload completion before
+   ACK; investigate whether fences can be deferred or shared at that join with
+   an explicit memory-order proof. Do not simply delete fences.
+2. Give each control group independent next-descriptor staging, so one occupied
+   stage does not prevent preparing the next peer. Preserve the 256-thread RX
+   group before trying more CTAs or smaller receive groups.
+3. Separate local receive readiness from outgoing-buffer reclamation where the
+   protocol can enforce credit at the actual next reuse. The measured post-receive
+   tail supports examining this dependency but does not prove it is all removable.
+4. For B1, investigate group-consistent bucket bounds and batched empty completion
+   notifications rather than increasing channel count. Preserve dynamic routing,
+   Graph generation safety and fallback interoperability.
+
+The current evidence favors stage/metadata/completion work over payload-vector
+micro-tuning. It does not establish a speedup for any proposed change, nor identify
+the isolated system-fence cost or prove which rank caused another rank to wait.

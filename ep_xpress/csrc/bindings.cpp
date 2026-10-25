@@ -18,7 +18,7 @@ torch::Tensor finish_combine_cuda(torch::Tensor remote, torch::Tensor local);
 int64_t host_sm_max_channels(int64_t world);
 int64_t host_sm_mailbox_bytes(int64_t hidden, int64_t tokens, int64_t world);
 std::vector<std::string> host_sm_profile_fields();
-std::vector<std::string> host_sm_decode_profile_fields();
+std::vector<std::string> host_sm_decode_profile_fields(bool dispatch);
 int64_t host_sm_arena_bytes(int64_t hidden, int64_t topk, int64_t slots, int64_t chunk_rows, int64_t channels, int64_t queue_peers);
 void host_sm_dispatch_cuda(torch::Tensor input, torch::Tensor ids, torch::Tensor weights,
     torch::Tensor expert_rank, torch::Tensor expert_local, torch::Tensor pointers,
@@ -193,7 +193,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("register_mapped_host", &register_mapped_host);
   module.def("host_sm_max_channels", &host_sm_max_channels, pybind11::arg("world") = 1);
   module.def("host_sm_profile_fields", &host_sm_profile_fields);
-  module.def("host_sm_decode_profile_fields", &host_sm_decode_profile_fields);
+  module.def("host_sm_decode_profile_fields", &host_sm_decode_profile_fields, pybind11::arg("dispatch") = false);
   module.def("host_sm_mailbox_bytes", &host_sm_mailbox_bytes,
       pybind11::arg("hidden"), pybind11::arg("tokens"), pybind11::arg("world"));
   module.def("host_sm_arena_bytes", &host_sm_arena_bytes,

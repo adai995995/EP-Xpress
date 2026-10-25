@@ -871,9 +871,9 @@ The pipeline deliberately retains per-frame reader fences. Their cost, the
 extra control-warps' register footprint, shared handoff latency and a possible
 imbalance between parity groups can offset overlap gains. No numerical speedup
 is assumed. The old nine/ten sequential phase counters cannot describe these
-overlapping groups: preparing dispatch phase sampling is rejected for this
-build rather than silently profiling a different kernel. Combine sampling and
-ordinary CUDA timelines remain available.
+overlapping groups. Prepared decode profiling now selects a separate role-based
+schema for this kernel, rather than profiling the old sequential schedule.
+Combine sampling and ordinary CUDA timelines remain available.
 
 Completed focused validation covers dynamic Graph routes and eager-prefill transitions,
 int32/int64 IDs, empty/skewed ranks, scalar payload tails, both prefetch stages
@@ -947,3 +947,39 @@ If both experimental options are enabled, eligible staging continues to use
 its existing polling loop; control-warp READY applies to direct/fallback reads,
 and outgoing ACK draining still uses the control warp. This combination has
 not been evaluated here. Neither switch changes prefill transport scheduling.
+
+
+## Dispatch pipeline role diagnostics
+
+Preparing `stage="dispatch"` with the pipeline build selects a separate CUDA
+specialization and schema 3. Normal contexts have no diagnostic storage, clocks
+or counter accesses. A GPU enable flag captured by Graphs controls bounded
+samples; reset/readback remains at synchronized request boundaries. Profile
+preparation checks both ID-width specializations' resident capacity. Fallback
+and eager-prefill kernels remain ordinary and are deliberately not sampled.
+
+Thread zero records the TX prefix, control-warp leaders record their respective
+receive/ACK timelines, and the RX leader records its own timeline. Each role's
+phases partition that role's duration. TX subdivision is leader instruction
+residence: it introduces no additional rendezvous, so publication includes
+writer stragglers. Similarly RX completion includes its original reader fence
+and barriers; RX payload time alone is not full-group completion or wire time.
+The existing final CTA barrier precedes record emission. Final record writes
+are excluded from elapsed time.
+
+Each control role splits READY poll, descriptor/output allocation, IDs/weights,
+metadata fence/stage publication, occupied-stage wait, ACK publication, and final
+outgoing ACK drain. Poll/missing-round counts distinguish immediately available
+notifications from rounds with none ready; they are not a count of all missing
+peers. Empty notifications and received payload rows are counted separately.
+After finishing incoming work, each control leader publishes a diagnostic-only
+shared flag. RX can then distinguish waiting for an incoming stage from waiting
+while only outgoing ACK drain remains. The flags never control transport progress.
+
+Role intervals overlap. Never add control, RX and TX totals as a wall-time
+breakdown, subtract timestamps across GPUs, or apply their percentages directly
+to an uninstrumented trace. Choosing the latest-finishing CTA per rank/operation
+identifies a local critical tail, not a globally synchronized causal trace.
+Prepared but disabled kernels retain profiling resources. Enable/disable trials
+measure active counter perturbation; an ordinary context is also required to
+assess the behavior of the production specialization.

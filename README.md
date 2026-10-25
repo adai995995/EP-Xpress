@@ -341,7 +341,7 @@ samples. A fresh start resets counters without recapturing the graphs. Start/sto
 synchronize only at explicit, quiescent request boundaries; no other thread may
 submit work during these boundaries. No per-layer CPU readback is introduced.
 
-The report's `phase_fields` partition each sampled CTA's `elapsed_ns`. READY
+For the sequential/mailbox schema, `phase_fields` partition each sampled CTA's `elapsed_ns`. READY
 polling is `peer_poll_ns`; `receive_payload_ns` includes reduction and output
 stores; `idle_final_drain_ns` includes all final ACK checks, even successful first
 checks. These are instrumented GPU durations, not PCIe wire times. This mailbox
@@ -349,6 +349,23 @@ schema does not use the pair-queue profiler's overlapping idle view. GPU clocks
 are local, and concurrent CTA/rank durations must not be added as wall latency.
 Normal contexts do not prepare this storage and launch an uninstrumented kernel
 specialization. Use a separate ordinary context/process for headline performance.
+
+With the decode dispatch pipeline enabled, the same API returns schema 3:
+`role_phase_fields` describes TX, control warp 0, control warp 1, and RX separately.
+TX partitions `tx_end_offset_ns`; each other role partitions its own end-minus-begin
+offset. These timelines overlap and must never be summed into CTA wall time.
+`phase_fields` is empty to prevent accidental sequential attribution. The report
+separates descriptor allocation, IDs/weights, metadata publication, READY polling,
+occupied-stage waiting, ACK publication/drain, RX payload and RX completion.
+RX waiting after both control groups finish incoming work is classified separately
+as `rx_ack_drain_wait_ns`. Pipeline-ineligible calls are not sampled.
+
+Pipeline instrumentation adds no synchronization barriers and retains the original
+schedule. It timestamps role leaders; payload instruction intervals exclude
+other-thread stragglers subsequently observed at completion barriers. Prepared
+but disabled counters still use the diagnostic specialization's resources, so
+compare enabled/disabled runs and an ordinary context separately. Counter readback
+occurs only after the request. See the architecture for interpretation limits.
 
 ## Validation
 

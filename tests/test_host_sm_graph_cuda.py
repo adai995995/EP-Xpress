@@ -115,7 +115,15 @@ def _worker(rank, init_file, fused, single_frame=False, chunk_bytes=4096, id_bit
             assert report["samples"]
             for sample in report["samples"]:
                 values = dict(zip(report["fields"], sample["values"]))
-                assert values["elapsed_ns"] == sum(values[k] for k in report["phase_fields"])
+                if report["schema_version"] == 3:
+                    for role, fields in report["role_phase_fields"].items():
+                        begin = 0 if role == "tx" else values[role + "_begin_offset_ns"]
+                        assert sum(values[k] for k in fields) == values[role + "_end_offset_ns"] - begin
+                    assert values["rx_payload_bytes"] == hidden * 2 * sum(
+                        values[f"ctrl{g}_payload_rows"] for g in range(2))
+                    assert values["end_ns"] - values["begin_ns"] == values["elapsed_ns"]
+                else:
+                    assert values["elapsed_ns"] == sum(values[k] for k in report["phase_fields"])
                 assert values["status"] == 0 and values["epoch"] > 0
             # A new session resets counters without recapturing the graph.
             context.start_decode_profile()
@@ -210,4 +218,20 @@ def test_dispatch_pipeline_multi_peer_stage_reuse():
     with tempfile.TemporaryDirectory(prefix="ep-xpress-pipeline-test-") as root:
         torch.multiprocessing.spawn(_worker,
             args=(os.path.join(root, "rendezvous"), True, True, 262144, 64, False, 5, 258, True),
+            nprocs=5, join=True)
+
+
+def test_dispatch_pipeline_profile_graph_reset_and_overflow():
+    """Role timelines survive changing routes, Graph replay, reset and overflow."""
+    if os.environ.get("EP_XPRESS_DECODE_DISPATCH_PIPELINE") != "1":
+        pytest.skip("enable dispatch pipeline")
+    if torch.cuda.device_count() < 5:
+        pytest.skip("five CUDA GPUs are required")
+    from torch.utils.cpp_extension import CUDA_HOME
+    if CUDA_HOME is None:
+        pytest.skip("CUDA toolkit is unavailable")
+    native.load()
+    with tempfile.TemporaryDirectory(prefix="ep-xpress-pipeline-profile-") as root:
+        torch.multiprocessing.spawn(_worker,
+            args=(os.path.join(root, "rendezvous"), True, True, 262144, 64, "dispatch", 5, 258),
             nprocs=5, join=True)

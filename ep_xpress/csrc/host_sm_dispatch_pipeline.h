@@ -26,7 +26,48 @@ struct DispatchPrefetchStage {
   int wires[kDispatchPipelineRows];
 };
 
-template <typename Id>
+// Pipeline diagnostics record three concurrent leader timelines, not a single
+// sequential phase partition. No new CTA/warp barriers are added. TX subphases
+// are thread-zero instruction intervals; publication includes writer stragglers.
+enum DispatchProfileField {
+  DBegin, DEnd, DElapsed, DTxRouteLocal, DTxMetadata, DTxPayload, DTxPublish, DTxEnd,
+  DControl0, DControl1 = DControl0 + 17, DRx = DControl1 + 17,
+  DStatus = DRx + 9, DFieldCount
+};
+enum DispatchControlField {
+  DCReady, DCDescriptor, DCMetadata, DCMetadataCommit, DCStageWait, DCAck,
+  DCDrain, DCOther, DCBegin, DCEnd, DCReceiveDone, DCPolls, DCMissing,
+  DCEmpty, DCRows, DCFirstReady, DCFirstStage
+};
+enum DispatchRxField {
+  DRStageWait, DRPayload, DRCommit, DRDrainWait, DROther, DRBegin, DREnd,
+  DRFrames, DRBytes
+};
+const std::vector<std::string> kDispatchProfileFields = [] {
+  std::vector<std::string> fields = {"begin_ns", "end_ns", "elapsed_ns",
+      "tx_route_local_ns", "tx_metadata_ns", "tx_payload_ns", "tx_publish_ns", "tx_end_offset_ns"};
+  for (int group = 0; group < 2; ++group) {
+    const std::string prefix = "ctrl" + std::to_string(group) + "_";
+    for (const auto* suffix : {"ready_poll_ns", "descriptor_alloc_ns", "metadata_ns",
+         "metadata_commit_ns", "stage_wait_ns", "ack_publish_ns", "ack_drain_ns", "other_ns",
+         "begin_offset_ns", "end_offset_ns", "receive_done_offset_ns", "poll_rounds",
+         "missing_rounds", "empty_notifications", "payload_rows", "first_ready_offset_ns",
+         "first_stage_offset_ns"}) fields.push_back(prefix + suffix);
+  }
+  for (const auto* suffix : {"stage_wait_ns", "payload_ns", "completion_ns", "ack_drain_wait_ns",
+       "other_ns", "begin_offset_ns", "end_offset_ns", "frames", "payload_bytes"})
+    fields.push_back(std::string("rx_") + suffix);
+  fields.push_back("status");
+  return fields;
+}();
+template <bool Enabled> struct DispatchProfileStorage {};
+template <> struct DispatchProfileStorage<true> {
+  int sample;
+  uint32_t receive_done[2];
+  int64_t values[DFieldCount];
+};
+
+template <typename Id, bool Profile = false>
 __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
   if (a.device_epoch) a.epoch = *a.device_epoch;
   const int tid = threadIdx.x, channel = blockIdx.x;
@@ -48,6 +89,39 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
   __shared__ int counts[kMaxRanks];
   __shared__ DispatchPrefetchStage stages[kDispatchControlWarps];
   __shared__ int rx_choice;
+
+  __shared__ DispatchProfileStorage<Profile> diag;
+  uint64_t diag_mark = 0;
+  int diag_phase = DTxRouteLocal;
+  if constexpr (Profile) {
+    if (!tid) {
+      diag.sample = -1;
+      if (a.decode_profile[1]) {
+        auto* header = a.decode_profile + int64_t(channel) * (DFieldCount + 4);
+        const int64_t index = header[0]++;
+        if (index < a.decode_profile_samples) diag.sample = int(index);
+        else ++header[2];
+      }
+      if (diag.sample >= 0) {
+        for (int i = 0; i < DFieldCount; ++i) diag.values[i] = 0;
+        diag.receive_done[0] = diag.receive_done[1] = 0;
+        diag.values[DControl0 + DCFirstReady] = diag.values[DControl1 + DCFirstReady] = -1;
+        diag.values[DControl0 + DCFirstStage] = diag.values[DControl1 + DCFirstStage] = -1;
+        diag.values[DBegin] = diag_mark = ticks_ns();
+      }
+    }
+  }
+  // Only leaders update their own disjoint fields. Markers never synchronize.
+  // Timestamp transitions only; repeated polling in one phase adds no clock reads.
+  const auto mark = [&](int field, bool leader) {
+    if constexpr (Profile) {
+      if (leader && diag.sample >= 0 && field != diag_phase) {
+        const uint64_t now = ticks_ns();
+        diag.values[diag_phase] += now - diag_mark;
+        diag_mark = now; diag_phase = field;
+      }
+    }
+  };
 
   if (tid < 32) {
     uint64_t mask = 0;
@@ -102,6 +176,7 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
       a.local_rows[first + local[tid]] = local_base + tid;
       a.owner_rows[int64_t(a.rank) * a.capacity + local_owner + tid] = local_base + tid;
     }
+    mark(DTxMetadata, tid == 0);
     for (int i = tid; i < remote_count * a.topk; i += blockDim.x) {
       const int64_t source = int64_t(first + remote[i / a.topk]) * a.topk + i % a.topk;
       const int64_t expert = ids[source];
@@ -120,6 +195,7 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
       }
       if (!lane) counts[peer] = __popc(bits);
     }
+    mark(DTxPayload, tid == 0);
     for (int64_t i = tid; i < int64_t(remote_count) * (a.hidden / 2); i += blockDim.x) {
       const int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
       host_store32(slot + x_offset + i * 4,
@@ -127,6 +203,7 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
     }
     if (!tid && a.diagnostics) host_store64(slot + kIdentityOffset, a.identity);
   }
+  mark(DTxPublish, tid == 0);
   // All writers, including descriptor/metadata writers, close publication.
   __threadfence_system();
   __syncthreads();
@@ -135,10 +212,24 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
     release(reinterpret_cast<uint64_t*>(dispatch_index(a, slot, tid)),
             (a.epoch << 32) | uint64_t(counts[tid] + 1));
   __syncthreads();
+  if constexpr (Profile) {
+    if (!tid && diag.sample >= 0) {
+      const uint64_t now = ticks_ns();
+      diag.values[diag_phase] += now - diag_mark;
+      diag.values[DTxEnd] = now - diag.values[DBegin];
+    }
+  }
 
   if (tid < 64) {
     const int group = tid / 32;
     auto& stage = stages[group];
+    const int dc = group == 0 ? DControl0 : DControl1;
+    if constexpr (Profile) {
+      if (!lane && diag.sample >= 0) {
+        diag_mark = ticks_ns(); diag_phase = dc + DCOther;
+        diag.values[dc + DCBegin] = diag_mark - diag.values[DBegin];
+      }
+    }
     // Each lane owns one incoming peer; no cross-group claims or host atomics.
     const int peer = group + lane * kDispatchControlWarps;
     bool pending = peer < a.world && peer != a.rank;
@@ -146,7 +237,9 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
     while (__any_sync(0xffffffffu, pending)) {
       if (__any_sync(0xffffffffu, read_status(a.status) != 0)) break;
       uint32_t state = __shfl_sync(0xffffffffu, lane == 0 ? dispatch_stage_load(&stage.state) : 0, 0);
+      if (state == 1) mark(dc + DCStageWait, lane == 0);
       if (state == 2) {
+        mark(dc + DCAck, lane == 0);
         if (!lane) {
           char* source = reinterpret_cast<char*>(a.pointers[stage.peer]) +
                          channel * a.channel_stride + kArenaHeader;
@@ -159,6 +252,7 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
         state = 0;
       }
       if (state == 0) {
+        mark(dc + DCReady, lane == 0);
         uint64_t ready = 0;
         if (pending) {
           char* source = reinterpret_cast<char*>(a.pointers[peer]) +
@@ -167,7 +261,14 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
         }
         const uint32_t available = __ballot_sync(0xffffffffu,
             pending && (ready >> 32) == a.epoch && uint32_t(ready) != 0);
+        if constexpr (Profile) { if (!lane && diag.sample >= 0) {
+          ++diag.values[dc + DCPolls];
+          diag.values[dc + DCMissing] += available == 0;
+          if (available && diag.values[dc + DCFirstReady] < 0)
+            diag.values[dc + DCFirstReady] = ticks_ns() - diag.values[DBegin];
+        }}
         if (available) {
+          mark(dc + DCDescriptor, lane == 0);
           const int leader = __ffs(available) - 1;
           const int selected_peer = __shfl_sync(0xffffffffu, peer, leader);
           const int count = int(__shfl_sync(0xffffffffu, uint32_t(ready), leader)) - 1;
@@ -178,9 +279,12 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
           if (a.diagnostics && !lane && host_load64(source + kIdentityOffset) != a.identity)
             fail(a.status, 5);
           if (!count) {
+            mark(dc + DCAck, lane == 0);
+            if constexpr (Profile) { if (!lane && diag.sample >= 0) ++diag.values[dc + DCEmpty]; }
             __syncwarp();
             // A count-only reader never touches payload or descriptors.
             if (!lane) release(control(source, 1 + a.rank), sequence);
+            mark(dc + DCReady, lane == 0);
           } else {
             int token = 0;
             if (lane < count) {
@@ -201,6 +305,8 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
             owner = __shfl_sync(0xffffffffu, owner, 0);
             __syncwarp();
             if (__any_sync(0xffffffffu, read_status(a.status) != 0)) break;
+            mark(dc + DCMetadata, lane == 0);
+            if constexpr (Profile) { if (!lane && diag.sample >= 0) diag.values[dc + DCRows] += count; }
             // Warp lanes issue independent route loads. The other control warp
             // can prefetch another peer while the 256-thread RX group copies.
             for (int i = lane; i < count * a.topk; i += 32) {
@@ -216,6 +322,7 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
               a.output_inverse[int64_t(output + lane) * 2 + 1] = token;
               a.owner_rows[int64_t(selected_peer) * a.capacity + owner + lane] = output + lane;
             }
+            mark(dc + DCMetadataCommit, lane == 0);
             // Every metadata reader closes its host accesses before handing the
             // stage to RX, whose later completion permits host-buffer reuse.
             __threadfence_system();
@@ -223,7 +330,10 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
             if (!lane) {
               stage.peer = selected_peer; stage.count = count; stage.output = output;
               dispatch_stage_store(&stage.state, 1);
+              if constexpr (Profile) { if (diag.sample >= 0 && diag.values[dc + DCFirstStage] < 0)
+                diag.values[dc + DCFirstStage] = ticks_ns() - diag.values[DBegin]; }
             }
+            mark(dc + DCStageWait, lane == 0);
           }
         }
       }
@@ -239,6 +349,7 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
       const uint32_t state = __shfl_sync(0xffffffffu, lane == 0 ? dispatch_stage_load(&stage.state) : 0, 0);
       if (state == 0) break;
       if (state == 2) {
+        mark(dc + DCAck, lane == 0);
         if (!lane) {
           char* source = reinterpret_cast<char*>(a.pointers[stage.peer]) + channel * a.channel_stride + kArenaHeader;
           release(control(source, 1 + a.rank), sequence);
@@ -249,6 +360,11 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
       }
       if (a.diagnostics && ticks_ns() - start > a.timeout_ns) fail(a.status, 3);
     }
+    mark(dc + DCDrain, lane == 0);
+    if constexpr (Profile) { if (!lane && diag.sample >= 0) {
+      diag.values[dc + DCReceiveDone] = diag_mark - diag.values[DBegin];
+      dispatch_stage_store(&diag.receive_done[group], 1);
+    }}
     // Drain only this group's outgoing ACK ownership before the next operation.
     bool unacked = peer < a.world && peer != a.rank;
     while (__any_sync(0xffffffffu, unacked) && !__any_sync(0xffffffffu, read_status(a.status) != 0)) {
@@ -257,9 +373,18 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
     }
     __syncwarp();
     if (!lane) dispatch_stage_store(&stage.state, 3);
+    if constexpr (Profile) { if (!lane && diag.sample >= 0) {
+      const uint64_t now = ticks_ns();
+      diag.values[diag_phase] += now - diag_mark;
+      diag.values[dc + DCEnd] = now - diag.values[DBegin];
+    }}
   } else {
     const int rx = tid - 64;
     int next = 0;
+    if constexpr (Profile) { if (!rx && diag.sample >= 0) {
+      diag_mark = ticks_ns(); diag_phase = DRx + DRStageWait;
+      diag.values[DRx + DRBegin] = diag_mark - diag.values[DBegin];
+    }}
     while (true) {
       if (!rx) {
         rx_choice = -1;
@@ -275,7 +400,14 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
       dispatch_rx_sync();
       const int choice = rx_choice;
       if (choice == -2) break;
-      if (choice < 0) { dispatch_rx_sync(); __nanosleep(64); continue; }
+      if (choice < 0) {
+        if constexpr (Profile) { if (!rx && diag.sample >= 0) {
+          const bool draining = dispatch_stage_load(&diag.receive_done[0]) && dispatch_stage_load(&diag.receive_done[1]);
+          mark(DRx + (draining ? DRDrainWait : DRStageWait), true);
+        }}
+        dispatch_rx_sync(); __nanosleep(64); continue;
+      }
+      mark(DRx + DRPayload, rx == 0);
       const auto& stage = stages[choice];
       char* source = reinterpret_cast<char*>(a.pointers[stage.peer]) + channel * a.channel_stride + kArenaHeader;
 #if EP_XPRESS_DISPATCH_READ_UNROLL > 0
@@ -305,15 +437,36 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
         reinterpret_cast<uint32_t*>(a.output + int64_t(stage.output) * a.hidden)[i] =
             host_load32(source + x_offset + (int64_t(stage.wires[i / width]) * width + i % width) * 4);
       }
+      mark(DRx + DRCommit, rx == 0);
+      if constexpr (Profile) { if (!rx && diag.sample >= 0) {
+        ++diag.values[DRx + DRFrames];
+        diag.values[DRx + DRBytes] += int64_t(stage.count) * a.hidden * 2;
+      }}
       __threadfence_system();
       dispatch_rx_sync();
       if (!rx) dispatch_stage_store(&stages[choice].state, 2);
       // All RX lanes stop referencing this stage before control can refill it.
       dispatch_rx_sync();
       next = (choice + 1) % kDispatchControlWarps;
+      mark(DRx + DRStageWait, rx == 0);
     }
+    if constexpr (Profile) { if (!rx && diag.sample >= 0) {
+      const uint64_t now = ticks_ns();
+      diag.values[diag_phase] += now - diag_mark;
+      diag.values[DRx + DREnd] = now - diag.values[DBegin];
+    }}
   }
   __syncthreads();
+  if constexpr (Profile) { if (!tid && diag.sample >= 0) {
+    const uint64_t now = ticks_ns();
+    diag.values[DEnd] = now;
+    diag.values[DElapsed] = now - diag.values[DBegin];
+    diag.values[DStatus] = read_status(a.status);
+    auto* out = a.decode_profile + (int64_t(diag.sample + 1) * a.decode_profile_channels + channel) * (DFieldCount + 4);
+    for (int i = 0; i < DFieldCount; ++i) out[i] = diag.values[i];
+    out[DFieldCount] = a.epoch; out[DFieldCount + 1] = a.input_rows;
+    out[DFieldCount + 2] = a.capacity; out[DFieldCount + 3] = a.channels;
+  }}
   if (!tid && read_status(a.status)) {
     release(reinterpret_cast<uint64_t*>(own), uint64_t(read_status(a.status)));
     if (a.fatal_errors || acquire(reinterpret_cast<uint64_t*>(own) + 2)) {
