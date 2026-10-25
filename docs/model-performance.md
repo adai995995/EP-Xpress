@@ -2578,3 +2578,159 @@ optimize the dominant part while retaining dynamic readers and safe slot reuse.
 Any send/receive overlap change should be justified by those measurements and
 must preserve receive parallelism. Increasing CTA count without measuring its
 queue and polling costs is not an established improvement.
+
+
+## Indexed decode dispatch and batched ACK commits (2026-10-25)
+
+The implementation in `3fa4752` adds optional receiver-direct indices and batched
+ACK publication for bounded single-frame decode. The recorded candidate manifest
+matches all 54 tracked files of that implementation commit. It retains current
+GPU token routes, per-rank deduplication, one shared payload write, full-CTA
+reception and the mandatory final ACK drain. `EP_XPRESS_DECODE_DISPATCH_INDEXED=1`
+enables it; the default remains 0. Receiver indices use unused payload capacity
+or the idle second slot's payload area, with one frame ACK protecting both.
+Neither the configured source capacity nor the arena allocation is reduced.
+
+Six targeted CUDA cases passed: bounded Graph profiling/reset/overflow,
+int32/int64 routing, small-frame fallback, three-rank dynamic Graph/eager reuse,
+BF16 vector and scalar-tail widths, empty/skewed ranks, and multi-warp index
+ballots with partial tails. These checks verify protocol behavior rather than
+provide performance estimates.
+
+### Controlled full-model measurement
+
+Same eight H20D GPUs; SGLang v0.5.21; Qwen3-30B-A3B-Instruct-2507 BF16;
+TP=DP=EP=8; Triton experts; FlashInfer attention; full decode Graph with local
+buckets 1/2/4/8 and eager prefill. Each load uses 512 input and 32 output tokens,
+eight warmups and five measured repeats with identical input hashes. The sole
+external baseline is SGLang's default `--moe-a2a-backend none` NCCL path.
+Both implementations disable NVLink/P2P/custom all-reduce; transport records
+show SHM with zero P2P/NET/NVLS, and available NVLink payload counters have zero
+increments. Ownership sampling detected no external GPU process.
+
+EP control and candidate retain 32 allocated/adaptive active channels,
+4 MiB chunk budget, two slots, 16-row prefill combine frames, decode source
+capacity 64, descriptor batch 32, publish batch 8 and peer batch 2. Host arenas
+remain producer-NUMA allocated with equal total page placement on both nodes.
+All headline timing uses ordinary contexts without prepared diagnostic counters.
+
+Values below are median [min, max]. TTFT mean averages requests within a repeat;
+TTFT last measures the final request's first token. Decode TPS counts output
+tokens within the interval after every request has started generating and
+before the first request completes. It excludes prefill and is not end-to-end TPS.
+
+| Backend | Batch | Mean TTFT (ms) | Last TTFT (ms) | Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| NCCL | 1 | 101.279 [100.371, 102.513] | 101.279 [100.371, 102.513] | 155.071 [154.181, 155.401] |
+| NCCL | 8 | 121.341 [120.931, 143.782] | 121.740 [121.292, 144.156] | 1216.497 [1205.285, 1230.512] |
+| NCCL | 32 | 391.222 [374.586, 449.403] | 450.675 [435.678, 484.216] | 3543.945 [3524.285, 3588.787] |
+| NCCL | 64 | 821.047 [700.343, 893.274] | 873.281 [842.140, 916.369] | 5957.461 [5906.739, 5999.644] |
+| EP control | 1 | 96.867 [96.588, 98.173] | 96.867 [96.588, 98.173] | 144.233 [143.204, 144.432] |
+| EP control | 8 | 100.861 [100.390, 101.369] | 101.244 [100.755, 101.744] | 806.785 [801.289, 810.704] |
+| EP control | 32 | 247.077 [246.197, 295.941] | 269.730 [267.172, 311.742] | 2645.683 [2638.564, 2668.388] |
+| EP control | 64 | 441.813 [425.565, 528.961] | 494.634 [492.702, 550.980] | 5027.234 [5014.218, 5059.895] |
+| EP indexed | 1 | 96.905 [96.142, 99.295] | 96.905 [96.142, 99.295] | 150.758 [150.378, 151.090] |
+| EP indexed | 8 | 101.652 [101.175, 101.809] | 102.021 [101.543, 102.178] | 832.066 [826.656, 837.735] |
+| EP indexed | 32 | 255.183 [246.424, 257.885] | 268.551 [267.108, 283.917] | 2770.741 [2753.737, 2789.169] |
+| EP indexed | 64 | 476.529 [426.102, 555.492] | 518.129 [496.329, 562.825] | 5302.553 [5248.867, 5336.196] |
+
+| Batch | Indexed Decode TPS vs control | Indexed Decode TPS vs NCCL |
+| --- | ---: | ---: |
+| 1 | +4.52% | -2.78% |
+| 8 | +3.13% | -31.60% |
+| 32 | +4.73% | -21.82% |
+| 64 | +5.48% | -10.99% |
+
+Decode TPS improves at all measured loads but remains below NCCL. There is no
+stable TTFT improvement from this decode change. B32 mean TTFT increases while
+last TTFT is nearly unchanged; B64 mean/last TTFT increase with broad repeat
+ranges. The existing TTFT advantage over NCCL must not be attributed to the
+new decode indexing. These are sequential five-repeat comparisons, not
+confidence intervals or a production workload study.
+
+All four short greedy output samples match the control exactly, including all
+29 compared prefix logprobs. NCCL's generated outputs also match, with the same
+previously observed logprob differences. This is a limited output sanity check,
+not proof of identical routes throughout the throughput sweep. Routes in the
+implementation are derived anew from GPU top-k IDs on every invocation.
+
+An initial version restricted indices to unused space in slot zero. With the
+unchanged configured source bound of 64 and two active channels, that region
+was too small, so B1/B8 correctly fell back to mask scanning and showed no
+throughput gain. Borrowing the idle second slot fixes this capacity limitation
+without changing routing bounds or recognizing particular benchmark batches.
+The final implementation still falls back if neither region fits.
+
+### Dispatch phase sampling
+
+Two instrumented trials per load captured 384 dispatches per rank without
+status errors or dropped records. Select the latest-finishing CTA separately
+for each rank-local operation, then average across trials: rank 0 for B1, all
+eight ranks for B32. The entries below are microseconds per sampled CTA,
+including diagnostic barriers. They are not pure PCIe transfer times, and
+concurrent CTA or rank times must not be summed as wall latency. B1 rank 0
+sends payload but receives no remote dispatch payload; other ranks receive it.
+
+| Phase | B1 control | B1 indexed | B32 control | B32 indexed |
+| --- | ---: | ---: | ---: | ---: |
+| Elapsed | 47.439 | 42.538 | 103.884 | 96.278 |
+| GPU route/local copy | 5.430 | 5.524 | 5.172 | 5.194 |
+| Send metadata | 0.451 | 0.597 | 0.446 | 0.766 |
+| Payload writes | 1.186 | 1.247 | 1.163 | 1.220 |
+| Fence/READY publication | 3.224 | 2.926 | 3.750 | 3.751 |
+| READY/frame-count polling | 8.341 | 12.254 | 11.094 | 17.758 |
+| Receive indices/IDs/weights | 0.000 | 0.000 | 40.674 | 31.810 |
+| Payload reads | 0.000 | 0.000 | 9.028 | 7.994 |
+| ACK publication | 15.226 | 3.057 | 18.817 | 5.537 |
+| Final ACK checks/completion | 7.366 | 9.711 | 7.172 | 13.418 |
+| Other control | 6.215 | 7.222 | 6.568 | 8.828 |
+
+The independent no-progress loop view overlaps those phases. In B32, READY-only
+idle time is 0.016 -> 0.019 us, and final-drain idle time is 6.835 -> 18.098 us.
+For B1 rank 0, final-drain idle time is 6.407 -> 11.184 us. Credit-only idle
+time is zero: the single-frame protocol has no intermediate slot reuse, but
+still must drain ACKs before the next call can reuse either payload region.
+Do not add these idle times to the phase totals or interpret all READY polling
+as time waiting for a late rank. Polling includes the dependent frame-count read.
+
+The intended costs fall: B32 receiver metadata 40.674 -> 31.810 us, ACK publication
+18.817 -> 5.537 us. They are partly offset by more READY/count polling, final
+ACK checks and no-progress drain residence. Faster local processing can expose
+more remote waiting, and committing several completed frames together can delay
+an early frame's ACK. These traces show the tradeoff but do not isolate a
+cross-rank causal explanation. Total sampled B32 CTA residence falls only
+103.884 -> 96.278 us, consistent with a modest end-to-end gain.
+
+Requested payload byte counters are unchanged across both trials and versions:
+B1 writes 1,572,864 and reads 7,229,440 bytes; B32 writes 50,331,648 and reads
+233,566,208 bytes, aggregated across ranks/channels per trial. These count
+requested payload accesses, not actual PCIe bus transactions. The optimization
+preserves payload deduplication rather than claiming a new reduction in bytes.
+
+### Complete decode Graph traces
+
+Complete replays were resolved with validated GPU annotations and no reported
+missing-node/integrity issues. Values are the median across active DECODE ranks
+of each rank's mean per complete replay. IDLE ranks are retained in the private
+analysis. Component interval unions may overlap and must not be added to
+reconstruct wall time. Profiled GPU forward time is separate from HTTP TTFT/TPOT.
+
+| Batch | EP control forward (ms) | EP indexed forward (ms) | NCCL forward (ms) | Control dispatch (ms) | Indexed dispatch (ms) | Indexed combine (ms) | NCCL framework collectives (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 7.275 | 6.972 | 6.564 | 2.108 | 1.799 | 1.006 | 2.420 |
+| 8 | 10.082 | 9.825 | 6.666 | 4.070 | 3.974 | 1.522 | 2.490 |
+| 32 | 12.043 | 11.497 | 8.921 | 4.701 | 4.281 | 1.776 | 3.390 |
+| 64 | 12.792 | 12.164 | 10.862 | 4.960 | 4.459 | 1.882 | 4.811 |
+
+At B32, dispatch falls from 4.701 to 4.281 ms and complete forward from
+12.043 to 11.497 ms. Expert GEMM stays approximately 1.92 ms. Combine code was
+not changed; variations in its measured residence include waiting/arrival
+effects and should not be described as a new combine-kernel optimization.
+
+The next priorities are the remaining dependent host metadata transactions
+and ACK turnaround, not an unmeasured increase in CTA count. Candidate
+experiments include publishing each receiver's count with its READY generation
+to avoid a second host read, prefetching several ready peers' indices/IDs/weights
+in parallel, and testing earlier ACK release for metadata-only frames while
+retaining payload lifetime protection. These are proposed follow-ups, not
+implemented or validated capabilities in this revision.
