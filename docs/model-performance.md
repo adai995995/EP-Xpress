@@ -2990,3 +2990,117 @@ reduce epilogue to the consumer's wait. Neither version removes necessary
 dependencies, and its NVLink/RDMA/TMA path is not a drop-in implementation for
 mapped host memory without P2P. The transferable objective is to do useful work
 while other data is pending and amortize completion, not to copy its warp count.
+
+## Ready-peer combine prefetch (2026-10-25)
+
+Implementation `98f5ce9` adds opt-in `EP_XPRESS_DECODE_READY_PREFETCH=1` to
+fused decode combine. The receiver stages contributors whose READY is visible
+while other actual contributors are pending, retaining all 256 payload threads
+and the configured cross-peer vector-read grouping. It reduces in the existing
+ascending-rank order with the same BF16 rounding/local-add semantics. Per-token
+loaded masks are rebuilt each call. No host routing, route cache, early ACK or
+relaxed lifetime is introduced. All-ready calls use direct reads; staging over
+40 KiB per CTA falls back to the existing path. Prefill kernels are unchanged.
+
+### Matched full-model comparison
+
+A fresh same-machine control retains the preceding dispatch pipeline and sets
+only the new prefetch switch to zero. The baseline is SGLang's default NCCL
+backend, not host CE. All runs use eight H20D GPUs, TP=DP=EP8, the same
+Qwen3-30B-A3B-Instruct-2507 BF16 model, SGLang v0.5.21 source and offline image,
+Triton experts, FlashInfer attention, full decode Graphs with local buckets
+1/2/4/8, and eager prefill. Input/output lengths are 512/32; each load has eight
+warmups and five timed repeats. Decode descriptor/publish/peer batches are
+32/8/2, with indexed dispatch and its control-prefetch pipeline enabled.
+
+The EP environments differ only in `EP_XPRESS_DECODE_READY_PREFETCH`. Timed
+prompt hashes match. Producer NUMA placement passed before/after profiling.
+All transports were SHM, with zero P2P/NET/NVLS records and available NVLink
+counters reporting zero delta. The two-second ownership sampler observed no
+external GPU process. A source manifest identifies the measured runtime files; those hashes match
+the final committed implementation. The remote source tree is synchronized,
+so a commit label alone is not used as provenance.
+
+TTFT below is the median of each repeat's request-mean TTFT. Decode TPS is
+aggregate post-prefill throughput from the benchmark's steady-state window.
+It is not total output tokens divided by whole-request latency.
+
+| Batch | Implementation | Mean TTFT (ms) | Last TTFT (ms) | Decode TPS |
+| --- | --- | ---: | ---: | ---: |
+| 1 | EP control | 97.235 | 97.235 | 155.745 |
+| 1 | EP ready-peer prefetch | 96.995 | 96.995 | 154.805 |
+| 1 | Default NCCL | 101.890 | 101.890 | 154.722 |
+| 32 | EP control | 265.751 | 288.363 | 2911.245 |
+| 32 | EP ready-peer prefetch | 273.695 | 301.226 | 2916.384 |
+| 32 | Default NCCL | 445.221 | 490.184 | 3566.185 |
+
+Against the EP control, candidate Decode TPS is -0.60% at B1 and +0.18% at B32.
+Mean TTFT is -0.25% at B1 and +2.99% at B32. This does not establish an
+end-to-end improvement. B32 TPS ranges overlap almost completely; TTFT varies
+substantially within both groups. Against NCCL, candidate TPS is effectively
+tied at B1 (+0.05%) and remains 18.22% lower at B32. Its existing TTFT advantage
+over NCCL is not evidence that this decode prefetch change improved prefill.
+Keep the switch disabled by default.
+
+| Batch | Implementation | Decode TPS min-max | Mean TTFT min-max (ms) |
+| --- | --- | ---: | ---: |
+| 1 | EP control | 155.482-156.214 | 96.905-102.612 |
+| 1 | EP ready-peer prefetch | 153.112-155.325 | 96.367-98.175 |
+| 1 | Default NCCL | 154.108-155.269 | 100.917-102.213 |
+| 32 | EP control | 2878.198-2928.527 | 257.064-331.137 |
+| 32 | EP ready-peer prefetch | 2876.587-2926.147 | 256.974-331.078 |
+| 32 | Default NCCL | 3545.957-3613.186 | 426.126-514.476 |
+
+An initial implementation (`daa96ed`) staged one ready peer at a time. It measured
+154.194/2918.694 TPS at B1/B32, also without a useful gain. The final candidate
+retains grouped independent peer loads before shared stores to preserve the
+existing memory-level parallelism. This change did not produce a repeatable
+throughput improvement in the measured workload. These sequential bounded
+experiments are not confidence intervals or a study of all routing distributions.
+
+### Functional evidence and limits
+
+Three focused CUDA cases passed in 84.97 seconds: vector width 2048, scalar-tail
+width 258, and a larger width that exceeds the staging limit. Tests deliberately
+delay GPU producers, change route masks including absent and deduplicated
+experts, alternate eager calls and Graph replay, and compare against the exact
+rank-order BF16 reference with cancellation-sensitive values. After restoring
+grouped peer loads, the two affected vector/scalar cases passed again in
+74.52 seconds. The unchanged capacity fallback was not redundantly retested.
+
+All four sampled full-model greedy texts/tokens and 29 compared prefix logprobs
+match the EP control exactly. All four generated outputs also match NCCL;
+NCCL prefix logprob differences remain max 0.218722 / mean 0.0146705. These
+limited samples do not establish numerical equivalence for arbitrary workloads.
+
+### Complete decode Graph traces and interpretation
+
+Values are medians across active DECODE ranks of rank-local means over eight
+complete Graph replays. GPU annotation/integrity checks passed. Components are
+interval unions that can overlap; they are not additive wall-time components
+and are separate from the ordinary HTTP timing above.
+
+| Batch | Implementation | GPU forward (ms) | Dispatch transport (ms) | Fused combine (ms) | NCCL collectives (ms) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 | EP control | 6.853 | 1.496 | 1.084 | - |
+| 1 | EP ready-peer prefetch | 6.807 | 1.524 | 1.145 | - |
+| 1 | Default NCCL | 6.634 | - | - | 2.377 |
+| 32 | EP control | 11.008 | 3.587 | 1.958 | - |
+| 32 | EP ready-peer prefetch | 11.006 | 3.573 | 1.960 | - |
+| 32 | Default NCCL | 8.945 | - | - | 3.434 |
+
+B32 combine and total forward are essentially unchanged. B1 combine residence
+increases about 5.6%, while other profiled intervals vary; this does not establish
+a single-request speedup. The new scheduling opportunity did not translate into
+lower measured combine time in this experiment.
+
+This implementation overlaps ready payload reads with outstanding remote
+producer work. It does not make the CTA poll while its payload instructions
+are running, change sender publication timing, or remove the final contributor
+needed for output. It adds shared stores/loads and readiness-mask processing
+whenever partial staging occurs. Which of those costs offsets hidden wait time
+has not been isolated by these full-model traces; this run does not claim that
+READY residence fell or that PCIe bandwidth improved. A further diagnosis would
+need staged/all-ready incidence and phase timings before redesigning the
+control/payload split. Retain the validated experimental option for that work,
+but keep the preceding default path as the deployment choice.

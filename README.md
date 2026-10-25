@@ -184,6 +184,14 @@ paths retain full-CTA reception and wait for every actual reader before return.
 Routes are rebuilt from current GPU owner lists on each invocation; the tile
 size is independent of token count and does not limit supported routing shapes.
 
+`EP_XPRESS_DECODE_READY_PREFETCH=1` experimentally stages ready peers' decode
+payloads while other contributors are pending. It preserves the 256-thread
+receiver, grouped peer reads, rank-order reduction and ACK drain. All-ready
+calls read directly; shapes exceeding 40 KiB of CTA staging use the existing
+path. It is disabled by default; see the [architecture](docs/architecture.md#ready-peer-decode-combine-prefetch)
+and [model measurements](docs/model-performance.md#ready-peer-combine-prefetch-2026-10-25)
+for scope and results.
+
 `EP_XPRESS_DECODE_DISPATCH_INDEXED=1` opts bounded single-frame dispatch into
 GPU-generated receiver index lists and batched ACK publication (default `0`).
 The payload is still written once for all selected readers. Receivers read their
