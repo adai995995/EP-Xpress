@@ -1,4 +1,4 @@
-"""Ready-peer staging preserves dynamic-route reduction and mailbox lifetimes."""
+"""Fused mailbox scheduling preserves dynamic reduction and buffer lifetimes."""
 import os
 import tempfile
 
@@ -12,15 +12,16 @@ pytestmark = [pytest.mark.cuda, pytest.mark.skipif(
     reason="four CUDA GPUs are required")]
 
 
-def _worker(rank, init_file, hidden):
+def _worker(rank, init_file, hidden, diagnostics=False):
     import torch.distributed as dist
     torch.cuda.set_device(rank)
     dist.init_process_group("gloo", init_method="file://" + init_file,
                             rank=rank, world_size=4)
     context = Context(None, [i // 2 for i in range(8)], Config(
         hidden, 4, 8, transport="host_sm", channels=2, chunk_bytes=262144,
-        decode_max_tokens=8, decode_single_frame=True, fatal_errors=True), device=rank)
-    context.enable_cuda_graph()
+        decode_max_tokens=8, decode_single_frame=True, fatal_errors=True, diagnostics=diagnostics), device=rank)
+    if not diagnostics:
+        context.enable_cuda_graph()
     stream = torch.cuda.Stream()
     factors = (1.0, 100.0, -100.0, 0.01)
 
@@ -62,6 +63,21 @@ def _worker(rank, init_file, hidden):
     graph = None
     try:
         n = rank + 1
+        if diagnostics:
+            # Operation diagnostics are intentionally incompatible with Graphs.
+            # Exercise their identity/status barriers on serialized eager calls.
+            results, retained_workspaces = [], []
+            for step in range(6):
+                with torch.cuda.stream(stream):
+                    current = inputs(0 if rank == 0 and step % 2 else n, step)
+                    workspace = context.create_workspace(10, current[0].shape[0], fused_combine=True)
+                    results.append((forward(current, workspace).clone(), reference(current)))
+                    retained_workspaces.append(workspace)
+            torch.cuda.synchronize()
+            for actual, expected in results:
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            context.check_errors()
+            return
         with torch.cuda.stream(stream):
             data = inputs(n, 0)
             workspace = context.create_workspace(10, n, fused_combine=True)
@@ -109,3 +125,19 @@ def test_ready_prefetch_dynamic_graph_order_and_fallback(hidden):
     with tempfile.TemporaryDirectory(prefix="ep-xpress-ready-prefetch-") as root:
         torch.multiprocessing.spawn(_worker,
             args=(os.path.join(root, "rendezvous"), hidden), nprocs=4, join=True)
+
+
+@pytest.mark.parametrize("hidden,diagnostics", [(2048, False), (258, True)])
+def test_control_warp_dynamic_graph_order_and_ack(hidden, diagnostics):
+    """One-warp polling preserves dynamic masks, exact sums and slot lifetime."""
+    if os.environ.get("EP_XPRESS_DECODE_CONTROL_WARP") != "1":
+        pytest.skip("enable decode control warp")
+    if os.environ.get("EP_XPRESS_DECODE_READY_PREFETCH", "0") != "0":
+        pytest.skip("exercise direct full-CTA reception")
+    from torch.utils.cpp_extension import CUDA_HOME
+    if CUDA_HOME is None:
+        pytest.skip("CUDA toolkit is unavailable")
+    native.load()
+    with tempfile.TemporaryDirectory(prefix="ep-xpress-control-warp-") as root:
+        torch.multiprocessing.spawn(_worker,
+            args=(os.path.join(root, "rendezvous"), hidden, diagnostics), nprocs=4, join=True)

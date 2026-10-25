@@ -184,6 +184,13 @@ paths retain full-CTA reception and wait for every actual reader before return.
 Routes are rebuilt from current GPU owner lists on each invocation; the tile
 size is independent of token count and does not limit supported routing shapes.
 
+`EP_XPRESS_DECODE_CONTROL_WARP=1` optionally assigns fused decode READY and ACK
+drain polling to one warp while retaining all 256 payload threads. Only actual
+dynamic contributors are waited on; the CTA joins once after polling. Diagnostic
+identity-check barriers are omitted when diagnostics are disabled. Required
+reader fences, ACKs and rank-order reduction remain. Use with ready prefetch off;
+see the [protocol](docs/architecture.md#decode-combine-control-warp-polling).
+
 `EP_XPRESS_DECODE_READY_PREFETCH=1` experimentally stages ready peers' decode
 payloads while other contributors are pending. It preserves the 256-thread
 receiver, grouped peer reads, rank-order reduction and ACK drain. All-ready

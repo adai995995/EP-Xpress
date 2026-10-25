@@ -915,3 +915,35 @@ with remote producer progress rather than claiming simultaneous local TX/RX or
 a dedicated polling warp. Shared-memory traffic and occupancy are costs to
 measure against any reduction in exposed READY waiting. The option defaults
 to zero; see the performance report for the evaluated configuration.
+
+
+## Decode combine control-warp polling
+
+`EP_XPRESS_DECODE_CONTROL_WARP=1` moves fused mailbox READY and outgoing ACK
+polling to the first warp. It is a build-time opt-in; the default remains zero.
+READY lanes derive pointers from this call's GPU expected-rank mask. Each lane
+can poll two peers, covering all supported ranks through 63, and stops polling
+a contributor after observing its current epoch. ACK lanes similarly retire
+actual outgoing descriptors. There is no cached routing assumption or all-rank
+completion requirement.
+
+The other seven warps wait at one CTA rendezvous. Once every required READY
+has been acquired, that rendezvous transfers visibility to the full 256-thread
+receiver. The existing ascending-rank FP32 reduction, remote BF16 rounding and
+local addition are unchanged. After payload consumption, all reader fences,
+ACK publication and final outgoing ACK drain remain. The optimization reduces
+barrier participation during polling; it cannot remove the dependency on a
+late actual contributor or make the PCIe control-word load itself local.
+
+When operation diagnostics are disabled, the identity-check block and its two
+CTA barriers are omitted. Diagnostics retain those barriers when enabled.
+Dynamic-route bounds checks, status propagation, epoch acquire/release and
+buffer-lifetime synchronization are retained. The helper never invokes a
+CTA-wide profiling barrier from within its warp; opt-in phase sampling remains
+at uniform CTA boundaries.
+
+Keep `EP_XPRESS_DECODE_READY_PREFETCH=0` for the evaluated direct receive path.
+If both experimental options are enabled, eligible staging continues to use
+its existing polling loop; control-warp READY applies to direct/fallback reads,
+and outgoing ACK draining still uses the control warp. This combination has
+not been evaluated here. Neither switch changes prefill transport scheduling.

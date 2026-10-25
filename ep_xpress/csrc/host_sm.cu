@@ -144,6 +144,11 @@ static_assert(EP_XPRESS_DISPATCH_READ_UNROLL == 0 || EP_XPRESS_DISPATCH_READ_UNR
 #endif
 static_assert(EP_XPRESS_COMBINE_LAST_DATA == 0 || EP_XPRESS_COMBINE_LAST_DATA == 1,
               "unsupported last-data setting");
+#ifndef EP_XPRESS_DECODE_CONTROL_WARP
+#define EP_XPRESS_DECODE_CONTROL_WARP 0
+#endif
+static_assert(EP_XPRESS_DECODE_CONTROL_WARP == 0 || EP_XPRESS_DECODE_CONTROL_WARP == 1,
+              "unsupported decode control warp setting");
 #ifndef EP_XPRESS_DECODE_READY_PREFETCH
 #define EP_XPRESS_DECODE_READY_PREFETCH 0
 #endif
@@ -1613,6 +1618,34 @@ __device__ __forceinline__ int mailbox_health(TransportArgs a, uint64_t start,
   return read_status(a.status);
 }
 
+// Called by all 32 lanes of the control warp. Two pointers per lane cover
+// every supported rank (up to 63). Retire observed epochs locally; other CTA
+// warps join once after completion instead of participating in every poll.
+// The caller must perform a CTA barrier before consuming any acquired payload.
+template <bool Profile, bool CountReady>
+__device__ __forceinline__ int mailbox_poll_warp(
+    TransportArgs a, const uint64_t* first, const uint64_t* second,
+    uint64_t start, ProfileState<Profile>& profile, bool record) {
+  unsigned pending = unsigned(first != nullptr) | (unsigned(second != nullptr) << 1);
+  uint32_t iteration = 0;
+  const int lane = threadIdx.x & 31;
+  while (true) {
+    if ((pending & 1u) && acquire(first) == a.epoch) pending &= ~1u;
+    if ((pending & 2u) && acquire(second) == a.epoch) pending &= ~2u;
+    const bool waiting = __any_sync(0xffffffff, pending != 0);
+    int error = lane == 0 ? mailbox_health(a, start, iteration++) : 0;
+    error = __shfl_sync(0xffffffff, error, 0);
+    if constexpr (Profile && CountReady) {
+      if (record && lane == 0) {
+        ++profile.values[PReadyPolls];
+        profile.values[PUnreadyObservations] += waiting;
+      }
+    }
+    if (error || !waiting) return error;
+    __nanosleep(64);
+  }
+}
+
 // Issue independent vector reads before consuming their results. Only the
 // load schedule changes: rank order, absent-rank zero additions, intermediate
 // BF16 rounding and the local addition match the scalar mailbox exactly.
@@ -2000,6 +2033,20 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
 #endif
     {
       phase(PPeerPoll);
+#if EP_XPRESS_DECODE_CONTROL_WARP
+      if (tid < 32) {
+        const uint64_t remote = readers & ~(uint64_t(1) << a.rank);
+        const uint64_t* first_flag = tid < a.world && (remote & (uint64_t(1) << tid))
+            ? control(mailbox(a, tid, a.rank, original), 0) : nullptr;
+        const int second_peer = tid + 32;
+        const uint64_t* second_flag = second_peer < a.world && (remote & (uint64_t(1) << second_peer))
+            ? control(mailbox(a, second_peer, a.rank, original), 0) : nullptr;
+        const int result = mailbox_poll_warp<Profile, true>(
+            a, first_flag, second_flag, start, profile, Profile && sample >= 0);
+        if (tid == 0) error = result;
+      }
+      __syncthreads();  // Carry READY acquire visibility to all payload readers.
+#else
       uint32_t iteration = 0;
       do {
         bool missing = false;
@@ -2017,15 +2064,20 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
         }}
         if (blocked && !error) __nanosleep(64);
       } while (blocked && !error);
+#endif
     }
     if (error) break;
     phase(PReceiveMetadata);
-    if (a.diagnostics && tid < a.world && tid != a.rank &&
-        (readers & (uint64_t(1) << tid)) &&
-        host_load64(mailbox(a, tid, a.rank, original) + 16) != a.identity) fail(a.status, 5);
-    __syncthreads();
-    if (tid == 0) error = read_status(a.status);
-    __syncthreads();
+    // Identity validation needs a status rendezvous only when enabled.
+    // Keep the legacy path intact for matched A/B measurements.
+    if (a.diagnostics || !EP_XPRESS_DECODE_CONTROL_WARP) {
+      if (a.diagnostics && tid < a.world && tid != a.rank &&
+          (readers & (uint64_t(1) << tid)) &&
+          host_load64(mailbox(a, tid, a.rank, original) + 16) != a.identity) fail(a.status, 5);
+      __syncthreads();
+      if (tid == 0) error = read_status(a.status);
+      __syncthreads();
+    }
     if (error) break;
     phase(PReceivePayload);
 #if EP_XPRESS_DECODE_PEER_BATCH > 0
@@ -2095,6 +2147,14 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
     bool pending = tid < count;
     char* box = pending ? send_boxes[tid] : nullptr;
     phase(PIdleDrain);
+#if EP_XPRESS_DECODE_CONTROL_WARP
+    if (tid < 32) {
+      const int result = mailbox_poll_warp<Profile, false>(
+          a, pending ? control(box, 1) : nullptr, nullptr, start, profile, false);
+      if (tid == 0) error = result;
+    }
+    __syncthreads();  // No producer mailbox reuse until all outgoing ACKs arrive.
+#else
     uint32_t iteration = 0;
     do {
       if (pending) pending = acquire(control(box, 1)) != a.epoch;
@@ -2106,6 +2166,7 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
       __syncthreads();
       if (blocked && !error) __nanosleep(64);
     } while (blocked && !error);
+#endif
   }
 #else
   // Each CTA drains only the rows it published. There is no terminal frame or
@@ -2122,6 +2183,15 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
       }
       __syncthreads();
       phase(PIdleDrain);
+#if EP_XPRESS_DECODE_CONTROL_WARP
+      if (tid < 32) {
+        const int result = mailbox_poll_warp<Profile, false>(
+            a, tid == 0 ? control(mailbox(a, a.rank, peer, token), 1) : nullptr,
+            nullptr, start, profile, false);
+        if (tid == 0) error = result;
+      }
+      __syncthreads();
+#else
       uint32_t iteration = 0;
       do {
         if (tid == 0) {
@@ -2131,6 +2201,7 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
         __syncthreads();
         if (blocked && !error) __nanosleep(64);
       } while (blocked && !error);
+#endif
       phase(POther);
     }
   }

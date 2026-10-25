@@ -3104,3 +3104,115 @@ READY residence fell or that PCIe bandwidth improved. A further diagnosis would
 need staged/all-ready incidence and phase timings before redesigning the
 control/payload split. Retain the validated experimental option for that work,
 but keep the preceding default path as the deployment choice.
+
+
+## Decode combine control-warp polling (2026-10-25)
+
+`EP_XPRESS_DECODE_CONTROL_WARP=1` assigns READY and outgoing ACK polling to
+one control warp instead of repeatedly joining all eight warps. Lanes retire
+observed epochs, with two peer slots per lane covering the supported rank range.
+After READY completion, one CTA barrier transfers acquired visibility to all
+256 payload readers. Identity-check barriers are omitted only with operation
+diagnostics disabled. The dynamic expected-rank mask, reduction order, reader
+fences, ACK publication and final drain remain unchanged. Both descriptor-batch
+and original ACK schedules support the control warp. Prefill is unchanged;
+ready-peer payload prefetch remains disabled.
+
+### Matched full SGLang comparison
+
+The candidate, same-source control with the switch disabled, and default NCCL
+were run sequentially on the same eight H20D GPUs. Configuration matches the
+preceding experiment: Qwen3-30B-A3B-Instruct-2507 BF16, SGLang v0.5.21,
+TP=DP=EP8, Triton experts, FlashInfer attention, full decode CUDA Graphs with
+local buckets 1/2/4/8, and eager prefill. Each batch has eight warmups and five
+timed repeats, using 512 input and 32 output tokens. EP descriptor/publish/peer
+batches are 32/8/2; indexed dispatch and its control-prefetch pipeline are on.
+
+The EP environments differ only in the control-warp flag. Timed prompt hashes,
+image, model configuration and framework source match. Runtime source hashes
+match the committed implementation. All generated lengths were checked.
+Producer NUMA placement passed before/after profiling. The GPU ownership
+sampler observed no external process. NCCL logs contain SHM only, with no
+P2P/NET/NVLS transport, and all available NVLink counters show zero delta.
+Operation diagnostics and phase counters are off during performance timing.
+
+TTFT is the median of repeat-level request-mean TTFT; Decode TPS is aggregate
+post-prefill steady-state throughput, not output tokens divided by total latency.
+
+| Batch | Implementation | Mean TTFT (ms) | Last TTFT (ms) | Decode TPS |
+| --- | --- | ---: | ---: | ---: |
+| 1 | EP control | 96.992 | 96.992 | 155.258 |
+| 1 | EP control warp | 97.238 | 97.238 | 156.304 |
+| 1 | Default NCCL | 101.994 | 101.994 | 154.959 |
+| 32 | EP control | 293.047 | 316.974 | 2929.929 |
+| 32 | EP control warp | 291.501 | 315.210 | 2920.720 |
+| 32 | Default NCCL | 403.405 | 471.351 | 3568.335 |
+
+Relative to EP control, Decode TPS changes +0.67% at B1 and -0.31% at B32.
+Mean TTFT changes +0.25% and -0.53%, respectively. Ranges overlap: this bounded
+experiment does not establish an end-to-end gain. Keep the new option disabled
+by default. The candidate's B32 TTFT is 27.74% lower than NCCL, while Decode TPS
+is 18.15% lower; the pre-existing prefill advantage does not come from this
+decode-only change. Sequential repeats are not confidence intervals.
+
+| Batch | Implementation | Decode TPS min-max | Mean TTFT min-max (ms) |
+| --- | --- | ---: | ---: |
+| 1 | EP control | 154.622-156.277 | 96.008-98.442 |
+| 1 | EP control warp | 154.962-156.714 | 94.585-99.591 |
+| 1 | Default NCCL | 154.415-155.651 | 99.968-104.259 |
+| 32 | EP control | 2906.778-2932.153 | 257.525-320.656 |
+| 32 | EP control warp | 2908.556-2945.600 | 263.364-301.436 |
+| 32 | Default NCCL | 3505.224-3590.102 | 385.194-428.138 |
+
+### Functional checks and scope
+
+Two focused four-GPU cases passed: width 2048 with diagnostics off covers
+changing contributor masks, deduplicated experts, empty ranks, delayed
+producers, exact cancellation-sensitive rank-order arithmetic, and alternating
+Graph replay/eager calls. Width 258 with diagnostics on checks the scalar path
+and identity/status rendezvous over changing eager routes. An initial attempt
+to combine diagnostics with Graph mode was rejected by the existing API;
+the diagnostic check was corrected to eager execution. No protocol change was
+needed. These tests and model runs use descriptor batch 32; the nonbatched ACK
+branch and configurations above four/eight ranks respectively were not run.
+
+All four sampled greedy full-model texts/tokens and 29 compared prefix logprobs
+match the EP control exactly. All four outputs also match NCCL; prefix logprob
+differences are max 0.218722 and mean 0.0146705. This is limited output sanity,
+not proof of numerical equivalence for all workloads. Ready-prefetch combined
+with control-warp polling remains untested.
+
+### Complete decode Graph traces
+
+These are medians across active DECODE ranks of rank-local means over eight
+complete Graph replays. Annotation and trace-integrity checks passed. Component
+intervals can overlap and are not additive wall-time components. Trace timings
+are separate from uninstrumented HTTP performance; fused communication kernels
+include control/routing/reduction work and are not pure PCIe transfer time.
+
+| Batch | Implementation | GPU forward (ms) | Dispatch transport (ms) | Fused combine (ms) | NCCL collectives (ms) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 | EP control | 6.789 | 1.554 | 1.116 | - |
+| 1 | EP control warp | 6.752 | 1.548 | 1.076 | - |
+| 1 | Default NCCL | 6.639 | - | - | 2.389 |
+| 32 | EP control | 10.988 | 3.561 | 1.962 | - |
+| 32 | EP control warp | 10.947 | 3.558 | 1.927 | - |
+| 32 | Default NCCL | 8.931 | - | - | 3.414 |
+
+In this trace, combine decreases 3.60% at B1 and 1.80% at B32. At B32 that is
+about 35 microseconds across the entire forward; total forward decreases only
+about 40 microseconds (0.37%). This small trace-local change is consistent with
+no resolved throughput gain in the ordinary HTTP measurements. It does not
+establish the isolated cost of READY, ACK drain or a CTA barrier, since phase
+counters were not enabled here.
+
+Dispatch remains about 3.56 ms at B32, and the candidate forward remains
+10.95 ms versus NCCL's 8.93 ms. The change removes repeated whole-CTA polling
+barriers, but retains host control-word accesses, actual contributor completion,
+all outgoing publication before reception, payload reads/reduction and final
+lifetime protection. It cannot hide a late actual producer or accelerate the
+unchanged dispatch path. The measured result therefore supports keeping the
+option available for further work, not claiming that control-warp polling alone
+resolves the throughput gap. Further work should identify which dispatch and
+producer-readiness dependencies lie on the critical path before changing more
+synchronization or sacrificing receive parallelism.
