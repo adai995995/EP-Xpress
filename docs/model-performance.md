@@ -3497,3 +3497,101 @@ These are limited output checks, not exhaustive numerical equivalence. Larger
 world sizes, other models, longer generations and serving arrival distributions
 were not measured. The current result establishes a bounded decode improvement
 while leaving B32 NCCL parity and the TTFT increase unresolved.
+
+
+## Decode control records and receive ACK batching (2026-10-25)
+
+The two opt-in changes were tested separately against the previous EP schedule
+and a fresh SGLang default NCCL reference. Neither demonstrates an end-to-end
+throughput improvement on these workloads. The defaults remain control records
+off and ACK batch one; no combined full-model speedup is claimed.
+
+### Implementation and measurement
+
+`EP_XPRESS_DECODE_CONTROL_RECORDS=1` replaces host-indirect route metadata reads
+in pipeline dispatch with receiver-specific contiguous records. Records contain
+the source/wire descriptor and packed local expert IDs with original FP32 weight
+bits, preserving top-k positions. Routing is computed from live GPU tensors on
+every call. The final writer spreads consecutive fields across warp lanes using
+a bounded ephemeral row list. Payload remains a deduplicated producer copy, and
+ACK still joins all metadata and payload readers. The larger control region is
+included in group-wide eligibility; insufficient space retains fallback.
+
+`EP_XPRESS_DECODE_ACK_BATCH=4` keeps the full 256-thread mailbox receiver and
+rank-ordered arithmetic, but fences and publishes individual ACKs after at most
+four local rows. A partial tail flushes; a token boundary barrier prevents shared
+reader-mask/local-row overwrite. Necessary publication, receive and reuse
+ordering is retained. It does not change the general prefill pair queues.
+
+The matched configuration is eight H20D GPUs, Qwen3-30B-A3B-Instruct-2507 BF16,
+SGLang v0.5.21, TP=DP=EP8, Triton experts, FlashInfer, full decode Graphs with
+local buckets 1/2/4/8, and eager prefill. Requests use 512 input and 32 output
+tokens, eight warmups and five timed repeats per B1/B32 case, greedy sampling,
+and cache flush before each batch. B32 places four requests on each DP rank.
+Detailed profiling is disabled; only end-to-end performance is measured.
+
+All comparisons verified identical timed prompt hashes, image, framework source,
+model configuration and launch arguments. The first three EP ablations use
+identical source with one build flag changed at a time. The final records variant
+changes only the opt-in writer branch in the pipeline header; the flag-off
+control/ACK behavior is unchanged. Final runtime source hashes were verified
+against the measured manifest. Each run verified producer NUMA placement, no
+external GPU process, NCCL SHM only (no P2P/NET/NVLS), and zero delta for every
+available NVLink counter. Startup compilation/Graph capture is excluded.
+
+TTFT is the median of repeat-level request-mean TTFT. Decode TPS is aggregate
+steady-state output throughput after prefill. Min/max ranges below are observed
+repeat extrema, not confidence intervals.
+
+| Implementation | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| Original EP | 96.478 | 158.780 | 291.160 | 3116.728 |
+| Default NCCL | 101.720 | 154.816 | 413.752 | 3547.579 |
+| Control records, token-lane writer | 96.895 | 158.066 | 265.692 | 3100.529 |
+| Control records, parallel writer | 96.019 | 158.493 | 282.196 | 3124.940 |
+| Receive ACK batch 4 | 96.273 | 158.274 | 263.947 | 3120.909 |
+
+| Implementation | B1 TTFT range | B1 TPS range | B32 TTFT range | B32 TPS range |
+| --- | ---: | ---: | ---: | ---: |
+| Original EP | 95.419-97.124 | 158.064-159.189 | 260.858-301.243 | 3106.438-3151.671 |
+| Default NCCL | 100.578-103.516 | 154.174-155.111 | 399.590-542.051 | 3522.805-3586.183 |
+| Control records, token-lane writer | 95.851-97.698 | 157.800-159.371 | 262.620-309.415 | 3080.181-3136.658 |
+| Control records, parallel writer | 95.403-96.714 | 157.013-158.541 | 256.183-309.158 | 3102.573-3142.107 |
+| Receive ACK batch 4 | 95.533-97.332 | 157.141-158.894 | 258.116-321.585 | 3107.070-3139.332 |
+
+### Interpretation and validation limits
+
+The final parallel-record writer changes Decode TPS by -0.18% at B1 and +0.26%
+at B32 versus original EP. ACK batching changes it by -0.32% and +0.13%.
+All candidate/control repeat ranges overlap, so these results do not establish
+a performance gain. Final records remain about 11.9% below NCCL at B32 decode.
+TTFT medians vary substantially, especially at B32; these decode-only changes
+provide no evidence of a causal prefill improvement. No fine-grained phase
+profiling was collected in this round, so a particular TX/RX phase cannot be
+claimed as the measured cause of the records result.
+
+The ACK ablation exposes a workload applicability limit: the unchanged adaptive
+rule selects four channels for 32 global tokens, while each rank returns four
+local tokens. Each CTA therefore owns one output row and flushes a one-row tail,
+even when ACK_BATCH=4. B1 similarly has at most one local row per CTA. These
+shapes cannot amortize a per-token fence with intra-CTA multi-token batching.
+This follows from the current scheduler/partition code and agrees with earlier
+role counters (B32 local_tokens=4, active_channels=4; B1 1 and 2); those are not
+new phase measurements. Wider/skewed native inputs do exercise batch and tail
+handling, but no performance benefit on those inputs is claimed. Reducing
+channels to force batching would sacrifice receiver parallelism and was not done.
+
+The original token-lane record writer serialized top-k writes within one lane;
+the final writer removes that serialization. Nevertheless its full-model result
+is still indistinguishable from control. Receiver-local ID translation and fewer
+indirect loads trade against additional per-destination control packing/writes;
+this tradeoff is an explanation to investigate, not a profiled attribution.
+
+Two focused eight-GPU dynamic-route tests passed in 81.21 s with both initial
+features enabled, covering 32/64-bit IDs, vector/scalar hidden widths, empty and
+skewed ranks, Graph/eager switching and payload/metadata/ACK reuse. After
+parallelizing record writes, one focused vector/dynamic-route test passed in
+69.82 s. All EP variants matched control exactly on four short greedy prompts,
+including token IDs and 29 common-prefix logprobs. NCCL matched their generated
+text; this is a limited output sanity check, not exhaustive numerical validation.
+Full-model performance was tested with each feature independently, not both on.

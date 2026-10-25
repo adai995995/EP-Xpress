@@ -994,3 +994,44 @@ identifies a local critical tail, not a globally synchronized causal trace.
 Prepared but disabled kernels retain profiling resources. Enable/disable trials
 measure active counter perturbation; an ordinary context is also required to
 assess the behavior of the production specialization.
+
+
+### Bounded decode control records and receive completion batches
+
+The optional `EP_XPRESS_DECODE_CONTROL_RECORDS` layout appends bounded records
+behind the legacy receiver index region. Each receiver row holds one 64-bit
+source-token/wire descriptor, followed by top-k 64-bit words packing a signed
+32-bit local expert ID and the original FP32 weight bits. Top-k positions remain
+unchanged; nonlocal experts use -1. Producer-side mapping reads the current GPU
+routing tensors on every invocation. Existing writer fences publish records and
+the deduplicated payload before generation/count READY. The receiver's route
+loads no longer depend on a host-loaded wire index. Metadata and payload readers
+still both finish and fence before ACK. The extra allocation is included in the
+group-wide index-space eligibility check; fallback never depends on local live
+row counts. The single-frame operation drains ACKs before another operation may
+reuse borrowed ring-slot storage.
+
+`EP_XPRESS_DECODE_ACK_BATCH` applies only to bounded decode mailbox combine.
+Send completion precedes receive processing, and every returned token has a
+distinct mailbox, so delaying a small completion batch does not consume credit
+needed for another send in the same operation. The full CTA retains the original
+rank-ordered arithmetic and payload reads. Non-final rows keep a token-boundary
+barrier to protect shared reader masks/local-row state; final rows perform an
+all-reader system fence and join before parallel per-reader ACK release, then
+join before reusing completion masks. The final partial batch always flushes.
+An error aborts the operation rather than falsely acknowledging incomplete data.
+No host atomic, global ACK or route cache is introduced. This is batching of
+fences and individual ACK publication, not a shared bitmap wire protocol.
+
+The control-record writer assigns consecutive route words to warp lanes using
+an ephemeral per-warp compact row list. It does not serialize all top-k stores
+on a token's single lane. The scratch list is bounded by the pipeline's source
+row limit and is rebuilt from the current route ballot, with warp joins before
+consumption and reuse.
+
+Receive completion batching can only amortize fences when one CTA owns more
+than one local output row. With the adapter's balanced eight-rank decode rule
+(one channel per eight global tokens), batch 32 has four local rows and four
+channels: every nonempty CTA flushes a one-row tail even with ACK_BATCH=4.
+Changing that would require a different scheduling/completion design. The flag
+intentionally does not reduce the receiver grid or add a cross-CTA barrier.

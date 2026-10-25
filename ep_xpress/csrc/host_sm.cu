@@ -166,6 +166,18 @@ static_assert(EP_XPRESS_DECODE_PEER_BATCH == 0 || EP_XPRESS_DECODE_PEER_BATCH ==
 static_assert(EP_XPRESS_DECODE_PUBLISH_BATCH == 1 || EP_XPRESS_DECODE_PUBLISH_BATCH == 2 ||
               EP_XPRESS_DECODE_PUBLISH_BATCH == 4 || EP_XPRESS_DECODE_PUBLISH_BATCH == 8 ||
               EP_XPRESS_DECODE_PUBLISH_BATCH == 16, "unsupported decode publish batch");
+// Independent, opt-in ablations; old wire layout and completion remain defaults.
+#ifndef EP_XPRESS_DECODE_CONTROL_RECORDS
+#define EP_XPRESS_DECODE_CONTROL_RECORDS 0
+#endif
+static_assert(EP_XPRESS_DECODE_CONTROL_RECORDS == 0 || EP_XPRESS_DECODE_CONTROL_RECORDS == 1,
+              "unsupported decode control records setting");
+#ifndef EP_XPRESS_DECODE_ACK_BATCH
+#define EP_XPRESS_DECODE_ACK_BATCH 1
+#endif
+static_assert(EP_XPRESS_DECODE_ACK_BATCH == 1 || EP_XPRESS_DECODE_ACK_BATCH == 2 ||
+              EP_XPRESS_DECODE_ACK_BATCH == 4 || EP_XPRESS_DECODE_ACK_BATCH == 8,
+              "unsupported decode ACK batch");
 #ifndef EP_XPRESS_DECODE_DESCRIPTOR_BATCH
 #define EP_XPRESS_DECODE_DESCRIPTOR_BATCH 0
 #endif
@@ -367,6 +379,15 @@ __device__ __forceinline__ char* dispatch_index(TransportArgs a, char* slot, int
   const int rows = decode_index_rows(a);
   return slot + a.dispatch_index_offset + int64_t(reader) * (rows + 1) * 8;
 }
+// Records follow the legacy index region, leaving general-ring fallback intact.
+// Each row is a descriptor followed by top-k packed (local expert, FP32 weight)
+// words. All addresses depend only on the bounded row ordinal, not host data.
+__device__ __forceinline__ char* dispatch_record(TransportArgs a, char* slot, int reader, int row) {
+  const int rows = decode_index_rows(a);
+  return slot + a.dispatch_index_offset + int64_t(a.world) * (rows + 1) * 8 +
+      (int64_t(reader) * rows + row) * (a.topk + 1) * 8;
+}
+
 
 // These atomics address this GPU's VRAM only. Host synchronization words retain
 // exactly one GPU writer per producer/channel or consumer/channel.
@@ -1974,6 +1995,8 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
   // BF16 -> BF16. The local compact row is provided by dispatch.
   const int first = int(int64_t(a.capacity) * channel / a.channels);
   const int last = int(int64_t(a.capacity) * (channel + 1) / a.channels);
+  __shared__ uint64_t ack_readers[EP_XPRESS_DECODE_ACK_BATCH];
+  int ack_count = 0, ack_first = first;
   for (int original = first; original < last && !error; ++original) {
     phase(PReceiveMetadata);
     if (tid == 0) {
@@ -2126,12 +2149,37 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
       profile.values[PReadBytes] += int64_t(peers) * a.hidden * 2;
       profile.values[PLocalRows] += local_row >= 0;
     }}
-    // ACK follows every reader's final host load, allowing safe next-call reuse.
+#if EP_XPRESS_DECODE_ACK_BATCH == 1
     __threadfence_system();
     __syncthreads();
     if (tid < a.world && tid != a.rank && (readers & (uint64_t(1) << tid)))
       release(control(mailbox(a, tid, a.rank, original), 1), a.epoch);
     __syncthreads();
+#else
+    // All sends precede this receive loop and mailbox rows are distinct. ACK
+    // can be delayed within this bounded tile without withholding send credit.
+    // Keep all 256 readers and the exact per-token reduction order unchanged.
+    if (tid == 0) ack_readers[ack_count] = readers;
+    ++ack_count;
+    if (ack_count == EP_XPRESS_DECODE_ACK_BATCH || original + 1 == last) {
+      // Every payload reader fences before any owner releases its ACK. The
+      // barrier also publishes masks; the final barrier protects mask reuse.
+      __threadfence_system();
+      __syncthreads();
+      for (int i = tid; i < ack_count * a.world; i += blockDim.x) {
+        const int row = i / a.world, peer = i % a.world;
+        if (peer != a.rank && (ack_readers[row] & (uint64_t(1) << peer)))
+          release(control(mailbox(a, peer, a.rank, ack_first + row), 1), a.epoch);
+      }
+      __syncthreads();
+      ack_count = 0;
+      ack_first = original + 1;
+    } else {
+      // Readers/local_row are CTA-shared. Do not let the next token's leader
+      // overwrite them while a slower payload warp still uses this token.
+      __syncthreads();
+    }
+#endif
   }
 
   phase(POther);
@@ -2596,7 +2644,10 @@ void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Ten
   const bool single_frame = impl_->decode_single_frame && expected_ranks.has_value() &&
       (a.mailbox_tokens + a.channels - 1) / a.channels <= std::min(a.chunk_rows, kThreads);
   const int index_rows = decode_index_rows(a);
-  const int64_t index_bytes = int64_t(a.world) * (index_rows + 1) * 8;
+  const int64_t record_bytes = EP_XPRESS_DECODE_CONTROL_RECORDS &&
+      EP_XPRESS_DECODE_DISPATCH_PIPELINE && index_rows <= kDispatchPipelineRows
+      ? int64_t(a.world) * index_rows * (a.topk + 1) * 8 : 0;
+  const int64_t index_bytes = int64_t(a.world) * (index_rows + 1) * 8 + record_bytes;
   a.dispatch_index_offset = align_up(payload_offset(a.chunk_rows, a.topk) +
                                     int64_t(index_rows) * a.hidden * 2, 8);
   int64_t index_limit = a.slot_stride;

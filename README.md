@@ -221,6 +221,26 @@ It is disabled by default. Optional role-based dispatch counters describe the
 overlapping control and RX timelines; sequential phase counters do not apply.
 See the performance report for version-specific end-to-end measurements.
 
+Two independent experimental build options retain the existing defaults:
+
+- `EP_XPRESS_DECODE_CONTROL_RECORDS=1` requires the dispatch pipeline and writes
+  receiver-specific contiguous control records: a payload/source descriptor plus
+  packed local expert IDs and unchanged FP32 weights. The receiver addresses
+  metadata by row ordinal instead of first loading a wire index. Payload remains
+  one producer copy shared by its readers. Extra control storage is bounded by
+  configured capacity; insufficient space selects the existing fallback on all
+  ranks. No routing decisions are cached between replays.
+- `EP_XPRESS_DECODE_ACK_BATCH=4` batches decode combine receive completion for up
+  to four consecutive token rows (accepted values: 1, 2, 4, 8; default 1). All 256
+  threads still receive and reduce each token in the original order. Every reader
+  fences before the batch's individual ACK words are published in parallel. A
+  token-boundary barrier protects shared metadata, and a partial final batch is
+  flushed. This reduces fence/join frequency, not the number of ACK words or the
+  READY dependencies. The general pair-queue combine path is unchanged. Batching
+  needs multiple local token rows per channel: a balanced eight-rank batch of 32
+  with four channels per rank has only one row per CTA and cannot amortize fences
+  this way. This option does not reduce channels to manufacture a larger batch.
+
 `Config(combine_frame_rows=N)` sets rows per pair-queue frame independently of
 channel count, for `N` in 1 through 256. The default `0` retains the original
 split of `chunk_bytes` across channels and peers. Larger fixed frames consume

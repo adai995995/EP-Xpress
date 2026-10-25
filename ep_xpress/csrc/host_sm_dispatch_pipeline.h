@@ -91,6 +91,10 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
   __shared__ uint64_t masks[kDispatchPipelineRows];
   __shared__ int local_count, remote_count, local_base, local_owner;
   __shared__ int counts[kMaxRanks];
+#if EP_XPRESS_DECODE_CONTROL_RECORDS
+  // Each TX warp owns one row-index scratch list, reused only after warp join.
+  __shared__ int record_wires[kDispatchPipelineThreads / 32][kDispatchPipelineRows];
+#endif
   __shared__ DispatchPrefetchStage stages[kDispatchStages];
   __shared__ int rx_choice;
 
@@ -181,6 +185,7 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
       a.owner_rows[int64_t(a.rank) * a.capacity + local_owner + tid] = local_base + tid;
     }
     mark(DTxMetadata, tid == 0);
+#if !EP_XPRESS_DECODE_CONTROL_RECORDS
     for (int i = tid; i < remote_count * a.topk; i += blockDim.x) {
       const int64_t source = int64_t(first + remote[i / a.topk]) * a.topk + i % a.topk;
       const int64_t expert = ids[source];
@@ -188,15 +193,40 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
       host_store32(slot + weight_offset + int64_t(i) * 4,
                    __float_as_uint(expert >= 0 ? a.weights[source] : 0.0f));
     }
+#endif
     for (int peer = tid / 32; peer < a.world; peer += kDispatchPipelineThreads / 32) {
       if (peer == a.rank) continue;
       const bool selected = lane < remote_count && (masks[remote[lane]] & (uint64_t(1) << peer));
       const uint32_t bits = __ballot_sync(0xffffffffu, selected);
       if (selected) {
         const int offset = __popc(bits & ((uint32_t(1) << lane) - 1));
-        host_store64(dispatch_index(a, slot, peer) + (int64_t(offset) + 1) * 8,
-                     (uint64_t(first + remote[lane]) << 32) | uint32_t(lane));
+        const uint64_t descriptor = (uint64_t(first + remote[lane]) << 32) | uint32_t(lane);
+#if EP_XPRESS_DECODE_CONTROL_RECORDS
+        char* record = dispatch_record(a, slot, peer, offset);
+        host_store64(record, descriptor);
+        record_wires[tid / 32][offset] = lane;
+#else
+        host_store64(dispatch_index(a, slot, peer) + (int64_t(offset) + 1) * 8, descriptor);
+#endif
       }
+#if EP_XPRESS_DECODE_CONTROL_RECORDS
+      __syncwarp();
+      // Spread contiguous route words over the whole warp. Assigning all
+      // top-k stores to one selected token lane serializes small decode rows.
+      // This scratch list is rebuilt from the current ballot for every peer.
+      for (int i = lane; i < __popc(bits) * a.topk; i += 32) {
+        const int row = i / a.topk, k = i % a.topk;
+        const int wire = record_wires[tid / 32][row];
+        const int64_t input = int64_t(first + remote[wire]) * a.topk + k;
+        const int64_t expert = ids[input];
+        const int local_id = expert >= 0 && expert < a.experts && a.expert_rank[expert] == peer
+            ? a.expert_local[expert] : -1;
+        const uint32_t weight = __float_as_uint(expert >= 0 ? a.weights[input] : 0.0f);
+        host_store64(dispatch_record(a, slot, peer, row) + (int64_t(k) + 1) * 8,
+                     (uint64_t(weight) << 32) | uint32_t(local_id));
+      }
+      __syncwarp(); // Do not overwrite scratch while another lane consumes it.
+#endif
       if (!lane) counts[peer] = __popc(bits);
     }
     mark(DTxPayload, tid == 0);
@@ -306,7 +336,11 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
           } else {
             int token = 0;
             if (lane < count) {
+#if EP_XPRESS_DECODE_CONTROL_RECORDS
+              const uint64_t descriptor = host_load64(dispatch_record(a, source, a.rank, lane));
+#else
               const uint64_t descriptor = host_load64(dispatch_index(a, source, a.rank) + (int64_t(lane) + 1) * 8);
+#endif
               stage.wires[lane] = int(uint32_t(descriptor));
               token = int(descriptor >> 32);
               if (stage.wires[lane] < 0 || stage.wires[lane] >= decode_index_rows(a) ||
@@ -339,12 +373,19 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
             // Warp lanes issue independent route loads. The other control warp
             // can prefetch another peer while the 256-thread RX group copies.
             for (int i = lane; i < count * a.topk; i += 32) {
+              const int64_t out = int64_t(output) * a.topk + i;
+#if EP_XPRESS_DECODE_CONTROL_RECORDS
+              const uint64_t route = host_load64(dispatch_record(a, source, a.rank, i / a.topk) +
+                                                (int64_t(i % a.topk) + 1) * 8);
+              a.output_ids[out] = int32_t(uint32_t(route));
+              a.output_weights[out] = __uint_as_float(uint32_t(route >> 32));
+#else
               const int64_t wire = int64_t(stage.wires[i / a.topk]) * a.topk + i % a.topk;
               const int64_t expert = int64_t(host_load64(source + id_offset + wire * 8));
               const float weight = __uint_as_float(host_load32(source + weight_offset + wire * 4));
-              const int64_t out = int64_t(output) * a.topk + i;
               a.output_ids[out] = expert >= 0 && expert < a.experts && a.expert_rank[expert] == a.rank ? a.expert_local[expert] : -1;
               a.output_weights[out] = weight;
+#endif
             }
             if (lane < count) {
               a.output_inverse[int64_t(output + lane) * 2] = selected_peer;
