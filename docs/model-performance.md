@@ -2456,9 +2456,125 @@ same continuous process-ownership audit, so absence of interference cannot be
 established retrospectively. These attempts are not accepted as a controlled
 performance comparison, and no new TTFT or Decode TPS gain is claimed here.
 
-The remaining validation is an exclusive-GPU rerun of the same BF16 SGLang
-model, full decode Graph settings and default NCCL baseline, with NVLink/P2P
-disabled on both sides. Timing and profiling remain separate. Private experiment
-instrumentation now records GPU process ownership throughout a run and rejects
-results if another GPU task appears; raw deployment details stay outside this
-repository. The option remains opt-in pending an uncontended model comparison.
+The controlled rerun below completes the model comparison on an available
+machine. Private experiment instrumentation records GPU process ownership
+throughout each run and rejects results if another GPU task appears. Timing and
+profiling remain separate; raw deployment details stay outside this repository.
+The descriptor option remains opt-in because these measurements cover one
+hardware topology and a bounded workload set.
+
+### Controlled same-machine model comparison
+
+All three variants ran on the same eight H20D GPUs, split four per NUMA node,
+with Qwen3-30B-A3B-Instruct-2507 in BF16, SGLang v0.5.21, TP=DP=EP=8,
+Triton experts, FlashInfer attention, eager prefill and full decode CUDA Graph
+buckets [1, 2, 4, 8] per rank. They used the same restored offline runtime image
+and source revision `6371b75`. NCCL used SGLang's default MoE backend (`none`),
+with custom all-reduce and fusion disabled. Both EP variants used publication
+batch 8; only descriptor batching changed from 0 to 32. Channels, peer batching,
+frame/slot settings, host budget and producer-NUMA placement were held fixed.
+
+Every group completed 8 warmups and 5 timed repetitions per shape: 512 input
+and 32 output tokens, with batches 1, 8, 32 and 64. Prompt hashes and resolved
+critical settings matched. GPU process ownership was sampled every two seconds:
+no external process was observed in 109 control, 55 NCCL and 91 candidate samples.
+This cannot exclude sub-period activity or CPU-only interference. Both EP runs
+verified producer-local host pages; all groups verified SHM transport with no
+P2P/NET/NVLS paths and zero NVLink payload counter increments.
+
+Values below are median [observed minimum, maximum]. TTFT is the time until the
+last request in the batch receives its first token. Decode TPS is aggregate
+throughput in the steady decode window, not maximum sustained serving throughput.
+
+| Variant | Batch | TTFT (ms) | Decode TPS (tokens/s) | TPOT (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| NCCL | 1 | 103.197 [101.343, 104.775] | 154.990 [154.561, 155.797] | 6.452 [6.419, 6.470] |
+| NCCL | 8 | 121.903 [121.519, 122.137] | 1217.544 [1206.590, 1230.903] | 6.571 [6.499, 6.630] |
+| NCCL | 32 | 438.610 [433.664, 521.860] | 3540.024 [3507.900, 3591.684] | 9.039 [8.909, 9.122] |
+| NCCL | 64 | 859.613 [828.333, 930.488] | 5948.362 [5898.773, 5991.135] | 10.759 [10.682, 10.850] |
+| EP descriptor 0 | 1 | 96.343 [96.015, 98.055] | 141.703 [141.604, 142.508] | 7.057 [7.017, 7.062] |
+| EP descriptor 0 | 8 | 188.983 [101.316, 303.211] | 738.827 [738.247, 739.788] | 10.828 [10.814, 10.836] |
+| EP descriptor 0 | 32 | 272.814 [267.411, 312.053] | 2457.320 [2443.246, 2481.691] | 13.022 [12.894, 13.097] |
+| EP descriptor 0 | 64 | 495.195 [490.999, 546.586] | 4688.749 [4650.506, 4712.524] | 13.650 [13.581, 13.762] |
+| EP descriptor 32 | 1 | 98.527 [97.393, 111.908] | 144.520 [143.875, 145.333] | 6.919 [6.881, 6.950] |
+| EP descriptor 32 | 8 | 101.722 [100.983, 111.567] | 809.060 [803.902, 813.451] | 9.888 [9.835, 9.951] |
+| EP descriptor 32 | 32 | 273.211 [270.222, 297.169] | 2650.621 [2643.134, 2673.513] | 12.073 [11.969, 12.107] |
+| EP descriptor 32 | 64 | 495.994 [493.612, 558.153] | 5041.549 [4996.534, 5083.131] | 12.695 [12.591, 12.809] |
+
+| Batch | Descriptor 32 Decode TPS change vs descriptor 0 | Descriptor 32 Decode TPS change vs NCCL |
+| --- | ---: | ---: |
+| 1 | +1.99% | -6.76% |
+| 8 | +9.51% | -33.55% |
+| 32 | +7.87% | -25.12% |
+| 64 | +7.52% | -15.24% |
+
+The decode gain is observed at every tested load, but the candidate remains below
+NCCL in Decode TPS. B32 and B64 TTFT are essentially unchanged between EP schedules;
+their advantage over NCCL predates this decode-only change. The descriptor-0 B8
+TTFT ranged from 101.316 to 303.211 ms, so its large TTFT difference from the
+candidate must not be attributed to faster decode descriptors. These are five
+repeats in one sequential comparison, not confidence intervals or a production SLA.
+
+All four short greedy output samples match between the candidate and control,
+including all 29 compared prefix logprobs. The four generated outputs also match
+NCCL, but prefix logprobs differ (maximum absolute difference 0.218722, mean
+0.0146705). This does not establish numerical equivalence with NCCL or identical
+expert routes throughout the synthetic throughput sweep. The implementation
+continues to derive descriptors from current GPU owner lists on every invocation;
+no prompt, batch-specific route or previous decode route is cached.
+
+### Matched combine phase sampling
+
+Two instrumented trials per load use matched off/on captures, the same repeat-zero
+prompt IDs and eight requested output tokens. Every rank recorded 384 combines per
+trial without dropped samples or status errors. No external GPU process was
+observed in either diagnostic run. For each operation, select the rank-local CTA
+with the latest end timestamp, then average across trials (source rank 0 for B1,
+all eight ranks for B32). Do not sum concurrent rank/CTA times as wall latency.
+
+The entries are microseconds per sampled CTA. Instrumentation adds barriers;
+READY includes polling and synchronization, payload includes reduction and stores,
+and ACK drain includes checking as well as waiting. These are not PCIe wire times.
+
+| Load | Descriptors | Elapsed | Send metadata | Send payload | Fence/READY | READY poll | Receive payload/reduce | ACK publish | ACK drain | Receive metadata + other |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| B1 | 0 | 25.620 | 4.634 | 0.000 | 0.000 | 8.626 | 5.642 | 2.130 | 0.000 | 4.588 |
+| B1 | 32 | 23.054 | 1.386 | 0.000 | 0.000 | 12.167 | 5.551 | 2.332 | 0.000 | 1.618 |
+| B32 | 0 | 62.100 | 8.781 | 6.376 | 3.041 | 14.944 | 5.883 | 3.453 | 10.591 | 9.032 |
+| B32 | 32 | 39.418 | 2.699 | 4.623 | 3.357 | 13.395 | 5.831 | 3.520 | 3.507 | 2.487 |
+
+B32 last-finishing CTA residence falls from 62.100 to 39.418 us. Send metadata,
+final ACK drain and other control work fall substantially; receive payload/reduce
+stays near 5.8-5.9 us. READY polling still costs 13.395 us in the candidate, about
+34% of this diagnostic residence, and must not be described as eliminated. B1
+READY polling increases while total residence falls: beginning to poll earlier
+can expose more waiting even when the whole operation finishes sooner. Separate
+instrumented runs do not establish exact cross-rank causality for that change.
+
+### Complete decode forward traces and next bottleneck
+
+Separate PyTorch traces resolve complete CUDA Graph replays for all measured
+loads, with validated GPU annotations and no reported missing-node/integrity
+issues. The table is the median across active DECODE ranks of each rank's mean
+per complete replay. IDLE ranks are retained separately in the private analysis.
+Components are unions of kernel intervals within that category; categories can
+overlap, so they must not be added to reconstruct forward latency. Profiled
+forward time is not HTTP TPOT, and the NCCL column is framework collectives rather
+than an identical dispatch/combine interface.
+
+| Batch | Control forward (ms) | Candidate forward (ms) | NCCL forward (ms) | Control combine (ms) | Candidate combine (ms) | Candidate dispatch (ms) | NCCL framework collectives (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 7.390 | 7.232 | 6.579 | 1.175 | 1.011 | 2.065 | 2.448 |
+| 8 | 10.954 | 10.181 | 6.676 | 2.624 | 1.810 | 4.101 | 2.492 |
+| 32 | 12.945 | 12.275 | 8.920 | 2.814 | 1.897 | 4.682 | 3.403 |
+| 64 | 13.708 | 12.775 | 10.831 | 2.920 | 2.009 | 4.954 | 4.782 |
+
+At B32, dispatch remains approximately 4.68 ms while combine falls from 2.81 to
+1.90 ms. Expert GEMM remains approximately 1.92 ms in both EP schedules. The
+observed gain is consistent with a localized combine optimization; the remaining
+decode gap cannot be solved solely by removing more final ACK checks. First
+profile dispatch's control/READY work and host payload accesses separately, then
+optimize the dominant part while retaining dynamic readers and safe slot reuse.
+Any send/receive overlap change should be justified by those measurements and
+must preserve receive parallelism. Increasing CTA count without measuring its
+queue and polling costs is not an established improvement.
