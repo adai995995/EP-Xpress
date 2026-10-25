@@ -817,8 +817,8 @@ not a substitute for ordinary full-model TTFT and Decode TPS measurements.
 
 ## Experimental decode dispatch prefetch pipeline
 
-Status: implemented locally, CUDA compilation, protocol checks and full-model
-measurements pending. The build flag `EP_XPRESS_DECODE_DISPATCH_PIPELINE=1`
+Status: CUDA compilation, five focused protocol checks and a same-machine
+full-model comparison completed; see the [performance report](model-performance.md#decode-dispatch-control-prefetch-pipeline-2026-10-25). The build flag `EP_XPRESS_DECODE_DISPATCH_PIPELINE=1`
 requires `EP_XPRESS_DECODE_DISPATCH_INDEXED=1`; both remain opt-in. This does not
 change prefill, combine, active channels, arena allocation or routing weights.
 
@@ -875,10 +875,10 @@ overlapping groups: preparing dispatch phase sampling is rejected for this
 build rather than silently profiling a different kernel. Combine sampling and
 ordinary CUDA timelines remain available.
 
-Required focused validation: dynamic Graph routes and eager-prefill transitions,
+Completed focused validation covers dynamic Graph routes and eager-prefill transitions,
 int32/int64 IDs, empty/skewed ranks, scalar payload tails, both prefetch stages
 refilled across multiple peers, and transitions between eligible/fallback channel
-counts. Then compare complete SGLang inference against the previous indexed
+counts. Complete SGLang inference was compared against the previous indexed
 implementation and default NCCL on identical GPUs with P2P/NVLink disabled,
-reporting single-request and 32-request TTFT and Decode TPS. Record both compiler
-and runtime outcomes before treating this specialization as validated.
+reporting single-request and 32-request TTFT and Decode TPS. These checks cover
+the measured configuration; the specialization remains opt-in.

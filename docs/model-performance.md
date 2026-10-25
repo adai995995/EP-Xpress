@@ -2734,3 +2734,104 @@ to avoid a second host read, prefetching several ready peers' indices/IDs/weight
 in parallel, and testing earlier ACK release for metadata-only frames while
 retaining payload lifetime protection. These are proposed follow-ups, not
 implemented or validated capabilities in this revision.
+
+
+## Decode dispatch control-prefetch pipeline (2026-10-25)
+
+Implementation: `a47ec9d`, opt-in `EP_XPRESS_DECODE_DISPATCH_PIPELINE=1`
+with indexed single-frame decode enabled. The baseline is SGLang's default
+NCCL backend (`moe-a2a-backend none`). A separate EP control retains indexed
+dispatch and batched ACKs with pipeline disabled. This is a fresh same-machine
+comparison; no measurements from the preceding machine are mixed into it.
+
+Eight H20D GPUs, TP=DP=EP8, Qwen3-30B-A3B-Instruct-2507 BF16, SGLang v0.5.21,
+Triton experts and FlashInfer attention. All groups use full decode CUDA Graphs
+with local buckets 1/2/4/8, eager prefill, input 512/output 32 tokens, eight
+warmups and five timed repeats per load. Producer NUMA placement, active channel
+policy, payload precision and arena capacity are unchanged. All three groups
+use the same offline image; all timed prompt hashes match. No external GPU
+process was observed by the two-second ownership sampler. NCCL logs contain
+only SHM (zero P2P/NET/NVLS); all NVLink counters were available with zero delta.
+
+### Full-model HTTP results
+
+All entries are medians of five repeats. TTFT is the mean across requests in a
+batch; last TTFT is also shown because prefill scheduling affects concurrent
+requests. Decode TPS is aggregate post-prefill throughput from the benchmark's
+steady-state window, not aggregate output tokens divided by whole-request time.
+
+| Batch | Implementation | Mean TTFT (ms) | Last TTFT (ms) | Decode TPS | Whole-batch latency (ms) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 | EP indexed control | 96.939 | 96.939 | 151.109 | 301.941 |
+| 1 | EP pipeline | 97.039 | 97.039 | 155.434 | 297.056 |
+| 1 | Default NCCL | 101.476 | 101.476 | 154.884 | 301.738 |
+| 32 | EP indexed control | 294.807 | 320.729 | 2783.677 | 675.226 |
+| 32 | EP pipeline | 295.793 | 319.357 | 2915.332 | 658.202 |
+| 32 | Default NCCL | 410.776 | 480.005 | 3551.426 | 757.044 |
+
+Decode TPS improves 2.86% at B1 and 4.73% at B32 over the EP control. Against
+NCCL it is +0.35% at B1 and -17.91% at B32: B1 is effectively tied within the
+observed variation, not evidence of a robust NCCL win. TTFT does not improve
+relative to the EP control. Prefill implementation was unchanged, so the
+existing TTFT advantage over NCCL must not be attributed to this decode change.
+These sequential five-repeat runs are not confidence intervals or a production
+workload study; equal input hashes do not establish identical full routing traces.
+
+| Batch | Implementation | Decode TPS min–max | Mean TTFT min–max (ms) |
+| --- | --- | ---: | ---: |
+| 1 | EP indexed control | 150.807–151.495 | 95.555–97.602 |
+| 1 | EP pipeline | 154.880–156.628 | 95.718–99.580 |
+| 1 | Default NCCL | 154.358–155.889 | 100.714–106.701 |
+| 32 | EP indexed control | 2753.159–2813.412 | 256.969–345.959 |
+| 32 | EP pipeline | 2874.913–2940.681 | 259.377–325.113 |
+| 32 | Default NCCL | 3528.217–3599.450 | 390.370–542.817 |
+
+### Complete decode Graph attribution
+
+All complete replays were resolved with validated GPU annotations and no
+reported missing-node/integrity issues. Values are the median across active
+DECODE ranks of rank-local means over eight complete Graph replays. Timing is
+for a full model forward, not one MoE layer. Component interval unions can
+overlap and must not be summed as wall time; instrumented Graph time is separate
+from the HTTP throughput measurement. The classifier includes the new
+`host_sm_dispatch_pipeline_kernel` as dispatch transport.
+
+| Batch | EP control forward (ms) | Pipeline forward (ms) | NCCL forward (ms) | Control dispatch (ms) | Pipeline dispatch (ms) | Control combine (ms) | Pipeline combine (ms) | NCCL collectives (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 6.942 | 6.777 | 6.622 | 1.799 | 1.517 | 1.015 | 1.111 | 2.364 |
+| 32 | 11.514 | 11.022 | 8.910 | 4.297 | 3.590 | 1.760 | 1.967 | 3.390 |
+
+Dispatch falls 15.67% at B1 and 16.44% at B32. At B32, expert GEMM remains
+approximately 1.92 ms. Combine residence increases despite unchanged combine
+code; differences in arrival/wait timing are a possible explanation, but this
+trace does not isolate their cause. Consequently, the dispatch reduction is
+partly offset and total forward improves only 2.38% at B1 / 4.27% at B32.
+This experiment changes READY/count encoding, metadata scheduling and ACK
+handoff together; it cannot assign a separate speedup to each mechanism.
+
+The remaining B32 gap is still concentrated in the communication path: pipeline
+dispatch is about 3.59 ms and fused combine about 1.97 ms, while NCCL framework
+collectives occupy about 3.39 ms. These are different operation scopes, with
+routing/scatter/reduction work fused into EP transport, so this comparison is
+not a pure PCIe bandwidth measurement. The initial TX phase still precedes RX,
+RX consumes one ready peer payload at a time, and the pipeline retains per-frame
+reader fences and final ACK drain. Removing those dependencies requires a
+separate protocol/performance evaluation rather than dropping synchronization.
+
+### Correctness and scope
+
+CUDA compilation succeeded. Five focused cases passed in 96.77 seconds:
+int32/int64 single-frame/fallback tests, multi-peer Graph reuse with vector and
+scalar-tail payloads, and a five-rank changing-route/stage-refill test. These
+exercise empty/skewed ranks, eager-prefill transitions, source-bound fallback
+and Graph replay with changing routes; they are not exhaustive verification.
+
+All four greedy output samples and 29 compared prefix logprobs match the EP
+control exactly. NCCL's generated text/tokens also match all four samples;
+prefix logprob deltas remain max 0.218722 / mean 0.0146705. This limited output
+sanity check does not prove numerical equivalence with NCCL.
+
+Keep the pipeline opt-in. It requires at most 32 configured source rows per
+active channel and fitting index storage; other shapes retain the existing
+protocol. Sequential dispatch phase counters are deliberately unsupported in
+this mode because groups overlap; complete CUDA timelines remain supported.

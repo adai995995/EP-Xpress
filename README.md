@@ -194,15 +194,15 @@ The index lists borrow unused frame space or the idle second slot's payload area
 group-wide capacity bounds and falls back to the original protocol when space
 is insufficient; no assumption about live routing or a particular model is used.
 
-Experimental, GPU validation pending: `EP_XPRESS_DECODE_DISPATCH_PIPELINE=1`
+Experimental, validated on the configuration in the [performance report](docs/model-performance.md#decode-dispatch-control-prefetch-pipeline-2026-10-25): `EP_XPRESS_DECODE_DISPATCH_PIPELINE=1`
 requires indexed dispatch and adds two control warps beside a full 256-thread
 receiver group. A receiver-specific 64-bit READY contains generation and count;
 control warps prefetch two peers and independently ACK completed reads. This
 specialization requires at most 32 configured source rows per active channel
 and a fitting descriptor region; other shapes retain the existing protocol.
 It is disabled by default. Sequential dispatch phase counters are unsupported
-in this mode; use a CUDA timeline. No performance improvement is established
-for this implementation yet.
+in this mode; use a CUDA timeline. The measured B1/B32 Decode TPS gains over
+indexed dispatch are 2.86%/4.73%; B32 remains below default NCCL.
 
 `Config(combine_frame_rows=N)` sets rows per pair-queue frame independently of
 channel count, for `N` in 1 through 256. The default `0` retains the original
