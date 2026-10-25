@@ -817,8 +817,8 @@ not a substitute for ordinary full-model TTFT and Decode TPS measurements.
 
 ## Experimental decode dispatch prefetch pipeline
 
-Status: CUDA compilation, five focused protocol checks and a same-machine
-full-model comparison completed; see the [performance report](model-performance.md#decode-dispatch-control-prefetch-pipeline-2026-10-25). The build flag `EP_XPRESS_DECODE_DISPATCH_PIPELINE=1`
+Status: CUDA compilation, focused dynamic-route checks and same-machine
+full-model comparisons completed; see the [performance report](model-performance.md#decode-dispatch-early-publication-and-double-stages-2026-10-25). The build flag `EP_XPRESS_DECODE_DISPATCH_PIPELINE=1`
 requires `EP_XPRESS_DECODE_DISPATCH_INDEXED=1`; both remain opt-in. This does not
 change prefill, combine, active channels, arena allocation or routing weights.
 
@@ -839,25 +839,34 @@ The original slot READY is retained for transitions back to the general ring.
 A 320-thread CTA has two control warps and eight payload RX warps. Initial
 routing, local bypass and TX publication complete before the receive pipeline;
 this version does not overlap the local TX phase with RX. The control warps
-own disjoint incoming peers by rank parity. Each has one shared-memory stage
+own disjoint incoming peers by rank parity. Each has two shared-memory stages
 and polls its pending peers concurrently; an unavailable peer cannot block a
-ready peer in that group. Descriptors and route IDs/weights are fetched for up
-to two peers concurrently. Control warps reserve output/owner ranges, populate
-metadata and inverse maps, and publish the corresponding stage to RX.
+ready peer in that group. After reserving output/owner ranges and reading all
+row descriptors, control publishes the descriptor stage immediately. It then
+reads IDs/weights and writes metadata/inverse maps concurrently with RX payload
+reads. The second slot allows preparation of another peer while the first slot
+is still being consumed; the two slots do not duplicate payload storage.
 
 The 256-thread RX group consumes ready stages fairly, retaining the vectorized
 host payload reader and scalar-tail fallback. Stage states are:
 
 - Control-owned: descriptors may be replaced.
-- RX-owned: descriptors and output ranges are immutable.
-- Read-complete: all RX threads have fenced and joined; control may ACK.
+- Descriptor-ready: RX may read payload; descriptors/output ranges are immutable,
+  while control may still be processing metadata.
+- Payload-read-complete: all RX threads have fenced and joined; control may ACK
+  only after its own metadata readers have also fenced and joined.
 - Finished: no incoming stage or outgoing ACK remains in that group.
 
 Shared stage transfers use CTA acquire/release operations. Only the RX group
 participates in its 256-thread named barrier; control warps use warp barriers.
-Each metadata reader fences before stage publication. Every payload reader
-fences before the RX leader release-publishes completion. The control leader
-acquires completion before publishing the remote ACK. The other control group
+Descriptor publication follows the descriptor writers' warp barrier and uses
+CTA release/acquire. Each metadata reader fences and joins its control warp
+before that warp can examine completion or reuse either slot on its next loop.
+Every payload reader fences before the RX leader release-publishes completion.
+The control leader acquires completion before publishing the remote ACK. Thus
+early RX completion alone cannot release the host buffer: ACK joins metadata
+and payload completion. Slots are reaped independently and only by their owning
+control warp. The other control group
 and RX can keep progressing during that ACK store. No ACK depends on unrelated
 peer completion, and no mutable host atomic counter is introduced. Count-only
 readers ACK without a payload transfer. Each group also drains its actual
@@ -876,8 +885,8 @@ schema for this kernel, rather than profiling the old sequential schedule.
 Combine sampling and ordinary CUDA timelines remain available.
 
 Completed focused validation covers dynamic Graph routes and eager-prefill transitions,
-int32/int64 IDs, empty/skewed ranks, scalar payload tails, both prefetch stages
-refilled across multiple peers, and transitions between eligible/fallback channel
+int32/int64 IDs, empty/skewed ranks, scalar payload tails, two stages per control
+warp refilled across multiple peers, and transitions between eligible/fallback channel
 counts. Complete SGLang inference was compared against the previous indexed
 implementation and default NCCL on identical GPUs with P2P/NVLink disabled,
 reporting single-request and 32-request TTFT and Decode TPS. These checks cover
@@ -968,8 +977,10 @@ The existing final CTA barrier precedes record emission. Final record writes
 are excluded from elapsed time.
 
 Each control role splits READY poll, descriptor/output allocation, IDs/weights,
-metadata fence/stage publication, occupied-stage wait, ACK publication, and final
-outgoing ACK drain. Poll/missing-round counts distinguish immediately available
+metadata fence/join, occupied-stage wait, ACK publication, and final
+outgoing ACK drain. With early descriptor publication, publication falls in the
+descriptor interval, and metadata completion remains in `metadata_commit_ns`.
+Poll/missing-round counts distinguish immediately available
 notifications from rounds with none ready; they are not a count of all missing
 peers. Empty notifications and received payload rows are counted separately.
 After finishing incoming work, each control leader publishes a diagnostic-only

@@ -3364,3 +3364,136 @@ the measurements do not authorize dropping them without replacing that contract.
 The current evidence favors stage/metadata/completion work over payload-vector
 micro-tuning. It does not establish a speedup for any proposed change, nor identify
 the isolated system-fence cost or prove which rank caused another rank to wait.
+
+
+## Decode dispatch early publication and double stages (2026-10-25)
+
+The opt-in decode dispatch pipeline now publishes a payload descriptor as soon
+as its wire rows and GPU output range are known. The full 256-thread RX group
+can copy payload while its owning control warp reads expert IDs/weights and
+writes inverse/owner metadata. Each of the two control warps has two independent
+shared-memory descriptor slots, allowing preparation of the next peer while
+RX consumes the current one. Payload remains a single deduplicated producer
+copy in host memory; the additional slots do not duplicate payload buffers.
+
+ACK still joins both readers: metadata lanes system-fence and warp-join before
+the owner can reap a slot on its next loop; payload lanes system-fence and
+RX-group-join before releasing the completion flag. The owner acquires this
+flag before publishing the host ACK. An early payload completion does not
+permit early host reuse. Slots are independently reclaimed by their owner;
+finished incoming stages and outgoing ACKs are drained before operation exit.
+No CPU routing, static route cache, host atomics or extra CTA-wide barrier is
+introduced. Configured eligibility, fallback behavior, token/rank deduplication,
+weights, combine reduction order, channels, frame sizes and NUMA policy remain
+unchanged. This replaces the previous schedule within the existing opt-in
+`EP_XPRESS_DECODE_DISPATCH_PIPELINE=1` specialization; the flag remains off by
+default.
+
+### Matched full-model comparison
+
+The previous committed schedule, default SGLang NCCL, and candidate ran
+sequentially on the same eight H20D GPUs. The model was
+Qwen3-30B-A3B-Instruct-2507 BF16 with SGLang v0.5.21, TP=DP=EP8, Triton experts,
+FlashInfer attention, full decode CUDA Graphs (local buckets 1/2/4/8), and eager
+prefill. Each B1/B32 case used eight warmups and five timed repeats, 512 input
+and 32 output tokens, greedy sampling, and cache flush before each request
+batch. B32 placed four requests on every DP rank. Detailed phase counters and
+operation diagnostics were disabled during timing; ordinary CUDA traces were
+collected afterwards using eight output tokens.
+
+EP configurations and runtime environments match exactly. The only changed
+runtime source is the dispatch pipeline header. Timed prompt hashes, model
+configuration, image and framework source match. Source SHA256 manifests were
+verified before launch and against the final runtime implementation. Producer
+NUMA placement was verified before timing and before/after tracing. GPU process
+sampling found no external workload. P2P/NVLink paths were disabled for all
+runs; NCCL logged SHM only, no P2P/NET/NVLS, and all available NVLink counters
+had zero delta.
+
+TTFT is the median of repeat-level request-mean TTFT. Decode TPS is aggregate
+steady-state throughput after prefill, not total output divided by request
+latency. Values below are medians of five repeats; the ranges are observed
+min/max, not confidence intervals.
+
+| Batch | Implementation | TTFT (ms) | Decode TPS | Batch completion (ms) |
+| --- | --- | ---: | ---: | ---: |
+| 1 | Previous EP pipeline | 96.221 | 155.982 | 295.550 |
+| 1 | Early publication + double stages | 96.746 | 158.444 | 293.372 |
+| 1 | Default NCCL | 101.943 | 154.947 | 302.509 |
+| 32 | Previous EP pipeline | 291.541 | 2910.583 | 656.315 |
+| 32 | Early publication + double stages | 321.673 | 3139.696 | 651.231 |
+| 32 | Default NCCL | 524.257 | 3579.579 | 822.509 |
+
+Relative to the previous EP schedule, B1 Decode TPS improves 1.58% and B32
+improves 7.87%. Against default NCCL the candidate is 2.26% higher at B1 but
+12.29% lower at B32. B32 candidate and previous-EP Decode TPS ranges do not
+overlap in this bounded sequential comparison. This supports a decode gain
+on the measured workload, not a general speedup across models or batch sizes.
+
+TTFT does not improve against previous EP: it increases 0.55% at B1 and 10.34%
+at B32. B32 candidate TTFT is 38.64% lower than NCCL, but that pre-existing
+prefill advantage cannot be credited to this decode-only change. B32 TTFT
+ranges are broad and overlap; no causal explanation for the observed increase
+was established. Do not dismiss it as noise or claim a prefill gain. With only
+32 output tokens, B32 whole-batch completion improves just 0.77%, despite the
+7.87% steady-state decode gain.
+
+| Batch | Implementation | TTFT min-max (ms) | Decode TPS min-max |
+| --- | --- | ---: | ---: |
+| 1 | Previous EP pipeline | 95.915-97.804 | 154.812-156.694 |
+| 1 | Early publication + double stages | 96.260-97.873 | 156.992-158.654 |
+| 1 | Default NCCL | 100.957-102.583 | 154.634-155.508 |
+| 32 | Previous EP pipeline | 256.922-309.724 | 2895.359-2918.603 |
+| 32 | Early publication + double stages | 258.017-343.266 | 3084.427-3165.949 |
+| 32 | Default NCCL | 452.493-550.190 | 3552.509-3615.184 |
+
+### Ordinary CUDA timeline
+
+Each entry is the median across active decode ranks of the rank-local mean
+for eight complete Graph replays. B1 has one active decode rank; B32 has eight.
+Kernel intervals within a category are unioned. Categories can overlap, and
+these trace timings are distinct from uninstrumented HTTP measurements. No
+cross-rank timestamps are subtracted or durations summed.
+
+| Batch | Version | GPU forward (ms) | Dispatch transport (ms) | Combine mailbox (ms) | Expert GEMM (ms) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 | Previous EP pipeline | 6.759 | 1.548 | 1.087 | 0.774 |
+| 1 | Early publication + double stages | 6.662 | 1.495 | 1.049 | 0.773 |
+| 32 | Previous EP pipeline | 11.017 | 3.591 | 1.963 | 1.922 |
+| 32 | Early publication + double stages | 10.276 | 2.977 | 1.834 | 1.923 |
+
+B32 dispatch falls from 3.591 to 2.977 ms (-17.08%), combine from 1.963 to
+1.834 ms, and complete forward from 11.017 to 10.276 ms (-0.741 ms). Expert
+GEMM remains approximately 1.923 ms. Thus dispatch savings are not canceled
+by a slower combine in this trace. Combine source did not change; its timing
+can change with rank arrival and upstream scheduling, so the reduction is not
+an independently established combine-kernel speedup. NCCL's B32 forward is
+8.958 ms with 3.423 ms of framework NCCL kernels. EP dispatch plus combine
+remain substantial, but these categories are not identical collective work
+and should not be treated as a pure PCIe bandwidth comparison.
+
+This turn did not repeat the perturbing role-counter experiment. The previous
+approximately 60% RX stage-wait fraction cannot be reused as the new fraction,
+and the current trace does not isolate which remaining ACK/fence interval
+accounts for the residual gap. The measured improvement is consistent with
+removing the metadata-before-payload dependency; separate ablations would be
+needed to distinguish early-publication gains from double-stage gains.
+
+### Functional validation and limitations
+
+Two focused eight-GPU checks passed in 81.67 seconds. They cover int32 IDs with
+2048-wide vector payload reads and int64 IDs with 258-wide scalar reads,
+changing per-token routes/weights, rank and row dependent payloads, empty ranks,
+skewed ownership, same-rank expert deduplication, multiple peers per control
+group, retained Graph buckets, alternating replay streams, eager transitions,
+and configured-bound fallback. Every result matches the exact BF16 reference.
+The tests deliberately vary payload values and weights so row/metadata mixups
+cannot hide behind constant data. No broad functional suite was rerun.
+
+Four greedy full-model outputs and all 29 compared prefix logprobs match the
+previous EP schedule exactly. All four generated token sequences also match
+NCCL; prefix logprob differences have maximum 0.218722 and mean 0.0146705.
+These are limited output checks, not exhaustive numerical equivalence. Larger
+world sizes, other models, longer generations and serving arrival distributions
+were not measured. The current result establishes a bounded decode improvement
+while leaving B32 NCCL parity and the TTFT increase unresolved.

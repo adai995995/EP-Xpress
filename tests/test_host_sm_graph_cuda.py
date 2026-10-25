@@ -48,7 +48,18 @@ def _worker(rank, init_file, fused, single_frame=False, chunk_bytes=4096, id_bit
         ids = torch.tensor(routes,
                            dtype=torch.int32 if id_bits == 32 else torch.int64, device="cuda").reshape(n, 2)
         weights = torch.full((n, 2), 0.5, device="cuda")
+        if world > 3:
+            # Distinguish rows/lanes and route weights so premature reuse or a
+            # metadata/payload mismatch cannot hide behind constant payloads.
+            rows = torch.arange(n, device="cuda")
+            columns = torch.arange(hidden, device="cuda")
+            x = ((rank + step + 1 + rows[:, None] % 7 + columns[None, :] % 4) * 8).to(torch.bfloat16)
+            weights[:, 0] = 0.25 + ((rows + step) % 2) * 0.5
+            weights[:, 1] = 1.0 - weights[:, 0]
         return x, ids, weights
+
+    def reference(data):
+        return data[0].float() * (data[2] * (data[1] >= 0)).sum(1)[:, None]
 
     def forward(data, workspace, channels, fused):
         batch = context.dispatch_on_stream(*data, workspace=workspace,
@@ -87,13 +98,12 @@ def _worker(rank, init_file, fused, single_frame=False, chunk_bytes=4096, id_bit
                 for static, value in zip(data, current):
                     static.copy_(value)
                 graph.replay()
-                reference = current[0].float() * (current[1] >= 0).sum(1)[:, None] * 0.5
-                results.append((output.clone(), reference))
+                results.append((output.clone(), reference(current)))
                 # Eager prefill uses pair queues and the same device counters.
                 eager = inputs(4, step)
                 workspace = context.create_workspace(world * 4, 4)
                 result = forward(eager, workspace, 2, False)
-                results.append((result.clone(), eager[0].float() * (eager[1] >= 0).sum(1)[:, None] * 0.5))
+                results.append((result.clone(), reference(eager)))
                 saved.append(workspace)
         # Exact configured source bound, maximally skewed token ownership.
         # The other rank still participates with zero local rows. One channel
@@ -104,7 +114,7 @@ def _worker(rank, init_file, fused, single_frame=False, chunk_bytes=4096, id_bit
                 edge = inputs(bound if rank == 0 else 0, 3)
                 workspace = context.create_workspace(bound, edge[0].shape[0], fused_combine=True)
                 output = forward(edge, workspace, 1, True)
-                results.append((output.clone(), edge[0].float() * (edge[1] >= 0).sum(1)[:, None] * 0.5))
+                results.append((output.clone(), reference(edge)))
                 saved.append(workspace)
         torch.cuda.synchronize()
         for actual, expected in results:
@@ -205,20 +215,21 @@ def test_indexed_dispatch_multi_warp_route_tail():
             nprocs=3, join=True)
 
 
-def test_dispatch_pipeline_multi_peer_stage_reuse():
-    """Both prefetch stages refill while route shapes and graph epochs change."""
+@pytest.mark.parametrize("hidden,id_bits", [(2048, 32), (258, 64)])
+def test_dispatch_pipeline_multi_peer_stage_reuse(hidden, id_bits):
+    """Each control group reuses two stages across dynamic routes and epochs."""
     if os.environ.get("EP_XPRESS_DECODE_DISPATCH_PIPELINE") != "1":
         pytest.skip("enable the experimental decode dispatch pipeline")
-    if torch.cuda.device_count() < 5:
-        pytest.skip("five CUDA GPUs are required")
+    if torch.cuda.device_count() < 8:
+        pytest.skip("eight CUDA GPUs are required")
     from torch.utils.cpp_extension import CUDA_HOME
     if CUDA_HOME is None:
         pytest.skip("CUDA toolkit is unavailable")
     native.load()
     with tempfile.TemporaryDirectory(prefix="ep-xpress-pipeline-test-") as root:
         torch.multiprocessing.spawn(_worker,
-            args=(os.path.join(root, "rendezvous"), True, True, 262144, 64, False, 5, 258, True),
-            nprocs=5, join=True)
+            args=(os.path.join(root, "rendezvous"), True, True, 262144, id_bits, False, 8, hidden, True),
+            nprocs=8, join=True)
 
 
 def test_dispatch_pipeline_profile_graph_reset_and_overflow():

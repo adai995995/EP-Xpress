@@ -1,7 +1,9 @@
 // Included inside host_sm.cu's private namespace. Bounded decode only.
-// Two control warps prefetch independent peers and publish completed ACKs;
+// Two control warps each double-buffer peer descriptors and publish joined ACKs;
 // the remaining eight warps retain the full legacy payload-read parallelism.
 constexpr int kDispatchControlWarps = 2;
+constexpr int kDispatchStagesPerControl = 2;
+constexpr int kDispatchStages = kDispatchControlWarps * kDispatchStagesPerControl;
 constexpr int kDispatchPipelineThreads = kThreads + 32 * kDispatchControlWarps;
 constexpr int kDispatchPipelineRows = 32;
 
@@ -20,7 +22,9 @@ __device__ __forceinline__ void dispatch_rx_sync() {
 }
 
 struct DispatchPrefetchStage {
-  // 0: control-owned; 1: RX-owned; 2: reads complete; 3: control finished.
+  // 0: free; 1: descriptor ready for RX; 2: payload reads complete; 3: finished.
+  // Control may still be reading metadata in state 1 or 2. Only its owner
+  // reclaims the stage, after its metadata fence/join and RX's release of 2.
   uint32_t state;
   int peer, count, output;
   int wires[kDispatchPipelineRows];
@@ -87,7 +91,7 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
   __shared__ uint64_t masks[kDispatchPipelineRows];
   __shared__ int local_count, remote_count, local_base, local_owner;
   __shared__ int counts[kMaxRanks];
-  __shared__ DispatchPrefetchStage stages[kDispatchControlWarps];
+  __shared__ DispatchPrefetchStage stages[kDispatchStages];
   __shared__ int rx_choice;
 
   __shared__ DispatchProfileStorage<Profile> diag;
@@ -154,7 +158,7 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
           int64_t(local_owner) + local_count > a.capacity) fail(a.status, 2);
     }
   }
-  if (tid < kDispatchControlWarps) stages[tid].state = 0;
+  if (tid < kDispatchStages) stages[tid].state = 0;
   __syncthreads();
   if (!read_status(a.status)) {
     for (int64_t i = tid; i < int64_t(local_count) * (a.hidden / 2); i += blockDim.x) {
@@ -222,7 +226,8 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
 
   if (tid < 64) {
     const int group = tid / 32;
-    auto& stage = stages[group];
+    const int stage_base = group * kDispatchStagesPerControl;
+    int next_stage = 0;
     const int dc = group == 0 ? DControl0 : DControl1;
     if constexpr (Profile) {
       if (!lane && diag.sample >= 0) {
@@ -234,24 +239,37 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
     const int peer = group + lane * kDispatchControlWarps;
     bool pending = peer < a.world && peer != a.rank;
     uint32_t iteration = 0;
-    while (__any_sync(0xffffffffu, pending)) {
+    while (true) {
       if (__any_sync(0xffffffffu, read_status(a.status) != 0)) break;
-      uint32_t state = __shfl_sync(0xffffffffu, lane == 0 ? dispatch_stage_load(&stage.state) : 0, 0);
-      if (state == 1) mark(dc + DCStageWait, lane == 0);
-      if (state == 2) {
-        mark(dc + DCAck, lane == 0);
-        if (!lane) {
-          char* source = reinterpret_cast<char*>(a.pointers[stage.peer]) +
-                         channel * a.channel_stride + kArenaHeader;
-          // RX writers fence and join before releasing state=2. This acquire
-          // transfers completion to the ACK owner, independently of the other stage.
-          release(control(source, 1 + a.rank), sequence);
-          dispatch_stage_store(&stage.state, 0);
+      int free_stage = -1;
+      bool occupied = false;
+      // Reap each completed slot independently. Metadata reads from the
+      // previous iteration have already fenced and joined at this point.
+      // RX's acquire/release handoff supplies the other half of the ACK join.
+      for (int i = 0; i < kDispatchStagesPerControl; ++i) {
+        const int index = stage_base + (next_stage + i) % kDispatchStagesPerControl;
+        auto& candidate = stages[index];
+        uint32_t state = __shfl_sync(0xffffffffu,
+            lane == 0 ? dispatch_stage_load(&candidate.state) : 0, 0);
+        if (state == 2) {
+          mark(dc + DCAck, lane == 0);
+          if (!lane) {
+            char* source = reinterpret_cast<char*>(a.pointers[candidate.peer]) +
+                           channel * a.channel_stride + kArenaHeader;
+            release(control(source, 1 + a.rank), sequence);
+            dispatch_stage_store(&candidate.state, 0);
+          }
+          __syncwarp();
+          state = 0;
         }
-        __syncwarp();
-        state = 0;
+        if (state == 0 && free_stage < 0) free_stage = index;
+        occupied |= state != 0;
       }
-      if (state == 0) {
+      const bool incoming = __any_sync(0xffffffffu, pending);
+      if (!incoming && !occupied) break;
+      if (free_stage < 0 || !incoming) mark(dc + DCStageWait, lane == 0);
+      if (free_stage >= 0 && incoming) {
+        auto& stage = stages[free_stage];
         mark(dc + DCReady, lane == 0);
         uint64_t ready = 0;
         if (pending) {
@@ -305,6 +323,17 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
             owner = __shfl_sync(0xffffffffu, owner, 0);
             __syncwarp();
             if (__any_sync(0xffffffffu, read_status(a.status) != 0)) break;
+            // Descriptors and destination are sufficient for payload reads.
+            // Publish before route metadata loads; RX never accesses IDs or
+            // weights, and this stage remains immutable until both sides join.
+            if (!lane) {
+              stage.peer = selected_peer; stage.count = count; stage.output = output;
+              dispatch_stage_store(&stage.state, 1);
+              if constexpr (Profile) { if (diag.sample >= 0 && diag.values[dc + DCFirstStage] < 0)
+                diag.values[dc + DCFirstStage] = ticks_ns() - diag.values[DBegin]; }
+            }
+            __syncwarp();
+            next_stage = (free_stage - stage_base + 1) % kDispatchStagesPerControl;
             mark(dc + DCMetadata, lane == 0);
             if constexpr (Profile) { if (!lane && diag.sample >= 0) diag.values[dc + DCRows] += count; }
             // Warp lanes issue independent route loads. The other control warp
@@ -323,16 +352,11 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
               a.owner_rows[int64_t(selected_peer) * a.capacity + owner + lane] = output + lane;
             }
             mark(dc + DCMetadataCommit, lane == 0);
-            // Every metadata reader closes its host accesses before handing the
-            // stage to RX, whose later completion permits host-buffer reuse.
+            // Every metadata lane completes its host reads and GPU writes
+            // before the owner may reap RX completion and publish a host ACK.
+            // RX can finish first; state 2 alone never causes an early ACK.
             __threadfence_system();
             __syncwarp();
-            if (!lane) {
-              stage.peer = selected_peer; stage.count = count; stage.output = output;
-              dispatch_stage_store(&stage.state, 1);
-              if constexpr (Profile) { if (diag.sample >= 0 && diag.values[dc + DCFirstStage] < 0)
-                diag.values[dc + DCFirstStage] = ticks_ns() - diag.values[DBegin]; }
-            }
             mark(dc + DCStageWait, lane == 0);
           }
         }
@@ -343,22 +367,6 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
           fail(a.status, 4);
       }
       __syncwarp();
-    }
-    // The final staged peer may still be in flight after pending becomes empty.
-    while (!__any_sync(0xffffffffu, read_status(a.status) != 0)) {
-      const uint32_t state = __shfl_sync(0xffffffffu, lane == 0 ? dispatch_stage_load(&stage.state) : 0, 0);
-      if (state == 0) break;
-      if (state == 2) {
-        mark(dc + DCAck, lane == 0);
-        if (!lane) {
-          char* source = reinterpret_cast<char*>(a.pointers[stage.peer]) + channel * a.channel_stride + kArenaHeader;
-          release(control(source, 1 + a.rank), sequence);
-          dispatch_stage_store(&stage.state, 0);
-        }
-        __syncwarp();
-        break;
-      }
-      if (a.diagnostics && ticks_ns() - start > a.timeout_ns) fail(a.status, 3);
     }
     mark(dc + DCDrain, lane == 0);
     if constexpr (Profile) { if (!lane && diag.sample >= 0) {
@@ -372,7 +380,9 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
       if (a.diagnostics && ticks_ns() - start > a.timeout_ns) fail(a.status, 3);
     }
     __syncwarp();
-    if (!lane) dispatch_stage_store(&stage.state, 3);
+    if (!lane)
+      for (int i = 0; i < kDispatchStagesPerControl; ++i)
+        dispatch_stage_store(&stages[stage_base + i].state, 3);
     if constexpr (Profile) { if (!lane && diag.sample >= 0) {
       const uint64_t now = ticks_ns();
       diag.values[diag_phase] += now - diag_mark;
@@ -389,8 +399,8 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
       if (!rx) {
         rx_choice = -1;
         bool done = true;
-        for (int i = 0; i < kDispatchControlWarps; ++i) {
-          const int choice = (next + i) % kDispatchControlWarps;
+        for (int i = 0; i < kDispatchStages; ++i) {
+          const int choice = (next + i) % kDispatchStages;
           const uint32_t state = dispatch_stage_load(&stages[choice].state);
           if (state != 3) done = false;
           if (state == 1 && rx_choice < 0) rx_choice = choice;
@@ -447,7 +457,7 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
       if (!rx) dispatch_stage_store(&stages[choice].state, 2);
       // All RX lanes stop referencing this stage before control can refill it.
       dispatch_rx_sync();
-      next = (choice + 1) % kDispatchControlWarps;
+      next = (choice + 1) % kDispatchStages;
       mark(DRx + DRStageWait, rx == 0);
     }
     if constexpr (Profile) { if (!rx && diag.sample >= 0) {
