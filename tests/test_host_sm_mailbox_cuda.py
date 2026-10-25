@@ -22,6 +22,11 @@ def _routes(case, rank):
         return [[2, 3, -1]] * (5 if rank == 0 else 0)
     if case == 3:
         return []
+    if case in (5, 6):
+        # Cross a 32-descriptor tile, then reuse the same mailboxes with a
+        # different skew and channel count. Every token has remote readers.
+        lengths = (33, 33, 33) if case == 5 else (1, 33, 2)
+        return [[0, 2, 4]] * lengths[rank]
     lengths = (16, 16, 16) if case == 4 else ((9, 3, 0) if case == 1 else (4, 8, 6))
     result = []
     for token in range(lengths[rank]):
@@ -36,7 +41,7 @@ def _routes(case, rank):
 
 def _mailbox_worker(rank, directory, barrier, hidden, storage_offset):
     torch.cuda.set_device(rank)
-    world, topk, channels, capacity, tokens = 3, 3, 2, 32, 16
+    world, topk, channels, capacity, tokens = 3, 3, 2, 128, 33
     mappings, addresses, pointers = [], [], {}
     prepared = None
     try:
@@ -61,7 +66,7 @@ def _mailbox_worker(rank, directory, barrier, hidden, storage_offset):
         combine_epoch = 0
         # The middle group holds two dispatched layouts concurrently and
         # combines them in reverse order with fresh operation epochs.
-        for cases in ((0,), (1, 2), (3,), (4,)):
+        for cases in ((0,), (1, 2), (3,), (4,), (5, 6)):
             handles = []
             for case in cases:
                 routes = _routes(case, rank)
@@ -164,7 +169,7 @@ def test_mailbox_sparse_readers_reuse_reverse_handles_and_legacy_rounding(hidden
     if native.host_sm_max_channels(3) < 2:
         pytest.skip("insufficient cooperative residency")
     with tempfile.TemporaryDirectory(prefix="ep-xpress-mailbox-test-", dir="/dev/shm") as directory:
-        for phase, size in _sizes(hidden, 3, 2, 3, 16).items():
+        for phase, size in _sizes(hidden, 3, 2, 3, 33).items():
             for rank in range(3):
                 with open(os.path.join(directory, f"{phase}-{rank}"), "wb") as output:
                     os.posix_fallocate(output.fileno(), 0, size)

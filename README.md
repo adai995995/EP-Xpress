@@ -177,6 +177,13 @@ for fused decode. It keeps full-CTA reception and the existing ACK protocol.
 The default `1` retains per-row publication; this is a throughput/latency tradeoff,
 not a universal speedup. Set it before extension loading or worker startup.
 
+`EP_XPRESS_DECODE_DESCRIPTOR_BATCH=32` additionally prepares outgoing row and
+mailbox descriptors in bounded GPU tiles and checks each tile's outgoing ACKs
+in parallel. Default `0` retains the original descriptor/check schedule. Both
+paths retain full-CTA reception and wait for every actual reader before return.
+Routes are rebuilt from current GPU owner lists on each invocation; the tile
+size is independent of token count and does not limit supported routing shapes.
+
 `Config(combine_frame_rows=N)` sets rows per pair-queue frame independently of
 channel count, for `N` in 1 through 256. The default `0` retains the original
 split of `chunk_bytes` across channels and peers. Larger fixed frames consume

@@ -152,6 +152,11 @@ static_assert(EP_XPRESS_DECODE_PEER_BATCH == 0 || EP_XPRESS_DECODE_PEER_BATCH ==
 static_assert(EP_XPRESS_DECODE_PUBLISH_BATCH == 1 || EP_XPRESS_DECODE_PUBLISH_BATCH == 2 ||
               EP_XPRESS_DECODE_PUBLISH_BATCH == 4 || EP_XPRESS_DECODE_PUBLISH_BATCH == 8 ||
               EP_XPRESS_DECODE_PUBLISH_BATCH == 16, "unsupported decode publish batch");
+#ifndef EP_XPRESS_DECODE_DESCRIPTOR_BATCH
+#define EP_XPRESS_DECODE_DESCRIPTOR_BATCH 0
+#endif
+static_assert(EP_XPRESS_DECODE_DESCRIPTOR_BATCH == 0 || EP_XPRESS_DECODE_DESCRIPTOR_BATCH == 32,
+              "unsupported decode descriptor batch");
 __device__ __forceinline__ void host_store128(void* address, uint4 value) {
   // Match the scalar volatile store policy. Each writer still executes a
   // system fence before the Tx leader publishes READY for the whole frame.
@@ -1558,6 +1563,89 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
   if (tid == 0) error = read_status(a.status);
   __syncthreads();
 
+#if EP_XPRESS_DECODE_DESCRIPTOR_BATCH > 0
+  // The immutable GPU owner lists define a flattened, per-CTA send sequence.
+  // Prepare bounded tiles in parallel, regardless of route skew or token count.
+  // Payload copies and reception still use the entire 256-thread CTA.
+  constexpr int descriptor_batch = EP_XPRESS_DECODE_DESCRIPTOR_BATCH;
+  __shared__ int send_begins[kMaxRanks];
+  __shared__ int64_t send_offsets[kMaxRanks + 1];
+  __shared__ int send_rows[descriptor_batch];
+  __shared__ char* send_boxes[descriptor_batch];
+  phase(PSendMetadata);
+  if (tid < a.world) {
+    int n = tid == a.rank ? 0 : a.owner_counts[tid];
+    if (n < 0 || n > a.input_rows) { fail(a.status, 1); n = 0; }
+    const int first_send = int(int64_t(n) * channel / a.channels);
+    const int last_send = int(int64_t(n) * (channel + 1) / a.channels);
+    send_begins[tid] = first_send;
+    send_offsets[tid + 1] = last_send - first_send;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    send_offsets[0] = 0;
+    for (int peer = 0; peer < a.world; ++peer)
+      send_offsets[peer + 1] += send_offsets[peer];
+    error = read_status(a.status);
+  }
+  __syncthreads();
+  const int64_t send_count = send_offsets[a.world];
+  const auto prepare_descriptors = [&](int64_t base, int count) {
+    if (tid < count) {
+      const int64_t item = base + tid;
+      int peer = 0;
+      while (peer + 1 < a.world && item >= send_offsets[peer + 1]) ++peer;
+      const int index = send_begins[peer] + int(item - send_offsets[peer]);
+      const int r = a.owner_rows[int64_t(peer) * a.input_rows + index];
+      if (r < 0 || r >= a.input_rows) fail(a.status, 1);
+      else {
+        const int64_t original = a.input_inverse[int64_t(r) * 2 + 1];
+        if (original < 0 || original >= a.mailbox_tokens) fail(a.status, 2);
+        else {
+          send_rows[tid] = r;
+          send_boxes[tid] = mailbox(a, a.rank, peer, int(original));
+        }
+        if (a.diagnostics && a.input_inverse[int64_t(r) * 2] != peer) fail(a.status, 1);
+      }
+    }
+    __syncthreads();
+    if (tid == 0) error = read_status(a.status);
+    __syncthreads();
+  };
+  for (int64_t base = 0; base < send_count && !error; base += descriptor_batch) {
+    phase(PSendMetadata);
+    const int count = int(min(int64_t(descriptor_batch), send_count - base));
+    prepare_descriptors(base, count);
+    if (error) break;
+    for (int batch = 0; batch < count; batch += EP_XPRESS_DECODE_PUBLISH_BATCH) {
+      const int n = min(EP_XPRESS_DECODE_PUBLISH_BATCH, count - batch);
+      phase(PSendPayload);
+      for (int j = 0; j < n; ++j) {
+        char* box = send_boxes[batch + j];
+        const auto* source = reinterpret_cast<const uint32_t*>(
+            a.input + int64_t(send_rows[batch + j]) * a.hidden);
+        for (int h = tid; h < a.hidden / 2; h += blockDim.x)
+          host_store32(box + 32 + int64_t(h) * 4, source[h]);
+      }
+      if constexpr (Profile) { if (sample >= 0 && tid == 0) {
+        profile.values[PSendRows] += n;
+        profile.values[PWrittenBytes] += int64_t(n) * a.hidden * 2;
+      }}
+      phase(PPublish);
+      // Every payload writer fences before any descriptor lane publishes.
+      __threadfence_system();
+      __syncthreads();
+      if (tid < n) {
+        char* box = send_boxes[batch + tid];
+        if (a.diagnostics) host_store64(box + 16, a.identity);
+        release(control(box, 0), a.epoch);
+      }
+      // Finish publication before descriptor storage can be reused. This also
+      // flushes a partial batch at the actual last send, including sparse routes.
+      __syncthreads();
+    }
+  }
+#else
   // Bound publication batching independently of token count, routing and
   // channel count. Every writer fences its own payload stores before ANY
   // lane publishes READY. Queues remain single-writer and final ACK drain is
@@ -1653,6 +1741,8 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
   flush_publishes();
 #endif
 
+#endif
+
   // A token CTA waits only for its actual remote contributors, then performs
   // the exact legacy arithmetic: ascending-rank FP32 sum -> BF16 -> add local
   // BF16 -> BF16. The local compact row is provided by dispatch.
@@ -1741,6 +1831,31 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
   }
 
   phase(POther);
+#if EP_XPRESS_DECODE_DESCRIPTOR_BATCH > 0
+  // Reconstruct one bounded descriptor tile at a time; no capacity-sized
+  // allocation or stale route cache is needed. Each lane retires its own ACK
+  // once, while the CTA waits only for the remaining actual destinations.
+  for (int64_t base = 0; base < send_count && !error; base += descriptor_batch) {
+    phase(POther);
+    const int count = int(min(int64_t(descriptor_batch), send_count - base));
+    prepare_descriptors(base, count);
+    if (error) break;
+    bool pending = tid < count;
+    char* box = pending ? send_boxes[tid] : nullptr;
+    phase(PIdleDrain);
+    uint32_t iteration = 0;
+    do {
+      if (pending) pending = acquire(control(box, 1)) != a.epoch;
+      const int waiting = __syncthreads_or(pending);
+      if (tid == 0) {
+        blocked = waiting;
+        error = mailbox_health(a, start, iteration++);
+      }
+      __syncthreads();
+      if (blocked && !error) __nanosleep(64);
+    } while (blocked && !error);
+  }
+#else
   // Each CTA drains only the rows it published. There is no terminal frame or
   // all-rank ACK: a rank with no incoming/outgoing rows can finish immediately.
   for (int peer = 0; peer < a.world && !error; ++peer) {
@@ -1767,6 +1882,7 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
       phase(POther);
     }
   }
+#endif
   if constexpr (Profile) {
     if (sample >= 0) {
       __syncthreads();

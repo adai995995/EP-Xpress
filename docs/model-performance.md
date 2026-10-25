@@ -2427,3 +2427,38 @@ or NUMA topologies need separate evaluation. No routing is cached across decode
 steps and no benchmark-specific batch-size branch is introduced. The diagnostic
 counter storage is also released at context teardown; that cleanup does not
 change the measured inference path.
+
+## Bounded decode descriptors and parallel ACK checks (2026-10-25)
+
+The optional `EP_XPRESS_DECODE_DESCRIPTOR_BATCH=32` schedule prepares outgoing
+row/mailbox descriptors in bounded GPU tiles and polls the actual outgoing ACKs
+in parallel. It retains all 256 receive threads, current routing masks, the
+existing BF16 arithmetic order, all-writer system fences before READY, and the
+final ACK drain before workspace reuse. Default 0 keeps the previous schedule.
+The candidate's test configuration also sets `EP_XPRESS_DECODE_PUBLISH_BATCH=8`.
+Descriptors are recomputed from each invocation's GPU owner lists; tile size is
+not a token-capacity limit or a benchmark-specific routing assumption.
+
+The candidate compiles on the development GPUs. Three focused GPU cases pass:
+Graph replay with changing routes/buckets, eager interleave and diagnostic
+reset/overflow; and vector-width 2048 plus scalar-width 258 mailbox comparisons
+against legacy rounding. Mailbox cases now include more than 32 outgoing
+descriptors per CTA, partial final tiles, changed route skew/channel counts,
+reverse handle consumption, sparse readers and delayed nonparticipants.
+The three-case run completed in 83.94 seconds; the only warning concerned the
+read-only test-cache directory.
+
+Full-model control and NCCL runs and complete forward traces were collected,
+but subsequent GPU process sampling found an independent benchmark sequence
+running concurrently with the candidate's timing window. The candidate run was
+stopped. The initial NCCL control also had large outliers; it did not have the
+same continuous process-ownership audit, so absence of interference cannot be
+established retrospectively. These attempts are not accepted as a controlled
+performance comparison, and no new TTFT or Decode TPS gain is claimed here.
+
+The remaining validation is an exclusive-GPU rerun of the same BF16 SGLang
+model, full decode Graph settings and default NCCL baseline, with NVLink/P2P
+disabled on both sides. Timing and profiling remain separate. Private experiment
+instrumentation now records GPU process ownership throughout a run and rejects
+results if another GPU task appears; raw deployment details stay outside this
+repository. The option remains opt-in pending an uncontended model comparison.

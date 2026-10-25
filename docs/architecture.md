@@ -732,3 +732,29 @@ older samples on overflow. Normal kernels instantiate profiling off, so there
 is no diagnostic flag read, counter write, timer or added profile barrier in
 production contexts. Concurrent replay/submission remains unsupported, as for
 the underlying mailbox protocol.
+
+## Bounded decode descriptor tiles
+
+`EP_XPRESS_DECODE_DESCRIPTOR_BATCH=32` enables an optional schedule for fused
+mailbox combine; default 0 retains the existing path. Each CTA first computes
+its per-peer intervals from current GPU owner counts. A prefix over these
+intervals defines a flat send sequence with the same peer/row order as before.
+Up to 32 lanes prepare row indices and destination addresses together. Tiles
+are streamed, so shared storage does not grow with token capacity or route
+skew. No descriptors or routes are reused across invocations.
+
+All 256 threads still write each payload. Publication uses the independent
+`EP_XPRESS_DECODE_PUBLISH_BATCH` bound: all writers fence, synchronize, and then
+descriptor lanes publish READY. The last partial batch is published immediately.
+Every lane joins before tile storage can be overwritten. Reception is unchanged:
+all actual contributors must be ready, the full CTA reads/reduces in the original
+arithmetic order, and ACK publication follows the last host read.
+
+After reception, each CTA reconstructs bounded descriptor tiles from the same
+immutable owner lists. Each active lane checks one outgoing mailbox ACK and
+remembers when it has completed; completed ACKs are not polled again. The CTA
+exits a tile only after all its actual ACKs arrive. There is still a final drain
+before return and no unrelated rank obligation, host atomic, additional payload
+copy, or credit bypass. Tiling reduces metadata barriers and serialized checks;
+it cannot remove a remote consumer's genuine delay. All-resident launch and
+serialized eager/Graph workspace lifetime requirements remain unchanged.
