@@ -2835,3 +2835,158 @@ Keep the pipeline opt-in. It requires at most 32 configured source rows per
 active channel and fitting index storage; other shapes retain the existing
 protocol. Sequential dispatch phase counters are deliberately unsupported in
 this mode because groups overlap; complete CUDA timelines remain supported.
+
+## Combine attribution after the dispatch pipeline (2026-10-25)
+
+This is a diagnostic follow-up to the preceding full-model comparison, with
+no transport implementation changes. Both groups use implementation `a47ec9d`
+and the same deployment/configuration, switching only the dispatch pipeline
+flag. Each full-model run uses input 512/output 8 for diagnostic captures,
+with eight warmups and counter-off/on/on/off trials at B1 and B32. B1 is pinned
+to source rank 0; B32 has four requests on each of eight source ranks. Prompts
+match across configurations. Every instrumented trial records 384 combine
+operations per rank, with no dropped samples or reported transport errors.
+The ownership sampler observed no external GPU process; transport validation
+passed with SHM only and zero NVLink counter delta.
+
+### Where the additional combine residence appears
+
+Values below are microseconds per combine invocation, averaged over the two
+counter-on trials. For each rank-local operation, select the last-finishing
+CTA, then average rank 0 for B1 or all eight ranks equally for B32. Do not sum
+concurrent CTA times or subtract clocks on different GPUs. Phase counters
+include instrumentation barriers and are diagnostic residence times, not raw
+PCIe latency or the uninstrumented end-to-end benchmark.
+
+| Phase (us) | B1 indexed | B1 pipeline | B32 indexed | B32 pipeline |
+| --- | ---: | ---: | ---: | ---: |
+| Send descriptor preparation | 1.399 | 1.400 | 2.694 | 2.703 |
+| Send payload writes | 0.000 | 0.000 | 4.573 | 4.552 |
+| Payload fence / READY publication | 0.000 | 0.000 | 3.380 | 3.366 |
+| Receive metadata / selection | 1.040 | 1.037 | 0.874 | 0.874 |
+| READY checks / progress loop | 10.736 | 12.959 | 9.882 | 13.711 |
+| Receive payload / reduction / output | 5.679 | 5.737 | 5.820 | 5.835 |
+| ACK publication / reader fence | 2.275 | 2.275 | 3.544 | 3.538 |
+| Final ACK drain | 0.000 | 0.000 | 3.584 | 3.508 |
+| Other control | 0.582 | 0.583 | 1.615 | 1.614 |
+| Total sampled CTA residence | 21.712 | 23.990 | 35.967 | 39.700 |
+
+B32 total residence increases 3.734 us; READY-loop residence increases 3.829 us,
+while payload read/reduction increases only 0.014 us and ACK drain decreases
+0.075 us. B1 shows the same pattern: +2.278 us total, +2.223 us READY-loop.
+Both repeated trials agree: B32 READY-loop means are 9.927/9.836 us before and
+13.740/13.682 us after. Missing-READY observations across all B32 CTAs increase
+from 57,300/56,599 to 81,966/81,640. These observations distinguish an increase
+in unsuccessful readiness checks from a mere shift in phase labels.
+
+The current B32 breakdown is approximately 34.5% READY-loop residence,
+14.7% receive payload/reduction, 11.5% payload writes, 8.5% READY publication,
+8.9% ACK publication and 8.8% final ACK drain. The READY phase includes host
+flag-load latency, collective CTA progress barriers and sleep/poll overhead;
+it does not measure pure remote producer delay. Receive payload also includes
+reduction/output work. Therefore these counters identify the affected phase
+but do not establish PCIe saturation, a particular late producer, or its cause.
+
+B1 rank 0 has no remote sends and therefore no outgoing ACK drain. The other
+seven ranks do have outgoing ACK drain, averaging 5.734 -> 5.715 us. A zero
+in the B1 source-rank table does not imply that the protocol has eliminated ACKs.
+
+Requested combine payload bytes are identical in every matched trial:
+7,229,440 bytes written and read at B1, and 233,566,208 bytes written and read
+at B32 (each direction, summed over all ranks/CTAs). B32 sends/receives 57,023
+remote partial rows per trial. Equal counts do not prove identical per-token
+routes, but exclude an aggregate payload-volume increase in these captures.
+
+Counter-on versus off mean diagnostic TPOT is 6.707 versus 6.656 ms for B1
+indexed, 6.519 versus 6.489 ms for B1 pipeline, 12.128 versus 12.154 ms for B32
+indexed, and 11.686 versus 11.640 ms for B32 pipeline. These short profiled runs
+are instrumentation checks, not replacement throughput results. Counter-off
+still uses the diagnostic specialization. The preceding ordinary-kernel
+five-repeat results remain the end-to-end comparison.
+
+A consistent explanation is that faster dispatch changes rank arrival skew:
+a receiver reaches combine earlier and exposes more of the outstanding peer
+work as READY waiting. For example, a receiver arriving 3 us earlier with an
+unchanged final peer publication waits 3 us longer without any slower payload
+transfer. This is an explanation consistent with the data, not an isolated
+cross-rank causal measurement. The observed dispatch-plus-model improvement
+and combine residence increase are compatible; combine duration alone is not
+a reason to revert the dispatch pipeline.
+
+### Why fewer payload bytes do not guarantee higher throughput
+
+The actual NCCL decode trace contains `AllGather_RING_LL` and
+`Reduce_Sum_bf16_RING_LL`. The deployed SGLang variable-size reduce-scatter
+implementation groups one `ncclReduce` per source split, returning the reduced
+split to its owner. It is incorrect to model this baseline as all-gather
+followed by a full all-reduce that broadcasts every final token to every GPU.
+There is still dense collective work that sparse routing can avoid.
+
+NCCL's [version-matched LL primitive](https://github.com/NVIDIA/nccl/blob/v2.30.7-1/src/device/prims_ll.h)
+uses fixed-layout data/flag lines, vector loads, bounded step credits and a
+receive/reduce/send pipeline. It also waits and acknowledges consumption, but
+amortizes those costs over its regular protocol. SHM logs alone do not identify
+copy-engine use, and no copy-engine explanation is needed for this result.
+
+For this diagnostic workload, 57,023 remote partial rows over 384 calls and
+32 source tokens correspond to approximately 4.64 remote contributing ranks
+per token. That is about 34% fewer remote destinations than seven; top-k 8
+across eight ranks does not mean one destination. This is a logical fanout
+comparison, not a measurement of NCCL physical PCIe traffic. Host multicast
+avoids repeated producer deposits, but every destination still reads its own
+copy across PCIe. Flag traffic, read transaction latency, metadata dependencies,
+barriers and underfilled transfers are not removed by payload deduplication.
+
+A useful model is payload bytes / effective bandwidth plus exposed dependency
+latency and control work, accounting for overlap. Reducing bytes to 0.67x while
+achieving 0.5x the effective transfer rate would increase payload time to 1.34x,
+even before extra control costs. This is an illustrative ratio, not measured
+bandwidth. The normal B32 trace still places dispatch at 3.590 ms and fused
+combine at 1.967 ms versus 3.390 ms in NCCL framework collectives; operation
+scopes differ because EP fuses routing/scatter/reduction. Expert GEMM remains
+about 1.92 ms. The remaining measured gap is concentrated in communication
+and its control path, not evidence that sparse routing lacks value.
+
+### Next priorities, grounded in the current workload
+
+1. **Overlap ready-peer reads with waiting for missing peers.** The current
+   combine CTA sends all of its outgoing rows, then waits for every actual
+   contributor of its current token before reading any of their payloads.
+   B32 uses four active channels and four source tokens per rank: each CTA
+   already owns one source token. Token lookahead alone cannot fix this case.
+   A bounded per-peer readiness mask and prefetch stages could read available
+   contributions while other peers are pending, then reduce in the established
+   rank order to preserve rounding. Keep the full payload-reader parallelism,
+   acquire-before-read, and ACK-after-final-read guarantees. Dynamic routing
+   determines the expected mask on each invocation; do not cache old routes.
+2. **Advance publication and overlap independent TX/RX work.** The descriptor
+   batch and fence batch already exist. The remaining all-TX-before-RX schedule
+   can expose the slowest sender. Measure first/final publication and rank-local
+   entry timing before choosing bounded TX batches or dedicated control/TX
+   workers; do not reduce the 256-thread receiver just to create more groups.
+   Increasing channels without useful work adds protocol traffic rather than
+   creating payload concurrency.
+3. **Separate output readiness from outgoing slot reuse.** Final ACK drain is
+   about 8.8% here and did not cause this regression, so it is a lower priority.
+   Epoch-separated mailbox storage could defer a drain until that slot is
+   actually reused. This needs per-slot generation/credit tracking and bounded
+   backpressure across Graph replay, changing routes and eager transitions.
+   Deleting ACKs or allowing an early overwrite is not an optimization.
+
+DeepEP provides useful precedents, with hardware and version distinctions:
+[v1.2.1 low-latency combine](https://github.com/deepseek-ai/DeepEP/blob/9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee/csrc/kernels/internode_ll.cu)
+uses batched completion signaling and a three-stage prefetch/consume pipeline;
+its [runtime](https://github.com/deepseek-ai/DeepEP/blob/9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee/csrc/deep_ep.cpp)
+alternates two low-latency buffers. Its receive hook separates issuing transfers
+from receiving. These suggest stage ownership, batched control and lifetime
+separation, but do not directly implement the proposed host-mailbox protocol.
+
+At the inspected V2.5 revision,
+[combine](https://github.com/deepseek-ai/DeepEP/blob/f6aa38fe06cd4a0489e7730365d4e0114970a2f3/deep_ep/include/deep_ep/impls/ep/combine.cuh)
+assigns independent token work to warps and still has initial/final GPU barriers.
+The [EP API](https://github.com/deepseek-ai/DeepEP/blob/f6aa38fe06cd4a0489e7730365d4e0114970a2f3/deep_ep/buffers/ep.py)
+models SM demand using fanout and transfer rates and can defer the combine
+reduce epilogue to the consumer's wait. Neither version removes necessary
+dependencies, and its NVLink/RDMA/TMA path is not a drop-in implementation for
+mapped host memory without P2P. The transferable objective is to do useful work
+while other data is pending and amortize completion, not to copy its warp count.
