@@ -51,6 +51,9 @@ def load(*, verbose: bool = False):
         combine_last_data = os.environ.get("EP_XPRESS_COMBINE_LAST_DATA", "0")
         if combine_last_data not in {"0", "1"}:
             raise ValueError("EP_XPRESS_COMBINE_LAST_DATA must be 0 or 1")
+        decode_ready_prefetch = os.environ.get("EP_XPRESS_DECODE_READY_PREFETCH", "0")
+        if decode_ready_prefetch not in {"0", "1"}:
+            raise ValueError("EP_XPRESS_DECODE_READY_PREFETCH must be 0 or 1")
         decode_peer_batch = os.environ.get("EP_XPRESS_DECODE_PEER_BATCH", "0")
         if decode_peer_batch not in {"0", "1", "2", "4"}:
             raise ValueError("EP_XPRESS_DECODE_PEER_BATCH must be 0, 1, 2, or 4")
@@ -73,6 +76,7 @@ def load(*, verbose: bool = False):
                       f"-DEP_XPRESS_DISPATCH_READ_UNROLL={dispatch_read_unroll}",
                       f"-DEP_XPRESS_COMBINE_LAST_DATA={combine_last_data}",
                       f"-DEP_XPRESS_DECODE_PEER_BATCH={decode_peer_batch}",
+                      f"-DEP_XPRESS_DECODE_READY_PREFETCH={decode_ready_prefetch}",
                       f"-DEP_XPRESS_DECODE_PUBLISH_BATCH={decode_publish_batch}",
                       f"-DEP_XPRESS_DECODE_DESCRIPTOR_BATCH={decode_descriptor_batch}",
                       f"-DEP_XPRESS_DECODE_DISPATCH_INDEXED={decode_dispatch_indexed}",

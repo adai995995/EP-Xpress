@@ -882,3 +882,34 @@ counts. Complete SGLang inference was compared against the previous indexed
 implementation and default NCCL on identical GPUs with P2P/NVLink disabled,
 reporting single-request and 32-request TTFT and Decode TPS. These checks cover
 the measured configuration; the specialization remains opt-in.
+
+## Ready-peer decode combine prefetch
+
+The opt-in build setting `EP_XPRESS_DECODE_READY_PREFETCH=1` retains the full
+256-thread fused mailbox receiver. For each token, it reads the current
+GPU-produced expected-rank mask and polls only remote contributors that have
+not yet been loaded. Two warp ballots cover the supported rank mask; a CTA
+barrier makes acquired READY state visible to every payload reader.
+
+If all contributors are ready before any partial prefetch, the receiver uses
+the existing direct host-read/reduce path. Otherwise, it copies ready peers'
+BF16 payloads into per-peer CTA shared memory while missing peers continue
+producing their results. A loaded-mask prevents duplicate reads. After all
+expected payloads are present, it reduces them in ascending rank order,
+including the existing absent-rank zero additions, then performs the original
+remote BF16 rounding and local BF16 addition. Scalar tails use the same order.
+No arrival-order accumulation or reuse of a previous token's route is allowed.
+
+Staging requires `world_size * hidden_size * 2 <= 40 KiB` per CTA; larger shapes
+use the original wait/read path. This is a static shape-based resource bound,
+not an assumption about top-k, balance, prompt shape or future routes. No HBM
+scratch or additional CPU routing operation is introduced. The allocation is
+fixed at launch/capture, while readiness and route masks remain GPU-dynamic.
+
+The existing payload fences, output completion, ACK publication and final
+outgoing ACK drain are retained. Staging does not release a sender's slot early.
+The all-TX-before-RX schedule is also retained, so this overlaps ready-peer reads
+with remote producer progress rather than claiming simultaneous local TX/RX or
+a dedicated polling warp. Shared-memory traffic and occupancy are costs to
+measure against any reduction in exposed READY waiting. The option defaults
+to zero; see the performance report for the evaluated configuration.

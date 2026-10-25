@@ -144,6 +144,11 @@ static_assert(EP_XPRESS_DISPATCH_READ_UNROLL == 0 || EP_XPRESS_DISPATCH_READ_UNR
 #endif
 static_assert(EP_XPRESS_COMBINE_LAST_DATA == 0 || EP_XPRESS_COMBINE_LAST_DATA == 1,
               "unsupported last-data setting");
+#ifndef EP_XPRESS_DECODE_READY_PREFETCH
+#define EP_XPRESS_DECODE_READY_PREFETCH 0
+#endif
+static_assert(EP_XPRESS_DECODE_READY_PREFETCH == 0 || EP_XPRESS_DECODE_READY_PREFETCH == 1,
+              "unsupported decode ready prefetch setting");
 #ifndef EP_XPRESS_DECODE_PEER_BATCH
 #define EP_XPRESS_DECODE_PEER_BATCH 0
 #endif
@@ -1611,9 +1616,9 @@ __device__ __forceinline__ int mailbox_health(TransportArgs a, uint64_t start,
 // Issue independent vector reads before consuming their results. Only the
 // load schedule changes: rank order, absent-rank zero additions, intermediate
 // BF16 rounding and the local addition match the scalar mailbox exactly.
-template <int PeerBatch>
+template <int PeerBatch, bool Staged = false>
 __device__ __forceinline__ void mailbox_reduce_vectors(
-    TransportArgs a, int original, int local_row, uint64_t readers) {
+    TransportArgs a, int original, int local_row, uint64_t readers, const uint32_t* staged = nullptr) {
   for (int h = threadIdx.x; h < a.hidden / 8; h += blockDim.x) {
     float sums[8] = {};
     for (int base = 0; base < a.world; base += PeerBatch) {
@@ -1623,7 +1628,8 @@ __device__ __forceinline__ void mailbox_reduce_vectors(
         const int peer = base + p;
         payload[p] = make_uint4(0, 0, 0, 0);
         if (peer < a.world && peer != a.rank && (readers & (uint64_t(1) << peer)))
-          payload[p] = host_load128(mailbox(a, peer, a.rank, original) + 32 + int64_t(h) * 16);
+          payload[p] = Staged ? reinterpret_cast<const uint4*>(staged + int64_t(peer) * (a.hidden / 2))[h]
+                              : host_load128(mailbox(a, peer, a.rank, original) + 32 + int64_t(h) * 16);
       }
 #pragma unroll
       for (int p = 0; p < PeerBatch; ++p) {
@@ -1659,12 +1665,28 @@ __device__ __forceinline__ void mailbox_reduce_vectors(
   }
 }
 
+// Bounded CTA-local staging, independent of routing and token capacity. Leave
+// room below the default shared-memory limit for descriptors and counters.
+__host__ __device__ inline int mailbox_prefetch_bytes(int world, int hidden) {
+#if EP_XPRESS_DECODE_READY_PREFETCH
+  const int64_t bytes = int64_t(world) * hidden * 2;
+  return bytes <= 40 * 1024 ? int(bytes) : 0;
+#else
+  return 0;
+#endif
+}
+
 template <bool Profile = false>
 __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
   if (a.device_epoch) a.epoch = *a.device_epoch;
   __shared__ int begin, end, row, token, error, local_row, blocked;
   __shared__ uint64_t readers;
   const int tid = threadIdx.x, channel = blockIdx.x;
+#if EP_XPRESS_DECODE_READY_PREFETCH
+  extern __shared__ uint4 prefetch_storage[];
+  auto* prefetched = reinterpret_cast<uint32_t*>(prefetch_storage);
+  __shared__ uint32_t ready_words[2];
+#endif
   // A separate opt-in specialization is captured with fixed storage. Its
   // enable flag is toggled only at synchronized request boundaries. Production
   // kernels have no timer, profile pointer load or diagnostic barrier.
@@ -1886,6 +1908,61 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
       error = read_status(a.status);
     }
     __syncthreads();
+    bool staged_payload = false;
+#if EP_XPRESS_DECODE_READY_PREFETCH
+    if (mailbox_prefetch_bytes(a.world, a.hidden)) {
+      const uint64_t remote = readers & ~(uint64_t(1) << a.rank);
+      uint64_t loaded = 0;
+      uint32_t iteration = 0;
+      do {
+        phase(PPeerPoll);
+        // Two warps cover the complete rank mask. The block barrier carries
+        // acquired READY visibility to all 256 payload readers. A loaded peer
+        // is never polled/read again in this invocation.
+        const uint64_t pending = remote & ~loaded;
+        bool ready = false;
+        if (tid < a.world && (pending & (uint64_t(1) << tid)))
+          ready = acquire(control(mailbox(a, tid, a.rank, original), 0)) == a.epoch;
+        const uint32_t word = __ballot_sync(0xffffffff, ready);
+        if (tid == 0 || tid == 32) ready_words[tid / 32] = word;
+        __syncthreads();
+        const uint64_t fresh = uint64_t(ready_words[0]) | (uint64_t(ready_words[1]) << 32);
+        if (tid == 0) error = mailbox_health(a, start, iteration++);
+        __syncthreads();
+        if constexpr (Profile) { if (sample >= 0 && tid == 0) {
+          ++profile.values[PReadyPolls];
+          profile.values[PUnreadyObservations] += fresh != pending;
+        }}
+        if (error) break;
+        // Avoid staging when all contributors are ready at the first useful
+        // poll (also handles a local-only/empty route). Use the legacy reader.
+        if (!loaded && fresh == remote) break;
+        if (fresh) {
+          phase(PReceivePayload);
+          for (int peer = 0; peer < a.world; ++peer) {
+            if (!(fresh & (uint64_t(1) << peer))) continue;
+            const char* source = mailbox(a, peer, a.rank, original) + 32;
+            auto* destination = prefetched + int64_t(peer) * (a.hidden / 2);
+            if (a.hidden % 8 == 0) {
+              for (int h = tid; h < a.hidden / 8; h += blockDim.x)
+                reinterpret_cast<uint4*>(destination)[h] = host_load128(source + int64_t(h) * 16);
+            } else {
+              for (int h = tid; h < a.hidden / 2; h += blockDim.x)
+                destination[h] = host_load32(source + int64_t(h) * 4);
+            }
+          }
+          // Complete the shared copies before reduction or another poll.
+          // ACK remains after all reads/reduction, so host slots cannot change.
+          __syncthreads();
+          loaded |= fresh;
+          staged_payload = true;
+        } else {
+          __nanosleep(64);
+        }
+      } while (loaded != remote);
+    } else
+#endif
+    {
     phase(PPeerPoll);
     uint32_t iteration = 0;
     do {
@@ -1904,6 +1981,7 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
       }}
       if (blocked && !error) __nanosleep(64);
     } while (blocked && !error);
+    }
     if (error) break;
     phase(PReceiveMetadata);
     if (a.diagnostics && tid < a.world && tid != a.rank &&
@@ -1919,7 +1997,12 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
     // Shifted contiguous tensor views and incomplete vectors stay scalar.
     if (a.hidden % 8 == 0 &&
         ((reinterpret_cast<uintptr_t>(a.input) | reinterpret_cast<uintptr_t>(a.output)) & 15) == 0) {
-      mailbox_reduce_vectors<EP_XPRESS_DECODE_PEER_BATCH>(a, original, local_row, readers);
+#if EP_XPRESS_DECODE_READY_PREFETCH
+      if (staged_payload)
+        mailbox_reduce_vectors<EP_XPRESS_DECODE_PEER_BATCH, true>(a, original, local_row, readers, prefetched);
+      else
+#endif
+        mailbox_reduce_vectors<EP_XPRESS_DECODE_PEER_BATCH>(a, original, local_row, readers);
     } else
 #endif
     {
@@ -1929,7 +2012,12 @@ __global__ void host_sm_mailbox_combine_kernel(TransportArgs a) {
           if (peer == a.rank) continue;
           uint32_t bits = 0;
           if (readers & (uint64_t(1) << peer))
+#if EP_XPRESS_DECODE_READY_PREFETCH
+            bits = staged_payload ? prefetched[int64_t(peer) * (a.hidden / 2) + h]
+                                  : host_load32(mailbox(a, peer, a.rank, original) + 32 + int64_t(h) * 4);
+#else
             bits = host_load32(mailbox(a, peer, a.rank, original) + 32 + int64_t(h) * 4);
+#endif
           const auto packed = *reinterpret_cast<const __nv_bfloat162*>(&bits);
           const float2 value = __bfloat1622float2(packed);
           sum0 += value.x;
@@ -2500,17 +2588,18 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
     // No capacity clear/finalizer or world-by-token scratch for this path.
+    const int shared_bytes = mailbox_prefetch_bytes(a.world, a.hidden);
     const auto kernel = a.decode_profile ? host_sm_mailbox_combine_kernel<true>
                                          : host_sm_mailbox_combine_kernel<false>;
     if (a.channels == 1) {
       void* arguments[] = {&a};
       C10_CUDA_CHECK(cudaLaunchKernel(reinterpret_cast<const void*>(kernel),
-          dim3(1), dim3(kThreads), arguments, 0, stream));
+          dim3(1), dim3(kThreads), arguments, shared_bytes, stream));
     }
     else {
       void* arguments[] = {&a};
       C10_CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<const void*>(kernel),
-          dim3(a.channels), dim3(kThreads), arguments, 0, stream));
+          dim3(a.channels), dim3(kThreads), arguments, shared_bytes, stream));
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     impl_->last_mailbox_epoch = uint64_t(epoch);
