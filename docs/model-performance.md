@@ -5,7 +5,7 @@ SGLang v0.5.21. They are distinct from the synthetic expert function in the
 standalone transport replay.
 
 The latest investigation is in
-[NUMA regression investigation](#numa-regression-investigation).
+[independent dispatch scheduling and host access width](#independent-dispatch-scheduling-and-host-access-width).
 Earlier sections describe earlier runtime revisions and their measurements.
 
 ## Matched configuration
@@ -3834,3 +3834,152 @@ To opt into the measured candidate, use `EP_XPRESS_DECODE_PACKET_ROWS=4` and
 `EP_XPRESS_DECODE_PACKET_CHANNELS=8` with the existing bounded fused-decode
 configuration. Leave legacy combine balanced/split/deferred/prefetch options
 disabled. Setting packet rows/channels back to zero retains the original path.
+
+## Independent dispatch scheduling and host access width
+
+This follow-up evaluates separate dispatch TX/RX CTAs, delayed dispatch-bank
+reclamation, per-handle return-index reuse, and host access width independently.
+All new build options remain opt-in. The routing contract stays dynamic BF16:
+one payload per source token with rank deduplication, current GPU-generated
+routes on every invocation, weights applied once, and rank-ordered combine.
+No CPU routing collective is added to the operation path.
+
+The model configuration remains eight H20D GPUs, Qwen3-30B-A3B-Instruct-2507,
+SGLang v0.5.21, TP/DP/EP 8, Triton experts, FlashInfer, producer-local NUMA
+arenas, eager prefill and decode Graph buckets 1/2/4/8. Requests have 512 input
+and 32 output tokens, with eight warmups and five measured repeats per batch.
+Prefix caching is disabled. Allocated channels remain 32, with adaptive decode
+width unless explicitly stated; packet combine uses four-row packets and eight
+channels where enabled. Both backends disable NVLink and GPU P2P.
+
+The [archived NCCL baseline](../benchmarks/baselines/sglang_h20d_ep8_bf16_host.json)
+combines two matching sessions, ten samples per batch. It records arithmetic
+means, sample standard deviations, medians and observed extrema. Later EP-only
+changes reuse this record rather than relaunching NCCL. Hardware, software,
+model, workload or execution-setting changes invalidate reuse; evidence of
+environment drift also requires reassessment. Image, framework source, topology,
+server arguments and timed prompt hashes were checked against this baseline.
+Each model run verifies exclusive GPU use, producer NUMA pages, SHM transport,
+absence of P2P/NET/NVLS channels and zero available NVLink counter deltas.
+
+The following table uses **arithmetic means**, unlike the median tables in
+earlier sections. The TTFT values are means of repeat-level mean request TTFT;
+Decode TPS is aggregate steady-state output throughput. TTFT varies considerably
+at batch 32 and should not be used to assign causality to individual decode
+scheduling changes.
+
+| Implementation | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| Archived default NCCL, 10 samples | 101.801 | 155.051 | 431.710 | 3557.948 |
+| Original EP control | 96.549 | 157.968 | 273.852 | 3119.389 |
+| Independent dispatch TX/RX | 98.025 | 160.594 | 304.582 | 3147.807 |
+| Add delayed dispatch reclamation | 96.928 | 160.529 | 282.975 | 3146.452 |
+| Split dispatch + packet combine, reclamation off | 100.828 | 157.497 | 307.529 | 3176.882 |
+| Add per-handle return-index reuse | 96.921 | 158.521 | 268.030 | 3180.324 |
+| Add 64-bit host metadata loads | 96.879 | 160.283 | 298.537 | 3326.965 |
+| Add vector dispatch writes, unroll 4 | 97.356 | 161.017 | 314.996 | 3338.217 |
+| Use two active decode dispatch channels | 100.368 | 161.124 | 270.153 | 3364.737 |
+
+Independent dispatch removes the local-TX-before-RX dependency while keeping
+256 payload receive threads per RX CTA. Its observed B32 throughput gain is
+small, about 0.9%. Delayed reclamation does not improve throughput further and
+adds 140,509,184 bytes of pinned dispatch storage in this configuration; it
+remains disabled. In the separate diagnostic timeline, dispatch falls from
+2.928 to 2.701 ms, but combine rises from 1.816 to 2.053 ms. Deferring the drain
+has moved much of the wait rather than removing it from the critical path.
+
+The return index removes the repeated `owner_rows -> inverse -> token` traversal
+from packet preparation. Its B32 TPS difference is about 0.1% and the observed
+ranges overlap: 3163.16-3204.25 without reuse, 3150.16-3228.03 with reuse. The
+diagnostic preparation interval falls from 0.136 to 0.101 ms, partly offset by
+dispatch initialization rising from 0.108 to 0.118 ms. This cleanup is useful
+structurally but does not account for the main throughput gap.
+
+The 64-bit metadata-load ablation improves B32 TPS by 4.6% relative to index
+reuse alone; its observed range is 3304.93-3353.93. In the diagnostic timeline,
+dispatch falls from 2.893 to 2.521 ms and the complete GPU forward from 10.111
+to 9.692 ms. Expert GEMM and activation intervals remain approximately
+1.92 and 1.31 ms. These timings are medians across active DECODE ranks of
+per-rank mean complete Graph replays, each covering 48 MoE layers. They include
+waiting and must not be interpreted as pure PCIe transfer time. READY remains
+a system-acquire load; only aligned descriptor/ID access changes from two
+32-bit instructions to one 64-bit instruction. Hardware PCIe transaction
+counts are not inferred from this change.
+
+Vector dispatch writes add only 0.3% B32 TPS in their individual ablation,
+with overlapping ranges (3304.82-3362.50 versus 3304.93-3353.93). Selecting
+two active decode dispatch channels instead of the adaptive four at B32 gives
+3364.737 TPS; an independent repeat gives 3367.791 TPS. Packet combine keeps
+eight channels in both cases. The second session has B1 TTFT 97.702 ms,
+B1 TPS 161.091 and B32 TTFT 269.552 ms. A ten-sample mean over these two
+matching candidate sessions is B1 TTFT **99.035 ms**, B1 TPS **161.107**,
+B32 TTFT **269.852 ms**, B32 TPS **3366.264**. B32 throughput is 7.9% above
+the original EP control and still 5.4% below the archived default NCCL mean.
+These results do not establish a twofold speedup or a universal channel policy.
+
+The first two-channel diagnostic has dispatch 2.387 ms, packet transport
+1.431 ms, packet preparation 0.101 ms and HBM reduction 0.136 ms per complete
+48-layer decode replay; complete GPU forward is 9.556 ms. Dispatch remains
+the largest communication kernel interval. Narrower load/store instructions,
+dependent metadata reads and per-stage progress still matter despite lower
+logical payload volume. The model trace alone does not separate the remaining
+payload, READY and credit times. Further optimization should measure that
+distinction before removing synchronization or adding CTAs.
+
+### Communication-only shape sweep and limits
+
+The standalone benchmark uses eight ranks, BF16 H=2048, top-k 8, 128 experts,
+eight allocated/active communication channels, eight warmups and twenty timed
+samples per shape. It replays changing routes including rank deduplication,
+hotspots and padding. Both control and candidate verify GPU-local producer
+NUMA pages. These are **medians of per-sample maximum rank durations**, not
+model TTFT/TPS. The candidate uses the same split/index/wide-access options,
+but this sweep fixes eight dispatch channels; it does not use the model's
+two-channel setting. The candidate's packet combine uses eight channels.
+
+| Tokens per rank | Control dispatch (us) | Candidate dispatch (us) | Control combine (us) | Candidate combine (us) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 60.80 | 53.28 | 44.42 | 37.42 |
+| 4 | 72.29 | 60.96 | 44.96 | 39.84 |
+| 16 | 80.83 | 68.96 | 65.66 | 76.03 |
+| 64 | 110.24 | 140.05 | 189.41 | 236.40 |
+| 256 | 271.98 | 471.76 | 709.31 | 956.34 |
+| 1024 | 1175.71 | 1080.82 | 1171.46 | 1165.86 |
+| 4096 | 4371.38 | 3935.44 | 4485.18 | 4468.42 |
+
+The 64/256-token bounded path **regresses**. Larger 1024/4096-token operations
+use the generic rings, where independent decode CTAs and packet combine are
+not selected; the wider shared metadata helper still applies. At 4096 tokens,
+the candidate's logical dispatch host-write/read rates are 31.62/121.66 GB/s
+summed over all eight ranks, versus 28.31/109.15 in the control. Combine's
+logical host-write/read rate is 96.55 GB/s versus 95.32. These count useful BF16
+payload only, exclude metadata/padding/protocol traffic, and are not physical
+PCIe utilization measurements. Earlier exploratory runs without verified NUMA
+placement are excluded from this comparison. No new NCCL sweep was run.
+
+Use the [small-decode preset](../adapters/sglang/presets/host_sm_bf16_ep8_graph_small_decode.sh)
+only as an opt-in reproduction of the measured B1/B32 configuration. It keeps
+delayed dispatch reclamation disabled and preserves the necessary READY/ACK
+ordering. It does not automatically choose a path for larger batches. The
+generic defaults remain unchanged; a general runtime selection policy needs
+further shape/routing coverage rather than hard-coding a decision from these
+two model batch sizes. The preset's exported EP/NCCL settings were checked
+against the measured environment.
+
+Across the ten final candidate samples, B1 TPS spans 160.66-161.72 (sample
+standard deviation 0.34), and B32 TPS spans 3340.00-3400.69 (standard deviation
+20.09). B1 TTFT spans 96.90-109.88 ms and B32 TTFT 254.86-292.38 ms. These are
+observed ranges, not confidence intervals. The candidate's B32 TPS range remains
+below the archived NCCL range of 3503.53-3613.55.
+
+Targeted GPU checks cover dynamic/skewed/empty routes, int32/int64 IDs,
+H=2048 vector transfers and H=258 scalar fallback, Graph bucket changes,
+eager fallback, multiple outstanding handles, and profiler reset/overflow.
+The final vector build passes two distributed CUDA cases plus eleven CPU
+configuration/workspace cases (13 cases and three subtests, 81.13 seconds).
+Both final seven-shape communication sweeps pass numerical checks, including
+the large generic-ring path. Every measured EP model variant matches the
+original on four short greedy output probes and their common-prefix logprobs.
+These are bounded correctness checks, not exhaustive workload or fault-tolerance
+coverage. The runtime source manifest is verified before each model launch;
+raw traces and deployment details remain outside the public repository.

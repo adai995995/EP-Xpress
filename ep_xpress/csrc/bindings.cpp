@@ -18,6 +18,9 @@ torch::Tensor finish_combine_cuda(torch::Tensor remote, torch::Tensor local);
 int64_t host_sm_max_channels(int64_t world);
 int64_t host_sm_mailbox_bytes(int64_t hidden, int64_t tokens, int64_t world);
 int64_t host_sm_packet_rows();
+int64_t host_sm_dispatch_banks();
+int64_t host_sm_dispatch_roles();
+bool host_sm_reuse_return_index();
 std::vector<std::string> host_sm_profile_fields();
 std::vector<std::string> host_sm_decode_profile_fields(bool dispatch);
 int64_t host_sm_arena_bytes(int64_t hidden, int64_t topk, int64_t slots, int64_t chunk_rows, int64_t channels, int64_t queue_peers);
@@ -161,14 +164,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
           pybind11::arg("active_channels") = 0, pybind11::arg("identity") = 0,
           pybind11::arg("expected_ranks") = pybind11::none(),
           pybind11::arg("local_rows") = pybind11::none(),
-          pybind11::arg("profile") = pybind11::none())
+          pybind11::arg("profile") = pybind11::none(),
+          pybind11::arg("return_rows") = pybind11::none())
       .def("combine", &PreparedHostSM::combine,
           pybind11::arg("partial"), pybind11::arg("inverse"), pybind11::arg("count"),
           pybind11::arg("owner_rows"), pybind11::arg("owner_counts"),
           pybind11::arg("epoch"), pybind11::arg("output"), pybind11::arg("remote"),
           pybind11::arg("active_channels") = 0, pybind11::arg("identity") = 0, pybind11::arg("profile") = pybind11::none(),
           pybind11::arg("expected_ranks") = pybind11::none(),
-          pybind11::arg("local_rows") = pybind11::none());
+          pybind11::arg("local_rows") = pybind11::none(),
+          pybind11::arg("return_rows") = pybind11::none());
   module.def("prepare_host_sm", [](torch::Tensor expert_rank, torch::Tensor expert_local,
       torch::Tensor dispatch_pointers, torch::Tensor combine_pointers, torch::Tensor status,
       int64_t rank, int64_t hidden, int64_t topk, int64_t slots, int64_t dispatch_rows,
@@ -196,6 +201,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("host_sm_profile_fields", &host_sm_profile_fields);
   module.def("host_sm_decode_profile_fields", &host_sm_decode_profile_fields, pybind11::arg("dispatch") = false);
   module.def("host_sm_packet_rows", &host_sm_packet_rows);
+  module.def("host_sm_reuse_return_index", &host_sm_reuse_return_index);
+  module.def("host_sm_dispatch_roles", &host_sm_dispatch_roles);
+  module.def("host_sm_dispatch_banks", &host_sm_dispatch_banks);
   module.def("host_sm_mailbox_bytes", &host_sm_mailbox_bytes,
       pybind11::arg("hidden"), pybind11::arg("tokens"), pybind11::arg("world"));
   module.def("host_sm_arena_bytes", &host_sm_arena_bytes,

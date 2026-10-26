@@ -223,6 +223,30 @@ static_assert(EP_XPRESS_DECODE_DISPATCH_PIPELINE == 0 || EP_XPRESS_DECODE_DISPAT
               "unsupported decode dispatch pipeline setting");
 static_assert(!EP_XPRESS_DECODE_DISPATCH_PIPELINE || EP_XPRESS_DECODE_DISPATCH_INDEXED,
               "decode dispatch pipeline requires indexed dispatch");
+#ifndef EP_XPRESS_HOST_READ64
+#define EP_XPRESS_HOST_READ64 0
+#endif
+static_assert(EP_XPRESS_HOST_READ64 == 0 || EP_XPRESS_HOST_READ64 == 1);
+#ifndef EP_XPRESS_DISPATCH_SPLIT
+#define EP_XPRESS_DISPATCH_SPLIT 0
+#endif
+#ifndef EP_XPRESS_DISPATCH_DEFER_RECLAIM
+#define EP_XPRESS_DISPATCH_DEFER_RECLAIM 0
+#endif
+#ifndef EP_XPRESS_REUSE_RETURN_INDEX
+#define EP_XPRESS_REUSE_RETURN_INDEX 0
+#endif
+#ifndef EP_XPRESS_DISPATCH_WRITE_UNROLL
+#define EP_XPRESS_DISPATCH_WRITE_UNROLL 0
+#endif
+static_assert(EP_XPRESS_DISPATCH_SPLIT == 0 || EP_XPRESS_DISPATCH_SPLIT == 1);
+static_assert(!EP_XPRESS_DISPATCH_SPLIT || EP_XPRESS_DECODE_DISPATCH_PIPELINE);
+static_assert(EP_XPRESS_DISPATCH_DEFER_RECLAIM == 0 || EP_XPRESS_DISPATCH_DEFER_RECLAIM == 1);
+static_assert(!EP_XPRESS_DISPATCH_DEFER_RECLAIM || EP_XPRESS_DISPATCH_SPLIT);
+static_assert(EP_XPRESS_REUSE_RETURN_INDEX == 0 || EP_XPRESS_REUSE_RETURN_INDEX == 1);
+static_assert(!EP_XPRESS_REUSE_RETURN_INDEX || EP_XPRESS_DECODE_PACKET_ROWS > 0);
+static_assert(EP_XPRESS_DISPATCH_WRITE_UNROLL == 0 || EP_XPRESS_DISPATCH_WRITE_UNROLL == 1 ||
+              EP_XPRESS_DISPATCH_WRITE_UNROLL == 2 || EP_XPRESS_DISPATCH_WRITE_UNROLL == 4);
 __device__ __forceinline__ void host_store128(void* address, uint4 value) {
   // Match the scalar volatile store policy. Each writer still executes a
   // system fence before the Tx leader publishes READY for the whole frame.
@@ -230,8 +254,17 @@ __device__ __forceinline__ void host_store128(void* address, uint4 value) {
       :: "l"(address), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w) : "memory");
 }
 __device__ __forceinline__ uint64_t host_load64(const void* address) {
+#if EP_XPRESS_HOST_READ64
+  // Descriptor and ID words are naturally aligned and immutable after READY.
+  // One uncached 64-bit instruction replaces the two 32-bit loads.
+  // Synchronization words continue to use the separate system-acquire helper.
+  uint64_t value;
+  asm volatile("ld.global.cv.u64 %0, [%1];" : "=l"(value) : "l"(address) : "memory");
+  return value;
+#else
   const auto* p = static_cast<const uint32_t*>(address);
   return uint64_t(host_load32(p)) | (uint64_t(host_load32(p + 1)) << 32);
+#endif
 }
 __device__ __forceinline__ void host_store32(void* address, uint32_t value) {
   *static_cast<volatile uint32_t*>(address) = value;
@@ -354,6 +387,9 @@ struct TransportArgs {
   const int32_t* expert_local;
   const int64_t* pointers;
   const int64_t* mailbox_pointers;
+#if EP_XPRESS_DISPATCH_DEFER_RECLAIM
+  uint64_t* dispatch_sent_epochs;
+#endif
 #if EP_XPRESS_DECODE_DEFER_RECLAIM
   uint64_t* mailbox_sent_epochs;
 #endif
@@ -368,6 +404,7 @@ struct TransportArgs {
 #endif
   int64_t* expected_ranks;
   int32_t* local_rows;
+  int32_t* return_rows = nullptr;
   int mailbox_tokens;
   int64_t mailbox_stride;
   const int64_t* input_inverse;
@@ -442,6 +479,17 @@ __device__ __forceinline__ int32_t read_status(const int32_t* status) {
   return value;
 }
 
+// Per-handle storage, rebuilt by dispatch. Never a context-wide routing cache:
+// another outstanding dispatch must not replace an earlier handle's mapping.
+__device__ __forceinline__ void dispatch_return_row(TransportArgs a, int peer, int token, int row) {
+#if EP_XPRESS_REUSE_RETURN_INDEX
+  if (a.return_rows) {
+    if (token < 0 || token >= a.mailbox_tokens) { fail(a.status, 2); return; }
+    a.return_rows[int64_t(peer) * a.mailbox_tokens + token] = row;
+  }
+#endif
+}
+
 // Separate ordinary grids keep initialization and final reduction from being
 // serialized through the small persistent communication grid.
 template <bool Combine>
@@ -453,6 +501,10 @@ __global__ void host_sm_init_kernel(TransportArgs a) {
     // Never reset after capture: capture records nodes without advancing state.
     if (++*a.device_epoch >= (uint64_t(1) << 31)) asm volatile("trap;");
   }
+#if EP_XPRESS_REUSE_RETURN_INDEX
+  if (!Combine && a.return_rows)
+    for (int64_t j = i; j < int64_t(a.world) * a.mailbox_tokens; j += stride) a.return_rows[j] = -1;
+#endif
   if (!Combine && i == 0) *a.output_count = 0;
   if (!Combine && a.local_rows)
     for (int64_t j = i; j < a.input_rows; j += stride) a.local_rows[j] = -1;
@@ -664,6 +716,7 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
             a.output_inverse[int64_t(output_base + tid) * 2] = a.rank;
             a.output_inverse[int64_t(output_base + tid) * 2 + 1] = cursor + local_rows[tid];
             if (a.local_rows) a.local_rows[cursor + local_rows[tid]] = output_base + tid;
+            dispatch_return_row(a, a.rank, cursor + local_rows[tid], output_base + tid);
             if (a.owner_rows)
               a.owner_rows[int64_t(a.rank) * a.capacity + owner_base + tid] = output_base + tid;
           }
@@ -939,6 +992,7 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
           if (tid < num_selected) {
             a.output_inverse[int64_t(output_base + tid) * 2] = peer;
             a.output_inverse[int64_t(output_base + tid) * 2 + 1] = selected_tokens[tid];
+            dispatch_return_row(a, peer, selected_tokens[tid], output_base + tid);
             if (a.owner_rows)
               a.owner_rows[int64_t(peer) * a.capacity + owner_base + tid] = output_base + tid;
           }
@@ -1070,6 +1124,13 @@ int64_t channel_bytes(int64_t hidden, int64_t topk, int64_t slots, int64_t rows)
   // dispatch path ignores the suffix; combine keeps its existing arena layout.
   const int64_t notifications = topk ? (slots * kMaxRanks + kMaxRanks + 1) * 8 : 0;
   return align_up(kArenaHeader + slots * align_up(kSlotHeader + rows * row, 128) + notifications, 4096);
+}
+
+// The generic ring retains its own extent. Bounded decode may use two separate
+// extents so result completion never lends still-live storage to eager prefill.
+int64_t arena_channel_bytes(int64_t hidden, int64_t topk, int64_t slots, int64_t rows) {
+  return channel_bytes(hidden, topk, slots, rows) *
+      (topk && EP_XPRESS_DISPATCH_DEFER_RECLAIM ? 3 : 1);
 }
 
 // A combine CTA owns both directions of exactly one rank pair. Neither its
@@ -2415,7 +2476,7 @@ int max_channels_current_device(int world = 1) {
       host_sm_dispatch_pipeline_kernel<int32_t>, kDispatchPipelineThreads, 0));
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&pipeline_i64,
       host_sm_dispatch_pipeline_kernel<int64_t>, kDispatchPipelineThreads, 0));
-  pipeline_capacity = sms * std::min(pipeline_i32, pipeline_i64);
+  pipeline_capacity = sms * std::min(pipeline_i32, pipeline_i64) / kDispatchRoles;
 #endif
 #if EP_XPRESS_DECODE_PACKET_ROWS > 0
   int packet_capacity;
@@ -2435,7 +2496,7 @@ void launch_transport(TransportArgs args, cudaStream_t stream) {
   const int blocks = int(std::max<int64_t>(1, std::min<int64_t>(4096, (elements + kThreads - 1) / kThreads)));
   host_sm_init_kernel<Combine><<<blocks, kThreads, 0, stream>>>(args);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  const int lanes = args.channels * (Combine ? args.world : 1);
+  const int lanes = args.channels * (Combine ? args.world : (Pipeline ? kDispatchRoles : 1));
   constexpr int transport_threads = Pipeline ? kDispatchPipelineThreads : kThreads;
   if (lanes == 1) {
     if constexpr (Pipeline) host_sm_dispatch_pipeline_kernel<Id, Profile><<<1, transport_threads, 0, stream>>>(args);
@@ -2614,6 +2675,11 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
   TORCH_CHECK(!decode_single_frame || mailbox_tokens > 0, "single-frame dispatch requires a decode mailbox bound");
   impl_->combine_warp_specialization = combine_warp_specialization;
   impl_->decode_single_frame = decode_single_frame;
+#if EP_XPRESS_DISPATCH_DEFER_RECLAIM
+  auto dispatch_sent_epochs = torch::zeros({channels * 2},
+      torch::TensorOptions().device(device).dtype(torch::kInt64));
+  impl_->retained.push_back(dispatch_sent_epochs);
+#endif
 #if EP_XPRESS_DECODE_DEFER_RECLAIM
   torch::Tensor mailbox_sent_epochs;
   if (mailbox_pointers.has_value()) {
@@ -2640,6 +2706,9 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
     auto& a = combine ? impl_->combine : impl_->dispatch;
     a.pointers = (combine ? combine_pointers : dispatch_pointers).data_ptr<int64_t>();
     a.mailbox_pointers = mailbox_pointers.has_value() ? mailbox_pointers->data_ptr<int64_t>() : nullptr;
+#if EP_XPRESS_DISPATCH_DEFER_RECLAIM
+    a.dispatch_sent_epochs = reinterpret_cast<uint64_t*>(dispatch_sent_epochs.data_ptr<int64_t>());
+#endif
 #if EP_XPRESS_DECODE_DEFER_RECLAIM
     a.mailbox_sent_epochs = mailbox_sent_epochs.defined()
         ? reinterpret_cast<uint64_t*>(mailbox_sent_epochs.data_ptr<int64_t>()) : nullptr;
@@ -2666,7 +2735,7 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
     a.chunk_rows = int(combine ? combine_rows : dispatch_rows); a.channels = int(channels);
     const int64_t row = align_up(16 + int64_t(a.topk) * 12 + hidden * 2, 16);
     a.slot_stride = align_up(kSlotHeader + int64_t(a.chunk_rows) * row, 128);
-    a.channel_stride = channel_bytes(hidden, a.topk, slots, a.chunk_rows);
+    a.channel_stride = arena_channel_bytes(hidden, a.topk, slots, a.chunk_rows);
     a.timeout_ns = uint64_t(timeout_ms) * 1000000;
     a.diagnostics = diagnostics; a.trusted_placement = true; a.fatal_errors = fatal_errors;
   }
@@ -2681,7 +2750,7 @@ void PreparedHostSM::prepare_decode_profile(torch::Tensor storage, bool dispatch
               "prepare decode profiling once before any submission or graph capture");
   tensor_check(storage, at::kLong, 3, impl_->device, "decode profile");
   TORCH_CHECK(storage.size(0) >= 2 && storage.size(0) <= 4097 &&
-              storage.size(1) == impl_->combine.channels * (dispatch ? 1 : kMailboxRoles) && storage.size(2) == (pipeline_profile ? DFieldCount : PFieldCount) + 4,
+              storage.size(1) == impl_->combine.channels * (dispatch ? (pipeline_profile ? kDispatchRoles : 1) : kMailboxRoles) && storage.size(2) == (pipeline_profile ? DFieldCount : PFieldCount) + 4,
               "invalid decode profile shape");
   int resident = 0, sms = 0;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -2699,7 +2768,7 @@ void PreparedHostSM::prepare_decode_profile(torch::Tensor storage, bool dispatch
     resident = std::min(resident, resident64);
   }
   C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, impl_->device.index()));
-  TORCH_CHECK(impl_->combine.channels * (dispatch ? 1 : kMailboxRoles) <= resident * sms, "diagnostic grid exceeds resident capacity");
+  TORCH_CHECK(impl_->combine.channels * (dispatch ? (pipeline_profile ? kDispatchRoles : 1) : kMailboxRoles) <= resident * sms, "diagnostic grid exceeds resident capacity");
   impl_->retained.push_back(storage);
   args.decode_profile = storage.data_ptr<int64_t>();
   args.decode_profile_samples = int(storage.size(0) - 1);
@@ -2731,7 +2800,8 @@ void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Ten
     torch::Tensor output_weights, torch::Tensor inverse, torch::Tensor count,
     torch::Tensor owner_rows, torch::Tensor owner_counts, int64_t active_channels,
     int64_t identity, c10::optional<torch::Tensor> expected_ranks,
-    c10::optional<torch::Tensor> local_rows, c10::optional<torch::Tensor> profile) {
+    c10::optional<torch::Tensor> local_rows, c10::optional<torch::Tensor> profile,
+    c10::optional<torch::Tensor> return_rows) {
   auto a = impl_->dispatch;
   active_channel_check(a, active_channels);
   const auto device = impl_->device;
@@ -2753,6 +2823,17 @@ void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Ten
   TORCH_CHECK(count.numel() == 1, "count must contain one element");
   owner_check(owner_rows, owner_counts, device, a.world, output.size(0));
   TORCH_CHECK(expected_ranks.has_value() == local_rows.has_value(), "both fused routing tensors are required");
+  if (return_rows.has_value()) {
+    TORCH_CHECK(EP_XPRESS_REUSE_RETURN_INDEX && expected_ranks.has_value(),
+                "return index requires fused packet dispatch/combine");
+    tensor_check(*return_rows, at::kInt, 2, device, "return row index");
+    TORCH_CHECK(return_rows->size(0) == a.world && return_rows->size(1) == a.mailbox_tokens,
+                "invalid return row index shape");
+    a.return_rows = return_rows->data_ptr<int32_t>();
+#if EP_XPRESS_DECODE_PACKET_ROWS > 0
+    a.packet_rows = a.return_rows;
+#endif
+  }
   if (expected_ranks.has_value()) {
     TORCH_CHECK(a.mailbox_pointers && input.size(0) <= a.mailbox_tokens, "input exceeds prepared mailbox capacity");
     tensor_check(*expected_ranks, at::kLong, 1, device, "expected rank masks");
@@ -2841,7 +2922,7 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
     torch::Tensor owner_rows, torch::Tensor owner_counts, int64_t epoch,
     torch::Tensor output, c10::optional<torch::Tensor> remote, int64_t active_channels, int64_t identity,
     c10::optional<torch::Tensor> profile, c10::optional<torch::Tensor> expected_ranks,
-    c10::optional<torch::Tensor> local_rows) {
+    c10::optional<torch::Tensor> local_rows, c10::optional<torch::Tensor> return_rows) {
   auto a = impl_->combine;
   active_channel_check(a, active_channels);
   const auto device = impl_->device;
@@ -2852,6 +2933,17 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
   tensor_check(count, at::kInt, 1, device, "count");
   TORCH_CHECK(count.numel() == 1, "count must contain one element");
   TORCH_CHECK(expected_ranks.has_value() == local_rows.has_value(), "both fused routing tensors are required");
+  if (return_rows.has_value()) {
+    TORCH_CHECK(EP_XPRESS_REUSE_RETURN_INDEX && expected_ranks.has_value(),
+                "return index requires fused packet dispatch/combine");
+    tensor_check(*return_rows, at::kInt, 2, device, "return row index");
+    TORCH_CHECK(return_rows->size(0) == a.world && return_rows->size(1) == a.mailbox_tokens,
+                "invalid return row index shape");
+    a.return_rows = return_rows->data_ptr<int32_t>();
+#if EP_XPRESS_DECODE_PACKET_ROWS > 0
+    a.packet_rows = a.return_rows;
+#endif
+  }
   const bool fused = expected_ranks.has_value();
   if (fused) {
     TORCH_CHECK(a.mailbox_pointers && output.size(0) <= a.mailbox_tokens,
@@ -2967,13 +3059,19 @@ std::vector<std::string> host_sm_profile_fields() {
   return kProfileFields;
 }
 
+int64_t host_sm_dispatch_roles() { return kDispatchRoles; }
+
+bool host_sm_reuse_return_index() { return EP_XPRESS_REUSE_RETURN_INDEX; }
+
+int64_t host_sm_dispatch_banks() { return EP_XPRESS_DISPATCH_DEFER_RECLAIM ? 2 : 0; }
+
 int64_t host_sm_arena_bytes(int64_t hidden, int64_t topk, int64_t slots,
                             int64_t chunk_rows, int64_t channels, int64_t queue_peers) {
   TORCH_CHECK(hidden > 0 && hidden <= INT32_MAX && hidden % 2 == 0 && topk >= 0 && topk <= 256 &&
               slots > 0 && slots <= 64 && chunk_rows > 0 && chunk_rows <= 65536 &&
               channels > 0 && channels <= 32 && queue_peers > 0 && queue_peers <= kMaxRanks,
               "invalid arena dimensions or channels");
-  return channels * queue_peers * channel_bytes(hidden, topk, slots, chunk_rows);
+  return channels * queue_peers * arena_channel_bytes(hidden, topk, slots, chunk_rows);
 }
 
 void host_sm_dispatch_cuda(torch::Tensor input, torch::Tensor ids, torch::Tensor weights,
@@ -3018,7 +3116,7 @@ void host_sm_dispatch_cuda(torch::Tensor input, torch::Tensor ids, torch::Tensor
   a.input_rows = input.size(0); a.hidden = input.size(1); a.topk = ids.size(1); a.capacity = output.size(0);
   const int64_t row = align_up(16 + a.topk * 12 + int64_t(a.hidden) * 2, 16);
   a.slot_stride = align_up(kSlotHeader + chunk_rows * row, 128);
-  a.channel_stride = channel_bytes(a.hidden, a.topk, slots, chunk_rows);
+  a.channel_stride = arena_channel_bytes(a.hidden, a.topk, slots, chunk_rows);
   a.epoch = epoch; a.timeout_ns = uint64_t(timeout_ms) * 1000000; a.identity = identity;
   const auto stream = c10::cuda::getCurrentCUDAStream(input.get_device());
   if (ids.scalar_type() == at::kInt) launch_transport<false, int32_t>(a, stream.stream());
@@ -3057,7 +3155,7 @@ void host_sm_combine_cuda(torch::Tensor partial, torch::Tensor inverse, torch::T
   a.input_rows = partial.size(0); a.hidden = partial.size(1); a.topk = 0; a.capacity = output.size(0);
   const int64_t row = align_up(16 + int64_t(a.hidden) * 2, 16);
   a.slot_stride = align_up(kSlotHeader + chunk_rows * row, 128);
-  a.channel_stride = channel_bytes(a.hidden, 0, slots, chunk_rows);
+  a.channel_stride = arena_channel_bytes(a.hidden, 0, slots, chunk_rows);
   a.epoch = epoch; a.timeout_ns = uint64_t(timeout_ms) * 1000000; a.identity = identity;
   const auto stream = c10::cuda::getCurrentCUDAStream(partial.get_device());
   if (profile.has_value()) launch_transport<true, int64_t, true>(a, stream.stream());

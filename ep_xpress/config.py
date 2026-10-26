@@ -125,7 +125,7 @@ class Config:
         token_bytes = ((32 + self.hidden_size * 2 + 127) // 128) * 128
         return ((128 + world_size * self.decode_max_tokens * token_bytes + 4095) // 4096) * 4096
 
-    def mapped_arena_bytes(self, topk, channels=None, queue_peers=1):
+    def mapped_arena_bytes(self, topk, channels=None, queue_peers=1, *, dispatch_banks=0):
         """Mapped queue allocation including per-row metadata and control words.
 
         Kept in agreement with the native ABI and checked during bootstrap.
@@ -135,6 +135,10 @@ class Config:
         non-readers do not gate payload-slot reuse. Active launch width never
         changes this initialized allocation or its frame size.
         """
+        if isinstance(dispatch_banks, bool) or not isinstance(dispatch_banks, int) or dispatch_banks not in (0, 2):
+            raise ValueError("dispatch_banks must be 0 or 2")
+        if dispatch_banks and not topk:
+            raise ValueError("extra dispatch banks are only valid for dispatch")
         channels = self.channels if channels is None else channels
         if (isinstance(queue_peers, bool) or not isinstance(queue_peers, int) or
                 not 1 <= queue_peers <= 63 or (topk and queue_peers != 1)):
@@ -144,7 +148,7 @@ class Config:
         row_bytes = ((16 + topk * 12 + self.hidden_size * 2 + 15) // 16) * 16
         slot_bytes = ((640 + rows * row_bytes + 127) // 128) * 128
         notification_bytes = (self.slots * 63 + 64) * 8 if topk else 0
-        return channels * queue_peers * (
+        return channels * queue_peers * (1 + dispatch_banks) * (
             (128 + self.slots * slot_bytes + notification_bytes + 4095) // 4096) * 4096
 
     def pinned_working_set_bytes(self, world_size):

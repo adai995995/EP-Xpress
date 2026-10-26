@@ -326,6 +326,14 @@ protocol option disabled.
 
 ## Full decode CUDA Graph (opt-in)
 
+The later [small-decode preset](presets/host_sm_bf16_ep8_graph_small_decode.sh)
+selects independent dispatch CTAs, per-handle return indices, wider host access,
+four-row packet combine and two active dispatch channels. It was measured at
+global batches 1 and 32; it is not a general batching policy. Larger bounded
+decode shapes regressed in the communication sweep, so these options remain
+off by default. See [the ablation and workload limits](../../docs/model-performance.md#independent-dispatch-scheduling-and-host-access-width)
+before using it. Routes still change on GPU at every invocation.
+
 Source `adapters/sglang/presets/host_sm_bf16_ep8_graph.sh` for the measured
 vector mailbox candidate with automatic channels, or set
 `EP_XPRESS_CUDA_GRAPH=1`, `EP_XPRESS_TRANSPORT=host_sm` and

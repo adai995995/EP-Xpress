@@ -121,6 +121,7 @@ class _DeviceRoute:
     expected_ranks: object = None
     local_rows: object = None
     workspace: object = None
+    return_rows: object = None
 
 
 class HostSMWorkspace:
@@ -160,6 +161,9 @@ class HostSMWorkspace:
                                if fused_combine else None)
         self.local_rows = (torch.empty(local_tokens, dtype=torch.int32, **options)
                            if fused_combine else None)
+        self.return_rows = (torch.empty((context.world_size, context.config.decode_max_tokens),
+                                      dtype=torch.int32, **options)
+                            if fused_combine and context._reuse_return_index else None)
 
     def _record_stream(self, stream, *, capturing=False):
         if capturing:
@@ -170,7 +174,7 @@ class HostSMWorkspace:
                 stream.wait_stream(self._allocation_stream)
             for tensor in (self.hidden, self.local_ids, self.weights, self.inverse, self.count,
                            self.owner_rows, self.owner_counts, self.output, self.remote,
-                           self.expected_ranks, self.local_rows):
+                           self.expected_ranks, self.local_rows, self.return_rows):
                 if tensor is not None:
                     tensor.record_stream(stream)
             self._recorded_streams.append(stream)
@@ -236,7 +240,8 @@ class _DevicePending(Pending):
                 tensors = (self._value.hidden, self._value.local_ids, self._value.weights,
                            self._value.valid_count, self._value.handle.inverse_map,
                            self._value.handle._plan.owner_rows, self._value.handle._plan.owner_counts,
-                           self._value.handle._plan.expected_ranks, self._value.handle._plan.local_rows)
+                           self._value.handle._plan.expected_ranks, self._value.handle._plan.local_rows,
+                           self._value.handle._plan.return_rows)
             else:
                 tensors = (self._value,)
             for tensor in tensors:
@@ -301,6 +306,9 @@ class HostSMContext(Context):
         with torch.cuda.device(self.device):
             native.load()
             self._decode_packet_rows = native.load().host_sm_packet_rows()
+            self._dispatch_banks = native.load().host_sm_dispatch_banks()
+            self._dispatch_roles = native.load().host_sm_dispatch_roles()
+            self._reuse_return_index = native.load().host_sm_reuse_return_index()
             self._channel_capacity = native.host_sm_max_channels(self.world_size)
         members = dist.get_process_group_ranks(group) if group is not None else list(range(dist.get_world_size()))
         self.group = dist.new_group(ranks=members, backend="gloo",
@@ -365,7 +373,8 @@ class HostSMContext(Context):
                 channels=self.effective_channels, queue_peers=self._queue_peers[phase])
                 for phase, topk in (("dispatch", self.config.topk), ("combine", 0))}
         if any(self._arena_sizes[phase] != self.config.mapped_arena_bytes(
-                   topk, self.effective_channels, queue_peers=self._queue_peers[phase])
+                   topk, self.effective_channels, queue_peers=self._queue_peers[phase],
+                   dispatch_banks=self._dispatch_banks if phase == "dispatch" else 0)
                for phase, topk in (("dispatch", self.config.topk), ("combine", 0))):
             raise RuntimeError("mapped queue allocation ABI mismatch")
         if self.config.decode_max_tokens:
@@ -516,6 +525,8 @@ class HostSMContext(Context):
                 roles = 2 if (stage == "combine" and
                               (os.environ.get("EP_XPRESS_DECODE_SPLIT_TX_RX", "0") == "1" or
                                self._decode_packet_rows != 0)) else 1
+                if stage == "dispatch":
+                    roles = self._dispatch_roles
                 storage = torch.zeros((max_samples_per_channel + 1,
                                        self.effective_channels * roles, len(fields)),
                                       dtype=torch.int64, device=self.device)
@@ -551,13 +562,15 @@ class HostSMContext(Context):
                 for i in range(min(header[0], state["max_samples"])):
                     samples.append({"channel": channel, "values": raw[i + 1][channel]})
             if "ctrl0_ready_poll_ns" in state["fields"]:
-                tx = ["tx_route_local_ns", "tx_metadata_ns", "tx_payload_ns", "tx_publish_ns"]
+                tx = ["tx_route_local_ns", "tx_credit_wait_ns", "tx_metadata_ns", "tx_payload_ns", "tx_publish_ns"]
                 controls = {f"ctrl{g}": [f"ctrl{g}_{f}_ns" for f in (
                     "ready_poll", "descriptor_alloc", "metadata", "metadata_commit", "stage_wait",
                     "ack_publish", "ack_drain", "other")] for g in range(2)}
                 rx = [f"rx_{f}_ns" for f in ("stage_wait", "payload", "completion", "ack_drain_wait", "other")]
                 return {
                     "schema_version": 3, "stage": "dispatch_pipeline", "rank": self.rank,
+                    "cta_roles": "independent_tx_rx" if self._dispatch_roles == 2 else "combined",
+                    "role_index": "For split mode, physical CTA below active channels is TX; remaining CTAs are RX.",
                     "fields": state["fields"], "samples": samples,
                     "dropped_samples": sum(row[2] for row in raw[0]), "status": int(self._status.item()),
                     "phase_fields": [], "role_phase_fields": {"tx": tx, **controls, "rx": rx},
@@ -994,16 +1007,21 @@ class HostSMContext(Context):
                                           if fused_combine else None)
                         local_rows = (torch.empty(x.shape[0], dtype=torch.int32, device=self.device)
                                       if fused_combine else None)
+                        return_rows = (torch.empty((self.world_size, self.config.decode_max_tokens),
+                                                   dtype=torch.int32, device=self.device)
+                                       if fused_combine and self._reuse_return_index else None)
                     else:
                         hidden, local_ids, weights_out = workspace.hidden, workspace.local_ids, workspace.weights
                         inverse, count = workspace.inverse, workspace.count
                         owner_rows, owner_counts = workspace.owner_rows, workspace.owner_counts
                         expected_ranks, local_rows = workspace.expected_ranks, workspace.local_rows
-                    decode_options = ({"expected_ranks": expected_ranks, "local_rows": local_rows}
+                        return_rows = workspace.return_rows
+                    decode_options = ({"expected_ranks": expected_ranks, "local_rows": local_rows,
+                                       "return_rows": return_rows}
                                       if fused_combine else {})
                     handle = RouteHandle(self._id, self._counter,
                                          _DeviceRoute(inverse, count, owner_rows, owner_counts, channels,
-                                                      expected_ranks, local_rows, workspace),
+                                                      expected_ranks, local_rows, workspace, return_rows),
                                          x.shape[0], capacity, tag)
                     dispatch_profile, dispatch_record = ((None, None) if fused_combine else
                                                          self._combine_profile_slice(handle, tag, epoch))
@@ -1061,7 +1079,7 @@ class HostSMContext(Context):
                 inputs = ((partial,) if same_stream and workspace is not None else
                           (partial, handle._plan.inverse, handle._plan.count,
                            handle._plan.owner_rows, handle._plan.owner_counts,
-                           handle._plan.expected_ranks, handle._plan.local_rows))
+                           handle._plan.expected_ranks, handle._plan.local_rows, handle._plan.return_rows))
                 for tensor in inputs:
                     if tensor is not None:
                         tensor.record_stream(execution)
@@ -1077,7 +1095,8 @@ class HostSMContext(Context):
                     profile, profile_record = ((None, None) if fused_combine else
                                                self._combine_profile_slice(handle, tag, epoch))
                     decode_options = ({"expected_ranks": handle._plan.expected_ranks,
-                                       "local_rows": handle._plan.local_rows} if fused_combine else {})
+                                       "local_rows": handle._plan.local_rows,
+                                       "return_rows": handle._plan.return_rows} if fused_combine else {})
                     self._prepared.combine(partial, handle._plan.inverse, handle._plan.count,
                                            handle._plan.owner_rows, handle._plan.owner_counts,
                                            epoch, output, remote, active_channels=handle.active_channels,

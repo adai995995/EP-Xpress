@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "baseline": "SGLang default NCCL, host staged",
+  "measurement_dates": [
+    "2026-10-25",
+    "2026-10-26"
+  ],
+  "sessions": 2,
+  "measured_repeats_per_session_per_batch": 5,
+  "warmups_per_session_per_batch": 8,
+  "configuration": {
+    "gpus": "8 x NVIDIA H20D",
+    "model": "Qwen3-30B-A3B-Instruct-2507",
+    "dtype": "BF16",
+    "sglang": "v0.5.21",
+    "tp": 8,
+    "dp": 8,
+    "ep": 8,
+    "expert_backend": "Triton",
+    "attention_backend": "FlashInfer",
+    "decode_graph_buckets": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "prefill_graph": false,
+    "input_tokens": 512,
+    "output_tokens": 32,
+    "prefix_cache": false,
+    "P2P": false,
+    "NVLink": false,
+    "sglang_commit": "e00930c5489053f26d86b179cee0d087f846acbb",
+    "hidden_size": 2048,
+    "layers": 48,
+    "experts": 128,
+    "topk": 8,
+    "driver_versions": [
+      "580.105.08"
+    ]
+  },
+  "aggregation": "Arithmetic mean over all repeat-level measurements; each session has equal sample count. Ranges are observed extrema, not confidence intervals.",
+  "metrics": {
+    "1": {
+      "ttft_mean_ms": {
+        "mean": 101.80142275057733,
+        "median": 102.00893739238381,
+        "min": 99.98885821551085,
+        "max": 103.22191286832094,
+        "sample_stddev": 1.010700303972949,
+        "samples": 10
+      },
+      "steady_state_output_tokens_per_s": {
+        "mean": 155.05084016429382,
+        "median": 155.144828586088,
+        "min": 154.32051158900754,
+        "max": 155.91908615517136,
+        "sample_stddev": 0.49940307833399683,
+        "samples": 10
+      },
+      "latency_ms": {
+        "mean": 301.8319895491004,
+        "median": 302.0734894089401,
+        "min": 299.77950593456626,
+        "max": 303.9713129401207,
+        "sample_stddev": 1.3223953624571745,
+        "samples": 10
+      }
+    },
+    "32": {
+      "ttft_mean_ms": {
+        "mean": 431.71029553195694,
+        "median": 409.29268664331175,
+        "min": 395.8954777190229,
+        "max": 496.156772976974,
+        "sample_stddev": 38.82127044981246,
+        "samples": 10
+      },
+      "steady_state_output_tokens_per_s": {
+        "mean": 3557.9480816127516,
+        "median": 3556.018375685565,
+        "min": 3503.532499819668,
+        "max": 3613.5499270178934,
+        "sample_stddev": 36.41053913962065,
+        "samples": 10
+      },
+      "latency_ms": {
+        "mean": 763.4296435397118,
+        "median": 754.1107521392405,
+        "min": 739.3944202922285,
+        "max": 800.5794249475002,
+        "sample_stddev": 22.35873134932199,
+        "samples": 10
+      }
+    }
+  },
+  "verification": [
+    "Matching image, framework source, model configuration, GPU topology, server arguments and timed prompt hashes",
+    "No external GPU process observed",
+    "NCCL SHM verified; no P2P/NET/NVLS channels; available NVLink counter deltas zero"
+  ],
+  "reuse_policy": "Reuse for EP-only changes. Rebuild when hardware, software, model, workload or execution settings change, or comparability is contradicted."
+}

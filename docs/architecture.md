@@ -1180,3 +1180,83 @@ before their dependent HBM stores, uses one aligned 128-bit host store instead
 of four strided 32-bit stores, and reuses rank-ordered vector reduction on the
 staged HBM layout. Scalar/unaligned cases retain a bounded fallback. Neither
 transfer width nor packet capacity changes which rows are routed or weighted.
+
+
+### Independent bounded dispatch and delayed bank reclamation
+
+`EP_XPRESS_DISPATCH_SPLIT=1` launches two cooperative resident CTA sets for
+bounded indexed dispatch. Physical CTAs `[0, channels)` publish local source
+rows; `[channels, 2*channels)` receive their channel's peer rows. Every RX CTA
+retains 256 payload threads and two descriptor-control warps. Output-count and
+owner-list reservations remain GPU-local atomics. RX starts without waiting for
+local TX. The ordinary completion of both CTA sets orders subsequent expert
+computation. Occupancy negotiation includes both sets and the instrumented
+specialization; scheduling never relies on a nonresident block making progress.
+
+`EP_XPRESS_DISPATCH_DEFER_RECLAIM=1` additionally separates local result
+completion from outgoing host-buffer reclamation. A physical channel owns the
+original fallback ring plus two full decode extents. Decode chooses a bank by
+its GPU operation epoch and stores each bank's **last actual published sequence**
+in producer-only HBM. Before the next overwrite, its TX control lanes wait for
+all readers of that publication to ACK. RX CTAs continue progressing independently.
+After incoming metadata and payload have joined and their ACKs have been issued,
+RX can finish without draining this operation's outgoing ACKs. All necessary
+writer fences, metadata/payload joins and remote ACKs remain.
+
+Count-only readers still acknowledge their control records: zero payload does
+not make a mutable READY/count record safe to overwrite. Credits cover the
+whole bank, including any borrowed index payload in its second slot. Eager
+fallback uses a different extent; Graph buckets, active channel counts, empty
+ranks, skipped routes and prefill/decode transitions cannot alias live decode
+storage. Using `epoch - 2` as a substitute for the last publication is incorrect
+when a bank/channel was not used in intervening operations. Healthy context
+shutdown synchronizes local work and rendezvous with all ranks before unmapping
+host memory. There is no per-operation CPU collective.
+
+The pinned dispatch allocation grows by a factor of three for this opt-in build;
+combine arenas are unchanged. The native allocation query and
+`Config.mapped_arena_bytes(..., dispatch_banks=2)` agree, and bootstrap validates
+the total against the host-pool budget. Static `Config.pool_bytes()` without
+compiled-option arguments remains the default-layout estimate.
+
+### Per-handle return indices
+
+`EP_XPRESS_REUSE_RETURN_INDEX=1` requires packet combine. Each fused route handle,
+or its explicitly borrowed workspace, owns an `int32[world, decode_max_tokens]`
+map from source rank/token to compact expert-output row. Dispatch clears this
+bounded map in its existing initialization kernel and fills it when it writes
+inverse metadata, including generic fallback dispatch. Packet preparation reads
+this map directly instead of clearing a context-wide map and traversing
+`owner_rows -> inverse -> token` again. It still constructs the current live
+packet masks and task lists; no routing decision is cached between invocations.
+
+The map is independent for outstanding handles, retained across Graph capture,
+and recorded on consumer streams. It is not valid to store it only in the context:
+a later dispatch could then silently replace an earlier uncombined handle's
+routes. Local rows remain excluded from remote sends, and reduction keeps the
+existing rank order and weight application.
+
+### Dispatch stores and interpretation of counters
+
+`EP_XPRESS_DISPATCH_WRITE_UNROLL=1/2/4` uses aligned 128-bit payload stores and
+bounded instruction unrolling in the pipeline TX role. Row widths or pointers
+unsuitable for 16-byte vector access retain the existing 32-bit transfer path;
+this does not add support for two-byte-offset BF16 views. Sparse and partial
+batches retain exact bounds.
+It does not change routing, frame size, channel count, READY granularity or ACK
+ownership. These knobs must be compared independently before selecting a policy.
+
+Split dispatch profiling records physical TX and RX CTAs separately. Active
+channel count is stored with each record; the RX set starts at that count.
+`tx_credit_wait_ns` isolates delayed-bank checks from route/local work. TX,
+control and RX timelines overlap, and role durations must not be added as if
+sequential. Instrumented kernels are separate from performance measurements.
+
+
+`EP_XPRESS_HOST_READ64=1` separately replaces the legacy pair of 32-bit loads
+used for aligned 64-bit host metadata with `ld.global.cv.u64`. Descriptor and ID
+words are immutable after their matching READY; the acquisition of that READY
+still uses the system-acquire helper. All metadata offsets retain natural
+8-byte alignment. This reduces load instructions without changing the wire
+format, synchronization ownership or payload. PCIe transaction counts are not
+inferred from instruction width alone.

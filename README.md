@@ -277,13 +277,15 @@ The SM backend batches routing and metadata access. `channels` is the allocated
 number of logical work partitions, not a count of reserved SMs. A dispatch may
 supply `active_channels` from 1 through `ep.effective_channels`; all ranks must
 use the same value. Omitting it uses the full allocation. The handle retains
-this width for combine. Dispatch launches one CUDA block per active channel;
+this width for combine. Default dispatch launches one CUDA block per active channel;
 pair-queue combine launches one block per `(active channel, peer)`, including a local-only
 block for the current rank. Four active channels on eight ranks therefore
 launch four dispatch blocks and 32 combine blocks per GPU. Arena addresses and
 frame sizes stay fixed when the active width changes. CUDA places those blocks
 on SMs according to resource availability. Fused mailbox combine instead
-launches one block per active channel.
+launches one block per active channel. The opt-in split dispatch pipeline
+launches separate TX and RX blocks per channel; packet combine similarly uses
+independent TX/RX blocks with its separately configured packet-channel count.
 
 `channels` defaults to four. Initialization negotiates a common limit from
 dispatch and combine kernel occupancy, including the optional diagnostic
@@ -390,6 +392,53 @@ other-thread stragglers subsequently observed at completion barriers. Prepared
 but disabled counters still use the diagnostic specialization's resources, so
 compare enabled/disabled runs and an ordinary context separately. Counter readback
 occurs only after the request. See the architecture for interpretation limits.
+
+## Independent communication measurements
+
+`benchmarks.communication` times prepared BF16 dispatch and combine independently
+with CUDA events. The synthetic expert operation is outside both timed regions.
+Token counts above 256 use generic dispatch/combine rings; smaller counts use
+bounded decode. Eight route patterns are replayed with changing GPU IDs, including destination
+rank deduplication, hotspots and padding. The report takes the maximum per-rank
+duration for each sample; it does not add timestamps from different GPUs.
+
+```sh
+NCCL_P2P_DISABLE=1 NCCL_NVLS_ENABLE=0 NCCL_IB_DISABLE=1 \
+EP_XPRESS_DECODE_DISPATCH_INDEXED=1 EP_XPRESS_DECODE_DISPATCH_PIPELINE=1 \
+EP_XPRESS_DECODE_DESCRIPTOR_BATCH=32 EP_XPRESS_DECODE_PUBLISH_BATCH=8 \
+python -m torch.distributed.run --master-addr=127.0.0.1 --nproc-per-node=8 \
+  --module benchmarks.communication --tokens 1 4 16 64 256 \
+  --graph --output communication.json
+```
+
+Reported host-write/read GB/s uses logical BF16 payload bytes summed over ranks.
+It excludes metadata and PCIe protocol traffic, so it is **not physical bus
+bandwidth**. The default `--cpu-numa auto` binds each producer to its GPU node
+before allocation and verifies the actual host pages; `--cpu-numa off` explicitly
+omits that requirement and should not be mixed into a placement-controlled
+comparison. Add `--nccl-reference` only when a fresh raw collective reference
+is needed. Raw NCCL AG/RS excludes EP
+routing/layout work. The full-model default-NCCL baseline remains the comparison
+for application performance. The [archived NCCL baseline](benchmarks/baselines/sglang_h20d_ep8_bf16_host.json)
+records two matched sessions and ten repeats per batch size. Keep that baseline for unchanged hardware,
+software and workloads; rerun EP candidates independently.
+
+Five build-time ablations are available, all disabled by default:
+
+| Variable | Behavior | Prerequisite |
+| --- | --- | --- |
+| `EP_XPRESS_DISPATCH_SPLIT=1` | Independent resident TX/RX CTAs; RX keeps 256 payload threads and two control warps | Indexed dispatch pipeline |
+| `EP_XPRESS_DISPATCH_DEFER_RECLAIM=1` | Two decode banks; check previous-generation ACK before bank overwrite | Split dispatch |
+| `EP_XPRESS_REUSE_RETURN_INDEX=1` | Per-handle return-row index built during dispatch and consumed by packet combine | Decode packet transport |
+| `EP_XPRESS_HOST_READ64=1` | Load aligned host descriptor/ID words with one 64-bit instruction | Host-SM transport |
+| `EP_XPRESS_DISPATCH_WRITE_UNROLL=1/2/4` | Aligned 128-bit dispatch writes with bounded unrolling; existing 32-bit fallback | Dispatch pipeline |
+
+These changes preserve token-level routes, destination-rank deduplication,
+BF16 semantics and receive synchronization. Deferred dispatch reclamation reserves
+three dispatch extents per channel: the original fallback ring and two decode
+banks. Bootstrap checks the increased pinned-memory budget. Enabling an option
+is an experiment, not a claim of end-to-end improvement; measured results belong
+in [the performance report](docs/model-performance.md).
 
 ## Validation
 

@@ -25,6 +25,10 @@
 - The performance baseline is SGLang's default NCCL backend. Unless explicitly
   requested otherwise, disable NVLink and GPU P2P for both candidates and baseline;
   keep the GPU configuration and workload identical.
+- Reuse the archived multi-run NCCL baseline for subsequent EP-only changes.
+  Record arithmetic means and observed variation. Rebuild that baseline only
+  when hardware, software, model, workload, or execution settings change, or
+  evidence shows the saved baseline is no longer comparable.
 - Keep comparisons on the same GPU configuration, dtype, routing trace, expert
   kernel, and Graph mode. Clearly distinguish tested functionality from planned
   optimization and unverified framework integration.

@@ -97,6 +97,7 @@ def test_bootstrap_negotiates_group_min_then_checks_actual_budget(capacities, ex
     context.device = torch.device("cuda", 0)
     context.group = object()
     context._channel_capacity = capacities[0]
+    context._dispatch_banks = 0
 
     def gather(result, signature, group):
         result[:] = [(*signature[:3], f"gpu-{rank}", cap) for rank, cap in enumerate(capacities)]
@@ -350,6 +351,7 @@ def _workspace_context():
     context.world_size, context.effective_channels = 2, 2
     context._max_receive_capacity = 6
     context._id, context._counter = "workspace-context", 0
+    context._reuse_return_index = False
     context._closed, context._failure, context._unwaited = False, None, 0
     context._epochs = {"dispatch": 0, "combine": 0}
     context._lock = threading.RLock()

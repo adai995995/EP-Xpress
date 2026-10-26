@@ -27,6 +27,16 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 Config(128, 4, 32, transport="host_ce", **{field: 1})
 
+    def test_dispatch_bank_budget_keeps_fallback_extent(self):
+        cfg = Config(2048, 8, 256, transport="host_sm", channels=8)
+        base = cfg.mapped_arena_bytes(8)
+        self.assertEqual(cfg.mapped_arena_bytes(8, dispatch_banks=2), 3 * base)
+        for banks in (-1, 1, 3, True, 2.0):
+            with self.assertRaises(ValueError):
+                cfg.mapped_arena_bytes(8, dispatch_banks=banks)
+        with self.assertRaises(ValueError):
+            cfg.mapped_arena_bytes(0, dispatch_banks=2)
+
     def test_aligned_budget_and_rows(self):
         cfg = Config(10, 2, 128, chunk_bytes=100, slots=2)
         self.assertEqual(cfg.chunk_rows, 5)

@@ -74,6 +74,22 @@ def load(*, verbose: bool = False):
             raise ValueError("EP_XPRESS_DECODE_DISPATCH_PIPELINE must be 0 or 1")
         if decode_dispatch_pipeline == "1" and decode_dispatch_indexed != "1":
             raise ValueError("decode dispatch pipeline requires EP_XPRESS_DECODE_DISPATCH_INDEXED=1")
+        host_read64 = os.environ.get("EP_XPRESS_HOST_READ64", "0")
+        if host_read64 not in {"0", "1"}:
+            raise ValueError("EP_XPRESS_HOST_READ64 must be 0 or 1")
+        dispatch_write_unroll = os.environ.get("EP_XPRESS_DISPATCH_WRITE_UNROLL", "0")
+        if dispatch_write_unroll not in {"0", "1", "2", "4"}:
+            raise ValueError("EP_XPRESS_DISPATCH_WRITE_UNROLL must be 0, 1, 2, or 4")
+        dispatch_split = os.environ.get("EP_XPRESS_DISPATCH_SPLIT", "0")
+        if dispatch_split not in {"0", "1"}:
+            raise ValueError("EP_XPRESS_DISPATCH_SPLIT must be 0 or 1")
+        if dispatch_split == "1" and decode_dispatch_pipeline != "1":
+            raise ValueError("independent dispatch requires the dispatch pipeline")
+        dispatch_defer = os.environ.get("EP_XPRESS_DISPATCH_DEFER_RECLAIM", "0")
+        if dispatch_defer not in {"0", "1"}:
+            raise ValueError("EP_XPRESS_DISPATCH_DEFER_RECLAIM must be 0 or 1")
+        if dispatch_defer == "1" and dispatch_split != "1":
+            raise ValueError("dispatch deferred reclamation requires independent TX/RX")
         decode_control_records = os.environ.get("EP_XPRESS_DECODE_CONTROL_RECORDS", "0")
         if decode_control_records not in {"0", "1"}:
             raise ValueError("EP_XPRESS_DECODE_CONTROL_RECORDS must be 0 or 1")
@@ -85,6 +101,11 @@ def load(*, verbose: bool = False):
         decode_packet_rows = os.environ.get("EP_XPRESS_DECODE_PACKET_ROWS", "0")
         if decode_packet_rows not in {"0", "2", "4", "8"}:
             raise ValueError("EP_XPRESS_DECODE_PACKET_ROWS must be 0, 2, 4, or 8")
+        reuse_return_index = os.environ.get("EP_XPRESS_REUSE_RETURN_INDEX", "0")
+        if reuse_return_index not in {"0", "1"}:
+            raise ValueError("EP_XPRESS_REUSE_RETURN_INDEX must be 0 or 1")
+        if reuse_return_index == "1" and decode_packet_rows == "0":
+            raise ValueError("return-index reuse requires decode packet transport")
         packet_channels = os.environ.get("EP_XPRESS_DECODE_PACKET_CHANNELS", "0")
         if packet_channels not in {"0", "4", "8", "16", "32"}:
             raise ValueError("EP_XPRESS_DECODE_PACKET_CHANNELS must be 0, 4, 8, 16, or 32")
@@ -104,7 +125,14 @@ def load(*, verbose: bool = False):
         if decode_packet_rows != "0" and (any(v == "1" for v in combine_options.values())
                                          or decode_ready_prefetch != "0"):
             raise ValueError("packet transport replaces legacy combine scheduling; disable those options")
-        cuda_flags = [f"-DEP_XPRESS_DECODE_PACKET_ROWS={decode_packet_rows}", "-O3", "-lineinfo", f"-DEP_XPRESS_PREFILL_READ_UNROLL={read_unroll}",
+        cuda_flags = ["-O3", "-lineinfo",
+                      f"-DEP_XPRESS_HOST_READ64={host_read64}",
+                      f"-DEP_XPRESS_DISPATCH_WRITE_UNROLL={dispatch_write_unroll}",
+                      f"-DEP_XPRESS_REUSE_RETURN_INDEX={reuse_return_index}",
+                      f"-DEP_XPRESS_DISPATCH_DEFER_RECLAIM={dispatch_defer}",
+                      f"-DEP_XPRESS_DISPATCH_SPLIT={dispatch_split}",
+                      f"-DEP_XPRESS_DECODE_PACKET_ROWS={decode_packet_rows}",
+                      f"-DEP_XPRESS_PREFILL_READ_UNROLL={read_unroll}",
                       f"-DEP_XPRESS_DECODE_PACKET_CHANNELS={packet_channels}",
                       f"-DEP_XPRESS_PREFILL_WRITE_UNROLL={write_unroll}",
                       f"-DEP_XPRESS_DISPATCH_READ_UNROLL={dispatch_read_unroll}",

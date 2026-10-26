@@ -66,26 +66,31 @@ __global__ void host_sm_packet_prepare_kernel(TransportArgs a) {
   }
   int* rows = a.packet_rows + int64_t(peer) * a.mailbox_tokens;
   const int tiles = packet_tiles(a.mailbox_tokens);
-  for (int t = tid; t < a.mailbox_tokens; t += blockDim.x) rows[t] = -1;
-  __syncthreads();
-  const int count = a.owner_counts[peer];
-  if (count < 0 || count > a.input_rows) { if (!tid) fail(a.status, 1); return; }
-  if (peer != a.rank) {
-    for (int i = tid; i < count; i += blockDim.x) {
-      const int row = a.owner_rows[int64_t(peer) * a.input_rows + i];
-      if (row < 0 || row >= a.input_rows) { fail(a.status, 1); continue; }
-      const int64_t token = a.input_inverse[int64_t(row) * 2 + 1];
-      if (token < 0 || token >= a.mailbox_tokens) { fail(a.status, 2); continue; }
-      if (a.diagnostics && a.input_inverse[int64_t(row) * 2] != peer) fail(a.status, 1);
-      rows[token] = row; // Dispatch guarantees one combined row per owner/token.
+  if (!a.return_rows) {
+    for (int t = tid; t < a.mailbox_tokens; t += blockDim.x) rows[t] = -1;
+    __syncthreads();
+    const int count = a.owner_counts[peer];
+    if (count < 0 || count > a.input_rows) { if (!tid) fail(a.status, 1); return; }
+    if (peer != a.rank) {
+      for (int i = tid; i < count; i += blockDim.x) {
+        const int row = a.owner_rows[int64_t(peer) * a.input_rows + i];
+        if (row < 0 || row >= a.input_rows) { fail(a.status, 1); continue; }
+        const int64_t token = a.input_inverse[int64_t(row) * 2 + 1];
+        if (token < 0 || token >= a.mailbox_tokens) { fail(a.status, 2); continue; }
+        if (a.diagnostics && a.input_inverse[int64_t(row) * 2] != peer) fail(a.status, 1);
+        rows[token] = row; // Dispatch guarantees one combined row per owner/token.
+      }
     }
+    __syncthreads();
+  } else {
+    // Publish the shared task counters before other warps append live tiles.
+    __syncthreads();
   }
-  __syncthreads();
   for (int tile = tid; tile < tiles; tile += blockDim.x) {
     unsigned send = 0, receive = 0;
     for (int i = 0; i < kPacketRows; ++i) {
       const int token = tile * kPacketRows + i;
-      if (token < a.mailbox_tokens && rows[token] >= 0) send |= 1u << i;
+      if (peer != a.rank && token < a.mailbox_tokens && rows[token] >= 0) send |= 1u << i;
       if (token < a.capacity) {
         const uint64_t mask = a.expected_ranks[token];
         if (peer != a.rank && (mask & (uint64_t(1) << peer))) receive |= 1u << i;

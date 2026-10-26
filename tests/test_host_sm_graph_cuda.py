@@ -69,6 +69,20 @@ def _worker(rank, init_file, fused, single_frame=False, chunk_bytes=4096, id_bit
         return context.combine_on_stream(partial, batch.handle)
 
     try:
+        if context._reuse_return_index:
+            # Two outstanding handles must own independent return indices.
+            # Rebuilding handle B must not replace handle A's dynamic routes.
+            with torch.cuda.stream(capture_stream):
+                pending = []
+                for step in (0, 1):
+                    data = inputs(4, step)
+                    batch = context.dispatch_on_stream(*data, fused_combine=True)
+                    partial = (batch.hidden.float() *
+                        (batch.weights * (batch.local_ids >= 0)).sum(1)[:, None]).bfloat16()
+                    pending.append((data, batch, partial))
+                for data, batch, partial in pending:
+                    output = context.combine_on_stream(partial, batch.handle)
+                    results.append((output.clone(), reference(data)))
         # Five retained buckets exceed the adapter's former four-entry cache;
         # the empty-rank bucket verifies zero-row kernels and remote experts.
         for key in range(5):
@@ -143,6 +157,8 @@ def _worker(rank, init_file, fused, single_frame=False, chunk_bytes=4096, id_bit
             roles = 2 if (profile == "combine" and
                           (os.environ.get("EP_XPRESS_DECODE_SPLIT_TX_RX") == "1" or
                            os.environ.get("EP_XPRESS_DECODE_PACKET_ROWS", "0") != "0")) else 1
+            if profile == "dispatch" and os.environ.get("EP_XPRESS_DISPATCH_SPLIT") == "1":
+                roles = 2
             assert report["dropped_samples"] == 0 and len(report["samples"]) == 2 * roles
         for graph, _, _ in graphs.values():
             graph.reset()
