@@ -13,8 +13,18 @@ __host__ __device__ inline int64_t packet_stride(int hidden) {
   return (128 + int64_t(kPacketRows) * hidden * 2 + 127) / 128 * 128;
 }
 __device__ __forceinline__ char* packet_box(TransportArgs a, int producer, int task) {
+#if EP_XPRESS_PACKET_RECV_LOCAL
+  // Logical task remains (producer, destination, tile). Only physical placement
+  // changes: the destination's rank-local host arena owns the incoming slot.
+  const int tiles = packet_tiles(a.mailbox_tokens);
+  const int destination = task / tiles;
+  const int physical_task = producer * tiles + task % tiles;
+  return reinterpret_cast<char*>(a.mailbox_pointers[destination]) + kArenaHeader +
+      (int64_t(physical_task) * kPacketBanks + a.epoch % kPacketBanks) * packet_stride(a.hidden);
+#else
   return reinterpret_cast<char*>(a.mailbox_pointers[producer]) + kArenaHeader +
       (int64_t(task) * kPacketBanks + a.epoch % kPacketBanks) * packet_stride(a.hidden);
+#endif
 }
 
 // Issue independent host loads before consuming their values in HBM stores.

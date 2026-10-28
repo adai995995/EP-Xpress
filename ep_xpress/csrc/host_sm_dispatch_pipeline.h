@@ -126,6 +126,50 @@ __device__ __forceinline__ void dispatch_pipeline_send(TransportArgs a, char* pa
 }
 #endif
 
+#if EP_XPRESS_READY_BATCH
+template <bool Vector>
+__device__ __forceinline__ void dispatch_pipeline_receive_pair(
+    TransportArgs a, const DispatchPrefetchStage& first,
+    const DispatchPrefetchStage& second, int channel, int64_t x_offset, int rx) {
+  // Both stages have already been acquired by the RX leader. Neither can be
+  // reclaimed until this full worker group releases its completion below.
+  const char* sources[2] = {
+      dispatch_pipeline_slot(a, first.peer, channel) + x_offset,
+      dispatch_pipeline_slot(a, second.peer, channel) + x_offset};
+  const int width = a.hidden / (Vector ? 8 : 2);
+  const int64_t totals[2] = {int64_t(first.count) * width, int64_t(second.count) * width};
+  const int64_t total = totals[0] > totals[1] ? totals[0] : totals[1];
+  using Value = typename std::conditional<Vector, uint4, uint32_t>::type;
+  for (int64_t base = rx; base < total; base += kThreads * 2) {
+    Value values[4];
+    // Two independent loads per stage, interleaved across the two peers.
+    // Issue the whole bounded batch before any loaded value is consumed.
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      const int64_t i = base + j * kThreads;
+      if (i < totals[0]) {
+        const int64_t source = int64_t(first.wires[i / width]) * width + i % width;
+        if constexpr (Vector) values[j * 2] = host_load128(sources[0] + source * 16);
+        else values[j * 2] = host_load32(sources[0] + source * 4);
+      }
+      if (i < totals[1]) {
+        const int64_t source = int64_t(second.wires[i / width]) * width + i % width;
+        if constexpr (Vector) values[j * 2 + 1] = host_load128(sources[1] + source * 16);
+        else values[j * 2 + 1] = host_load32(sources[1] + source * 4);
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      const int64_t i = base + j * kThreads;
+      if (i < totals[0])
+        reinterpret_cast<Value*>(a.output + int64_t(first.output) * a.hidden)[i] = values[j * 2];
+      if (i < totals[1])
+        reinterpret_cast<Value*>(a.output + int64_t(second.output) * a.hidden)[i] = values[j * 2 + 1];
+    }
+  }
+}
+#endif
+
 template <typename Id, bool Profile = false>
 __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
   if (a.device_epoch) a.epoch = *a.device_epoch;
@@ -161,6 +205,9 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
 #endif
   __shared__ DispatchPrefetchStage stages[kDispatchStages];
   __shared__ int rx_choice;
+#if EP_XPRESS_READY_BATCH
+  __shared__ int rx_second;
+#endif
 
   __shared__ DispatchProfileStorage<Profile> diag;
   uint64_t diag_mark = 0;
@@ -275,9 +322,19 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
         const int64_t expert = ids[source];
         const int64_t target = EP_XPRESS_DISPATCH_DIRECT
             ? int64_t(remote[i / a.topk]) * a.topk + i % a.topk : i;
+#if EP_XPRESS_ROUTE_PACKED
+        // Prepared transport bounds the expert table by INT32_MAX. The route
+        // validation above runs on the original ID type before narrowing, so
+        // int64 input IDs and -1 padding retain their existing semantics.
+        // Keep one source-owned word per route; all readers share this copy.
+        const uint64_t route = uint64_t(uint32_t(expert)) |
+            (uint64_t(__float_as_uint(expert >= 0 ? a.weights[source] : 0.0f)) << 32);
+        host_store64(slot + id_offset + target * 8, route);
+#else
         host_store64(slot + id_offset + target * 8, uint64_t(expert));
         host_store32(slot + weight_offset + target * 4,
                      __float_as_uint(expert >= 0 ? a.weights[source] : 0.0f));
+#endif
       }
 #endif
       for (int peer = tid / 32; peer < a.world; peer += kDispatchPipelineThreads / 32) {
@@ -497,8 +554,14 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
                 a.output_weights[out] = __uint_as_float(uint32_t(route >> 32));
 #else
                 const int64_t wire = int64_t(stage.wires[i / a.topk]) * a.topk + i % a.topk;
+#if EP_XPRESS_ROUTE_PACKED
+                const uint64_t route = host_load64(source + id_offset + wire * 8);
+                const int64_t expert = int32_t(uint32_t(route));
+                const float weight = __uint_as_float(uint32_t(route >> 32));
+#else
                 const int64_t expert = int64_t(host_load64(source + id_offset + wire * 8));
                 const float weight = __uint_as_float(host_load32(source + weight_offset + wire * 4));
+#endif
                 a.output_ids[out] = expert >= 0 && expert < a.experts && a.expert_rank[expert] == a.rank ? a.expert_local[expert] : -1;
                 a.output_weights[out] = weight;
 #endif
@@ -513,7 +576,7 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
               // Every metadata lane completes its host reads and GPU writes
               // before the owner may reap RX completion and publish a host ACK.
               // RX can finish first; state 2 alone never causes an early ACK.
-              __threadfence_system();
+              host_rx_fence();
               __syncwarp();
               mark(dc + DCStageWait, lane == 0);
 #endif
@@ -576,11 +639,18 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
         char* source = dispatch_pipeline_slot(a, stage.peer, channel);
         for (int i = lane; i < stage.count * a.topk; i += 32) {
           const int64_t wire = int64_t(stage.wires[i / a.topk]) * a.topk + i % a.topk;
+#if EP_XPRESS_ROUTE_PACKED
+          const uint64_t route = host_load64(source + id_offset + wire * 8);
+          const int64_t expert = int32_t(uint32_t(route));
+          const float weight = __uint_as_float(uint32_t(route >> 32));
+#else
           const int64_t expert = int64_t(host_load64(source + id_offset + wire * 8));
+          const float weight = __uint_as_float(host_load32(source + weight_offset + wire * 4));
+#endif
           const int64_t out = int64_t(stage.output) * a.topk + i;
           a.output_ids[out] = expert >= 0 && expert < a.experts && a.expert_rank[expert] == a.rank
               ? a.expert_local[expert] : -1;
-          a.output_weights[out] = __uint_as_float(host_load32(source + weight_offset + wire * 4));
+          a.output_weights[out] = weight;
         }
         if (lane < stage.count) {
           const int token = channel + stage.wires[lane] * a.channels;
@@ -589,7 +659,7 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
           a.owner_rows[int64_t(stage.peer) * a.capacity + stage.owner + lane] = stage.output + lane;
           dispatch_return_row(a, stage.peer, token, stage.output + lane);
         }
-        __threadfence_system();
+        host_rx_fence();
         __syncwarp();
         // No lane touches this generation after arrival: it may be retired.
         if (!lane) dispatch_stage_arrive(&stage.state, 4);
@@ -621,18 +691,28 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
       while (true) {
         if (!rx) {
           rx_choice = -1;
+#if EP_XPRESS_READY_BATCH
+          rx_second = -1;
+#endif
           bool done = true;
           for (int i = 0; i < kDispatchStages; ++i) {
             const int choice = (next + i) % kDispatchStages;
             const uint32_t state = dispatch_stage_load(&stages[choice].state);
             if (state != kDispatchFinished) done = false;
-            if ((EP_XPRESS_DISPATCH_RETIRE ? (state & 1) && !(state & 2) : state == 1)
-                && rx_choice < 0) rx_choice = choice;
+            if (EP_XPRESS_DISPATCH_RETIRE ? (state & 1) && !(state & 2) : state == 1) {
+              if (rx_choice < 0) rx_choice = choice;
+#if EP_XPRESS_READY_BATCH
+              else if (rx_second < 0) rx_second = choice;
+#endif
+            }
           }
           if (done || read_status(a.status)) rx_choice = -2;
         }
         dispatch_rx_sync();
         const int choice = rx_choice;
+#if EP_XPRESS_READY_BATCH
+        const int second = rx_second;
+#endif
         if (choice == -2) break;
         if (choice < 0) {
           if constexpr (Profile) { if (!rx && diag.sample >= 0) {
@@ -644,6 +724,17 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
         mark(DRx + DRPayload, rx == 0);
         const auto& stage = stages[choice];
         char* source = dispatch_pipeline_slot(a, stage.peer, channel);
+#if EP_XPRESS_READY_BATCH
+        if (second >= 0) {
+          const char* other = dispatch_pipeline_slot(a, stages[second].peer, channel);
+          if (a.hidden % 8 == 0 &&
+              ((reinterpret_cast<uintptr_t>(source + x_offset) |
+                reinterpret_cast<uintptr_t>(other + x_offset) |
+                reinterpret_cast<uintptr_t>(a.output)) & 15) == 0)
+            dispatch_pipeline_receive_pair<true>(a, stage, stages[second], channel, x_offset, rx);
+          else dispatch_pipeline_receive_pair<false>(a, stage, stages[second], channel, x_offset, rx);
+        } else {
+#endif
 #if EP_XPRESS_DISPATCH_READ_UNROLL > 0
         if (a.hidden % 8 == 0 &&
             ((reinterpret_cast<uintptr_t>(source + x_offset) | reinterpret_cast<uintptr_t>(a.output)) & 15) == 0) {
@@ -671,21 +762,40 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
           reinterpret_cast<uint32_t*>(a.output + int64_t(stage.output) * a.hidden)[i] =
               host_load32(source + x_offset + (int64_t(stage.wires[i / width]) * width + i % width) * 4);
         }
+#if EP_XPRESS_READY_BATCH
+        }
+#endif
         mark(DRx + DRCommit, rx == 0);
         if constexpr (Profile) { if (!rx && diag.sample >= 0) {
           ++diag.values[DRx + DRFrames];
           diag.values[DRx + DRBytes] += int64_t(stage.count) * a.hidden * 2;
+#if EP_XPRESS_READY_BATCH
+          if (second >= 0) {
+            ++diag.values[DRx + DRFrames];
+            diag.values[DRx + DRBytes] += int64_t(stages[second].count) * a.hidden * 2;
+          }
+#endif
         }}
-        __threadfence_system();
+        host_rx_fence();
         dispatch_rx_sync();
         // All readers have completed before their leader releases the stage.
         // Peers may reclaim it immediately after the metadata join and ACK.
         if (!rx) {
           if constexpr (EP_XPRESS_DISPATCH_RETIRE) dispatch_stage_arrive(&stages[choice].state, 2);
           else dispatch_stage_store(&stages[choice].state, 2);
+#if EP_XPRESS_READY_BATCH
+          if (second >= 0) {
+            if constexpr (EP_XPRESS_DISPATCH_RETIRE) dispatch_stage_arrive(&stages[second].state, 2);
+            else dispatch_stage_store(&stages[second].state, 2);
+          }
+#endif
         }
         dispatch_rx_sync();
+#if EP_XPRESS_READY_BATCH
+        next = ((second >= 0 ? second : choice) + 1) % kDispatchStages;
+#else
         next = (choice + 1) % kDispatchStages;
+#endif
         mark(DRx + DRStageWait, rx == 0);
       }
       if constexpr (Profile) { if (!rx && diag.sample >= 0) {

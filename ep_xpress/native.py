@@ -111,6 +111,17 @@ def load(*, verbose: bool = False):
         ring_split = os.environ.get("EP_XPRESS_RING_SPLIT", "0")
         if ring_split not in {"0", "1"}:
             raise ValueError("EP_XPRESS_RING_SPLIT must be 0 or 1")
+        host_options = {}
+        for option in ("ROUTE_PACKED", "RX_FENCE", "READY_BATCH", "PACKET_RECV_LOCAL"):
+            key = "EP_XPRESS_" + option
+            value = os.environ.get(key, "0")
+            if value not in {"0", "1"}:
+                raise ValueError(key + " must be 0 or 1")
+            host_options[option] = value
+        if host_options["ROUTE_PACKED"] == "1" and dispatch_direct != "1":
+            raise ValueError("packed shared routes require direct dispatch slots")
+        if host_options["READY_BATCH"] == "1" and (dispatch_direct != "1" or packet_pipeline != "1"):
+            raise ValueError("ready payload batching requires direct dispatch and packet pipelining")
         decode_ack_batch = os.environ.get("EP_XPRESS_DECODE_ACK_BATCH", "1")
         if decode_ack_batch not in {"1", "2", "4", "8"}:
             raise ValueError("EP_XPRESS_DECODE_ACK_BATCH must be 1, 2, 4, or 8")
@@ -119,6 +130,8 @@ def load(*, verbose: bool = False):
             raise ValueError("EP_XPRESS_DECODE_PACKET_ROWS must be 0, 2, 4, or 8")
         if packet_pipeline == "1" and decode_packet_rows == "0":
             raise ValueError("packet pipelining requires decode packet transport")
+        if host_options["PACKET_RECV_LOCAL"] == "1" and decode_packet_rows == "0":
+            raise ValueError("receiver-local packet storage requires packet transport")
         reuse_return_index = os.environ.get("EP_XPRESS_REUSE_RETURN_INDEX", "0")
         if reuse_return_index not in {"0", "1"}:
             raise ValueError("EP_XPRESS_REUSE_RETURN_INDEX must be 0 or 1")
@@ -170,6 +183,8 @@ def load(*, verbose: bool = False):
                       f"-DEP_XPRESS_DECODE_ACK_BATCH={decode_ack_batch}"]
         cuda_flags.extend(f"-DEP_XPRESS_DECODE_{key}={value}"
                           for key, value in combine_options.items())
+        cuda_flags.extend(f"-DEP_XPRESS_{key}={value}"
+                          for key, value in host_options.items())
         digest = hashlib.sha256()
         for source in sources + sorted(source_dir.glob("*.h")):
             digest.update(source.read_bytes())

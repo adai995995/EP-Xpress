@@ -4122,3 +4122,137 @@ matches the original four greedy output probes and their common-prefix logprobs.
 Live arena snapshots verify producer NUMA placement; monitoring observes no
 external GPU processes, no P2P/NET/NVLS transports and zero NVLink counter deltas.
 These checks cover the measured contracts, not every possible workload.
+
+
+## Host read completion and placement ablations (2026-10-28)
+
+Four opt-in changes were measured independently, each enabling only its own
+new build option over the direct-slot + packet-pipeline + split-ring preset.
+The other new options remained zero. The eight H20D GPUs, SGLang 0.5.21,
+BF16 Qwen3-30B-A3B-Instruct-2507, TP/DP/EP8, expert/attention backends,
+512-token prompts, 32-token outputs, eager prefill and full decode Graph
+buckets 1/2/4/8 remain as above. Each session has eight warmups and five
+measured batches per load. No NCCL rerun was performed; the archived ten-sample
+mean is reused. Both implementations exclude NVLink and GPU P2P.
+
+Allocated channels remain 32, active model decode dispatch channels two, and
+packet combine four rows on eight channels. Routing is rebuilt from current
+GPU inputs; rank deduplication, weights, necessary synchronization and the
+separate deterministic combine reduction are retained. See
+[implementation options](host-read-progress.md) and the
+[receive ordering argument](host-rx-ordering.md).
+
+### Independent full-model measurements
+
+| Configuration | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| Archived default NCCL | 101.801 | 155.051 | 431.710 | 3557.948 |
+| Fresh previous-publication EP control | 96.599 | 161.367 | 282.541 | 3461.172 |
+| Compact shared route metadata only | 96.796 | 161.713 | 289.444 | 3468.083 |
+| Narrow receive fence scope only | 96.681 | 164.724 | 266.170 | 3650.664 |
+| Read two already-ready tasks together only | 97.218 | 160.868 | 280.482 | 3484.796 |
+| Receiver-owned combine slots only | 96.504 | 161.210 | 296.384 | 3465.584 |
+
+Only the receive-fence change shows a substantial decode improvement in this
+first pass: +2.1% at B1 and +5.5% at B32 over the fresh control. The metadata,
+ready-batch and placement options change B32 TPS by +0.2%, +0.7% and +0.1%;
+they do not establish a consistent model gain and remain off in the selected
+configuration. B32 TTFT has broad within-session variation, so these ablations
+do not establish a new prefill improvement.
+
+The compact format preserves one shared source copy and combines the global
+expert ID and FP32 weight into a 64-bit word; it does not shrink arena
+allocations. Ready batching keeps all 256 payload workers and selects only
+already-ready stages, but the first task's ACK may wait for the second task.
+Receiver-owned combine slots move the existing single host copy to the
+receiver's rank-local arena without adding a CPU relay. Live page snapshots
+verify rank-owner locality. The snapshot tool's historical label is
+`producer_placement`; for receiver-owned combine slots the arena owner is the
+receiver, while dispatch remains producer-owned.
+
+
+The separate B32 diagnostic replay reports median kernel intervals across ranks,
+in milliseconds per complete 48-layer decode forward:
+
+| Configuration | GPU forward | Dispatch transport | Packet transport |
+| --- | ---: | ---: | ---: |
+| Fresh previous-publication control | 9.317 | 2.249 | 1.314 |
+| Compact metadata | 9.296 | 2.221 | 1.315 |
+| Receive fence | 8.814 | 1.840 | 1.237 |
+| Ready payload batch | 9.250 | 2.162 | 1.327 |
+| Receiver-owned combine slots | 9.308 | 2.229 | 1.318 |
+
+Dispatch initialization/finalization remains about 0.118 ms, packet preparation
+0.101 ms, and the HBM reduction 0.136 ms. Fence scope is a measurable cost in
+this synchronous host-read path; removing required ACKs is not necessary to
+obtain the observed improvement. Batching reduces the dispatch interval but
+slightly increases the packet interval. Receiver-local placement does not
+improve packet time on this workload. These traces do not separately measure
+physical PCIe bandwidth, READY waits or credit waits, and do not prove how often
+the two-ready-stage branch is selected. The ready-batch option therefore remains
+an experiment, not a claim of saturated PCIe or generally superior scheduling.
+
+
+### Validation scope
+
+Each option passes focused distributed CUDA checks before its model run: two
+cases per option, plus a small-frame fallback case for receiver-owned slots
+(nine cases total). Coverage includes changing/skewed/empty routes, int32/int64
+IDs, H=2048 vector and H=258 scalar payloads, repeated stage/epoch reuse, Graph
+bucket/channel changes, eager fallback and multiple outstanding handles.
+The selected configuration retains the ordinary metadata control path
+(`DISPATCH_RETIRE=0`). Combining the new options with independent metadata
+retirement or diagnostic-enabled protocol builds is not part of these GPU
+checks. The receive ordering proof records the required preconditions separately.
+
+All independent model sessions pass four exact greedy output probes and match
+their common-prefix logprobs. Source manifests, framework/image/topology,
+prompt hashes, 32 output tokens per timed request, eight warmups and exclusive
+GPU use are checked. Arena snapshots verify physical NUMA placement. Transport
+logs report SHM with no P2P/NET/NVLS, and NVLink counters remain zero. Raw logs,
+private deployment information and credentials are excluded from publication.
+These are bounded validation results, not exhaustive workload coverage.
+
+
+### Final same-source control and repeat
+
+The final control turns all four new options off on the exact publication
+runtime source. Its B32 TPS is within 0.3% of the fresh previous-publication
+control. A second receive-fence session uses the same runtime source and
+configuration as its first session; only those two identical candidate sessions
+are pooled below. Each individual session has five samples per load.
+
+| Configuration | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| Archived default NCCL, ten samples | 101.801 | 155.051 | 431.710 | 3557.948 |
+| Final-source EP, all four options off | 96.408 | 161.370 | 270.115 | 3452.218 |
+| Receive fence, first session | 96.681 | 164.724 | 266.170 | 3650.664 |
+| Receive fence, repeat | 96.914 | 164.495 | 274.252 | 3657.358 |
+| Selected receive fence, ten-sample mean | 96.798 | 164.610 | 270.211 | 3654.011 |
+
+The selected B1/B32 decode means improve by **2.0%/5.8%** over the final-source
+EP control and by **6.2%/2.7%** over archived NCCL. B1/B32 TTFT is 0.4%/0.04%
+higher than the EP control, with overlapping ranges: this change does not
+establish a prefill speedup. TTFT remains 4.9%/37.4% lower than archived NCCL,
+a benefit already present before the receive-fence change.
+
+Across the ten candidate samples, B1 TPS spans 163.93-165.20 (sample standard
+deviation 0.39); B32 spans 3617.95-3685.14 (standard deviation 25.57). B1/B32
+TTFT spans 95.49-97.63 / 248.82-324.94 ms. Final-source control B32 TPS spans
+3406.73-3487.41, and archived NCCL spans 3503.53-3613.55. These are observed
+ranges, not confidence intervals or guarantees on other models/topologies.
+
+Use the [read-progress preset](../adapters/sglang/presets/host_sm_bf16_ep8_graph_read_progress.sh)
+to reproduce the selected configuration. It enables only `RX_FENCE` among the
+four new options; the remaining three are explicitly off. All four still
+default to zero outside this preset. All 56 exported EP/NCCL settings match the
+measured configuration, and all 45 runtime source inputs match the tested
+publication snapshot. No per-token route is cached, no route distribution is
+assumed and no workload-specific output is substituted.
+
+
+The repeat diagnostic confirms the transport improvement on the same source:
+dispatch falls from 2.233 to 1.844 ms and packet transport from 1.326 to
+1.237 ms per 48-layer decode forward. GPU forward falls from 9.311 to
+8.820 ms. Both final sessions pass the same output, source, placement,
+exclusivity and no-P2P/NVLink checks used for the independent ablations.

@@ -9,6 +9,60 @@ struct PacketPipelineStage {
   char* box;
 };
 
+#if EP_XPRESS_READY_BATCH
+// Both descriptors were already READY when the worker leader selected them.
+// Keep the complete payload group and issue loads from both peers before any
+// of their values are consumed. Two loads per descriptor per iteration bound
+// the live value set to the ordinary single-packet unroll's four vectors.
+template <bool Vector>
+__device__ __forceinline__ void packet_receive_ready_pair(
+    TransportArgs a, const PacketPipelineStage& first,
+    const PacketPipelineStage& second, int worker, int tiles) {
+  constexpr int unroll = 2;
+  using Value = typename std::conditional<Vector, uint4, uint32_t>::type;
+  const char* payloads[2] = {first.box + 128, second.box + 128};
+  const unsigned masks[2] = {first.mask, second.mask};
+  const int peers[2] = {first.task / tiles, second.task / tiles};
+  const int token_bases[2] = {(first.task % tiles) * kPacketRows,
+                             (second.task % tiles) * kPacketRows};
+  const int units = a.hidden / (Vector ? 8 : 2);
+  const int64_t total = int64_t(kPacketRows) * units;
+  for (int64_t base = worker; base < total; base += kThreads * unroll) {
+    Value values[2][unroll];
+    bool live[2][unroll];
+#pragma unroll
+    for (int j = 0; j < unroll; ++j) {
+      const int64_t i = base + j * kThreads;
+      const int offset = int(i / units), h = int(i % units);
+#pragma unroll
+      for (int packet = 0; packet < 2; ++packet) {
+        live[packet][j] = i < total && (masks[packet] & (1u << offset));
+        if (live[packet][j]) {
+          const char* source = payloads[packet] + int64_t(offset) * a.hidden * 2;
+          if constexpr (Vector) values[packet][j] = host_load128(source + int64_t(h) * 16);
+          else values[packet][j] = host_load32(source + int64_t(h) * 4);
+        }
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < unroll; ++j) {
+      const int64_t i = base + j * kThreads;
+      const int offset = int(i / units), h = int(i % units);
+#pragma unroll
+      for (int packet = 0; packet < 2; ++packet) {
+        if (live[packet][j]) {
+          const int token = token_bases[packet] + offset;
+          auto* target = a.packet_scratch +
+              (int64_t(peers[packet]) * a.mailbox_tokens + token) * a.hidden;
+          if constexpr (Vector) reinterpret_cast<uint4*>(target)[h] = values[packet][j];
+          else reinterpret_cast<uint32_t*>(target)[h] = values[packet][j];
+        }
+      }
+    }
+  }
+}
+#endif
+
 __device__ void packet_pipeline_transport(TransportArgs a) {
   if (a.device_epoch) a.epoch = *a.device_epoch;
   const int tid = threadIdx.x, lane = tid % 32;
@@ -17,6 +71,9 @@ __device__ void packet_pipeline_transport(TransportArgs a) {
   const int tiles = packet_tiles(a.mailbox_tokens);
   __shared__ PacketPipelineStage stages[2];
   __shared__ int offsets[kMaxRanks + 1], choice;
+#if EP_XPRESS_READY_BATCH
+  __shared__ int second_choice;
+#endif
   if (tid < 2) stages[tid].state = 0;
   if (tid < a.world) offsets[tid + 1] = a.packet_counts[(send ? 0 : a.world) + tid];
   __syncthreads();
@@ -100,12 +157,20 @@ __device__ void packet_pipeline_transport(TransportArgs a) {
     while (true) {
       if (!worker) {
         choice = -1;
+#if EP_XPRESS_READY_BATCH
+        second_choice = -1;
+#endif
         bool done = true;
         for (int i = 0; i < 2; ++i) {
           const int index = (next + i) % 2;
           const uint32_t state = dispatch_stage_load(&stages[index].state);
           done &= state == 3;
-          if (state == 1 && choice < 0) choice = index;
+          if (state == 1) {
+            if (choice < 0) choice = index;
+#if EP_XPRESS_READY_BATCH
+            else if (!send) second_choice = index;
+#endif
+          }
         }
         if (done || read_status(a.status)) choice = -2;
       }
@@ -113,6 +178,9 @@ __device__ void packet_pipeline_transport(TransportArgs a) {
       const int selected = choice;
       if (selected == -2) break;
       if (selected < 0) { dispatch_rx_sync(); __nanosleep(64); continue; }
+#if EP_XPRESS_READY_BATCH
+      const int selected_second = second_choice;
+#endif
       const auto& stage = stages[selected];
       const int peer = stage.task / tiles, tile = stage.task % tiles;
       char* payload = stage.box + 128;
@@ -125,10 +193,25 @@ __device__ void packet_pipeline_transport(TransportArgs a) {
         } else if (host_load64(stage.box + 16) != a.identity || host_load32(stage.box + 24) != stage.mask) {
           fail(a.status, 5);
         }
+#if EP_XPRESS_READY_BATCH
+        if (!send && selected_second >= 0) {
+          const auto& second = stages[selected_second];
+          if (host_load64(second.box + 16) != a.identity || host_load32(second.box + 24) != second.mask)
+            fail(a.status, 5);
+        }
+#endif
       }
       if (!send) {
-        if (vector) packet_receive<true>(a, payload, peer, tile, stage.mask, worker, kThreads);
-        else packet_receive<false>(a, payload, peer, tile, stage.mask, worker, kThreads);
+#if EP_XPRESS_READY_BATCH
+        if (selected_second >= 0) {
+          if (vector) packet_receive_ready_pair<true>(a, stage, stages[selected_second], worker, tiles);
+          else packet_receive_ready_pair<false>(a, stage, stages[selected_second], worker, tiles);
+        } else
+#endif
+        {
+          if (vector) packet_receive<true>(a, payload, peer, tile, stage.mask, worker, kThreads);
+          else packet_receive<false>(a, payload, peer, tile, stage.mask, worker, kThreads);
+        }
       } else {
         const int units = a.hidden / (vector ? 8 : 2);
         for (int64_t i = worker; i < int64_t(kPacketRows) * units; i += kThreads) {
@@ -142,11 +225,23 @@ __device__ void packet_pipeline_transport(TransportArgs a) {
           else host_store32(host + int64_t(h) * 4, reinterpret_cast<const uint32_t*>(source)[h]);
         }
       }
-      __threadfence_system();
+      if (send) __threadfence_system();
+      else host_rx_fence();
       dispatch_rx_sync();
-      if (!worker) dispatch_stage_store(&stages[selected].state, 2);
+      if (!worker) {
+        // Both reads and HBM writes have joined before either descriptor can
+        // be ACKed/reused. No worker refers to a descriptor after this release.
+        dispatch_stage_store(&stages[selected].state, 2);
+#if EP_XPRESS_READY_BATCH
+        if (selected_second >= 0) dispatch_stage_store(&stages[selected_second].state, 2);
+#endif
+      }
       dispatch_rx_sync();
+#if EP_XPRESS_READY_BATCH
+      next = ((selected_second >= 0 ? selected_second : selected) + 1) % 2;
+#else
       next = (selected + 1) % 2;
+#endif
     }
   }
   __syncthreads();

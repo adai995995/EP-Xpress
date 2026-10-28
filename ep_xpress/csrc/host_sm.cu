@@ -251,6 +251,25 @@ constexpr int kPacketTransportThreads = kThreads + (EP_XPRESS_PACKET_PIPELINE ? 
 #define EP_XPRESS_RING_SPLIT 0
 #endif
 static_assert(EP_XPRESS_RING_SPLIT == 0 || EP_XPRESS_RING_SPLIT == 1);
+#ifndef EP_XPRESS_ROUTE_PACKED
+#define EP_XPRESS_ROUTE_PACKED 0
+#endif
+static_assert(EP_XPRESS_ROUTE_PACKED == 0 || EP_XPRESS_ROUTE_PACKED == 1);
+static_assert(!EP_XPRESS_ROUTE_PACKED || EP_XPRESS_DISPATCH_DIRECT);
+#ifndef EP_XPRESS_RX_FENCE
+#define EP_XPRESS_RX_FENCE 0
+#endif
+static_assert(EP_XPRESS_RX_FENCE == 0 || EP_XPRESS_RX_FENCE == 1);
+#ifndef EP_XPRESS_READY_BATCH
+#define EP_XPRESS_READY_BATCH 0
+#endif
+static_assert(EP_XPRESS_READY_BATCH == 0 || EP_XPRESS_READY_BATCH == 1);
+static_assert(!EP_XPRESS_READY_BATCH || (EP_XPRESS_DISPATCH_DIRECT && EP_XPRESS_PACKET_PIPELINE));
+#ifndef EP_XPRESS_PACKET_RECV_LOCAL
+#define EP_XPRESS_PACKET_RECV_LOCAL 0
+#endif
+static_assert(EP_XPRESS_PACKET_RECV_LOCAL == 0 || EP_XPRESS_PACKET_RECV_LOCAL == 1);
+static_assert(!EP_XPRESS_PACKET_RECV_LOCAL || EP_XPRESS_DECODE_PACKET_ROWS > 0);
 #ifndef EP_XPRESS_DISPATCH_DEFER_RECLAIM
 #define EP_XPRESS_DISPATCH_DEFER_RECLAIM 0
 #endif
@@ -498,6 +517,18 @@ __device__ __forceinline__ int32_t read_status(const int32_t* status) {
   // read-modify-write from every persistent CTA. No payload depends on it.
   asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(value) : "l"(status) : "memory");
   return value;
+}
+
+// RX only: synchronous host loads are consumed before the caller's mandatory
+// group join. A CTA release/acquire completion handoff precedes the ACK owner's
+// system release. No other GPU reads the HBM destination, and later kernels are
+// stream ordered. TX host writes must retain their separate system fence.
+__device__ __forceinline__ void host_rx_fence() {
+#if EP_XPRESS_RX_FENCE
+  __threadfence_block();
+#else
+  __threadfence_system();
+#endif
 }
 
 // Per-handle storage, rebuilt by dispatch. Never a context-wide routing cache:
