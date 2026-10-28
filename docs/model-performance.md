@@ -4481,3 +4481,89 @@ or the work required to publish a correct compact layout. The next design
 should reduce that work per ready group while preserving dynamic routes and
 full payload receive width; simply assigning another warp to polling has not
 shown an end-to-end benefit.
+
+## Dispatch descriptor batching experiment, reverted (2026-10-28)
+
+Three temporary schedules were evaluated to reduce the dependency from one
+peer's metadata processing to publication of the next receive descriptor.
+All retained dynamic token routing, rank deduplication, two control warps with
+two stages each, the full 256-thread receive group, and required READY/ACK
+ordering. Host payload capacity and active channel counts were unchanged.
+
+The first schedule selected up to two already-ready peers that fit free stages,
+reserved one compact output range plus independent per-peer owner ranges,
+published both descriptors before metadata processing, and serviced empty
+notifications and completed-stage ACKs across control lanes. It never waited to
+fill a batch. Metadata was processed as one flattened row range. The second
+schedule restored the original single-peer path when only one peer or one free
+stage was available. The final schedule also restored warp-uniform per-peer
+metadata addressing and acknowledged each completed peer before processing the
+next peer's metadata. All three schedules were subsequently removed.
+
+### Full-model comparison
+
+The workload remains Qwen3-30B-A3B BF16, SGLang v0.5.21, the same eight GPUs and
+TP/DP/EP=8, 512 input tokens and 32 output tokens, decode Graph buckets
+1/2/4/8, eight warmup batches, and five measured batches per concurrency in
+each EP session. The archived default-NCCL baseline has ten observations per
+concurrency and was not rerun. NVLink and GPU P2P payload paths are disabled.
+Values below are arithmetic means; Decode TPS uses the same steady-state
+metric as the preceding comparisons.
+
+| Configuration | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| Archived default NCCL | 101.801 | 155.051 | 431.710 | 3557.948 |
+| Previous EP path, fresh control | 96.555 | 164.438 | 288.264 | 3664.559 |
+| Initial descriptor batch | 96.747 | 163.597 | 256.268 | 3645.201 |
+| Batch with single-peer fast path | 97.490 | 162.817 | 273.205 | 3645.622 |
+| Final per-peer metadata and immediate ACK | 97.124 | 163.104 | 298.720 | 3663.673 |
+
+The final candidate decreases B1 TPS by 0.81%; B32 is effectively unchanged
+(-0.02%). Its B1 TPS range is 162.60-163.59 (standard deviation 0.42), versus
+163.60-165.38 (0.71) for the fresh control. At B32 the ranges are
+3641.41-3688.48 (18.93) and 3635.70-3686.31 (22.21), respectively. No throughput
+gain is established. Final B1/B32 TTFT ranges are 95.37-98.50 / 278.29-325.55 ms;
+control ranges are 95.39-97.53 / 250.88-325.74 ms. The prefill path is unchanged,
+and these observations do not establish a TTFT benefit either.
+
+Separate B32 model traces report median per-rank times across the 48-layer
+forward step. These are diagnostic observations, not additional throughput
+samples or a cross-device clock comparison:
+
+| Schedule | Dispatch transport (ms) | Packet combine transport (ms) | Forward window (ms) |
+| --- | ---: | ---: | ---: |
+| Previous EP control | 1.823 | 1.248 | 8.807 |
+| Initial descriptor batch | 1.825 | 1.293 | 8.819 |
+| Single-peer fast path | 1.836 | 1.283 | 8.829 |
+| Final per-peer metadata | 1.836 | 1.277 | 8.820 |
+
+Early publication removes a real source-code ordering edge, but none of these
+schedules reduced measured dispatch time on this workload. The experiment does
+not isolate the contribution of additional control instructions, the frequency
+of ready pairs, or upstream rank arrival. The earlier shared-stage wait counter
+must not be treated as entirely removable scheduling overhead. Before adding
+more batching, measure how often observed-ready work is actually delayed by
+local preparation and how often two free stages have two ready peers.
+
+### Validation and rollback
+
+Each candidate passed two focused eight-rank dynamic-route checks: int32 IDs
+with hidden width 2048 and int64 IDs with width 258. They exercise changing
+routes and weights, empty/skewed ranks, same-rank expert deduplication,
+multiple peers, stage reuse, Graph replay and eager fallback. Every completed
+model session passed four exact greedy output comparisons with zero
+common-prefix logprob difference, matching prompt hashes and output lengths,
+source/image/model/topology verification, producer-NUMA placement, and sampled
+GPU exclusivity. Transport records show SHM without P2P/NET/NVLS and zero
+available NVLink counter deltas.
+
+An earlier control attempt was stopped by the exclusivity monitor when another
+GPU workload appeared. A subsequent attempt waited on that interrupted build's
+stale extension lock. Neither produced a valid performance sample; both are
+excluded. The completed fresh control rebuilt the extension successfully.
+
+All experimental implementation changes, build options and presets were
+reverted, including the default-off switch. The retained runtime remains the
+preceding implementation; only this result record is published. Its existing
+advantage over archived NCCL must not be attributed to this unsuccessful batch
+experiment.
