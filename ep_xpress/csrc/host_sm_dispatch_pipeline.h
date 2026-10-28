@@ -432,6 +432,13 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
       // Each lane owns one incoming peer; no cross-group claims or host atomics.
       const int peer = group + lane * kDispatchControlWarps;
       bool pending = peer < a.world && peer != a.rank;
+#if EP_XPRESS_READY_CACHE
+      // The acquired generation stays immutable until this receiver ACKs it.
+      // Keep observations for unselected peers only within this invocation;
+      // neither a graph replay nor a later route reuses these registers.
+      uint64_t cached_ready = 0;
+      bool known_ready = false;
+#endif
       uint32_t iteration = 0;
       while (true) {
         if (__any_sync(0xffffffffu, read_status(a.status) != 0)) break;
@@ -465,12 +472,29 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
           auto& stage = stages[free_stage];
           mark(dc + DCReady, lane == 0);
           uint64_t ready = 0;
+#if EP_XPRESS_READY_CACHE
+          // Do not make cached work wait for an unrelated host read. This
+          // ballot gives the whole warp the same decision: drain an already
+          // acquired task first, or poll the still-unknown peers together.
+          uint32_t available = __ballot_sync(0xffffffffu, pending && known_ready);
+          if (!available) {
+            if (pending) {
+              char* source = dispatch_pipeline_slot(a, peer, channel);
+              cached_ready = acquire(reinterpret_cast<uint64_t*>(dispatch_index(a, source, a.rank)));
+              known_ready = (cached_ready >> 32) == a.epoch &&
+                  (EP_XPRESS_DISPATCH_DIRECT || uint32_t(cached_ready) != 0);
+            }
+            available = __ballot_sync(0xffffffffu, pending && known_ready);
+          }
+          ready = cached_ready;
+#else
           if (pending) {
             char* source = dispatch_pipeline_slot(a, peer, channel);
             ready = acquire(reinterpret_cast<uint64_t*>(dispatch_index(a, source, a.rank)));
           }
           const uint32_t available = __ballot_sync(0xffffffffu,
               pending && (ready >> 32) == a.epoch && (EP_XPRESS_DISPATCH_DIRECT || uint32_t(ready) != 0));
+#endif
           if constexpr (Profile) { if (!lane && diag.sample >= 0) {
             ++diag.values[dc + DCPolls];
             diag.values[dc + DCMissing] += available == 0;
@@ -503,6 +527,9 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
               __syncwarp();
               if (lane < count) token = channel + stage.wires[lane] * a.channels;
 #else
+              // Bridge the selected lane's READY acquire to all descriptor
+              // readers. The DIRECT path already joins while building wires.
+              __syncwarp();
               if (lane < count) {
 #if EP_XPRESS_DECODE_CONTROL_RECORDS
                 const uint64_t descriptor = host_load64(dispatch_record(a, source, a.rank, lane));
@@ -689,6 +716,14 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
         diag.values[DRx + DRBegin] = diag_mark - diag.values[DBegin];
       }}
       while (true) {
+#if EP_XPRESS_RX_POLL_WARP
+        // Park the other payload warps at the handoff below. The complete
+        // first warp polls together, so no lanes wait at a group barrier while
+        // other lanes of that same warp must make progress in this loop.
+        if (rx < 32) {
+          int observed;
+          do {
+#endif
         if (!rx) {
           rx_choice = -1;
 #if EP_XPRESS_READY_BATCH
@@ -708,12 +743,25 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
           }
           if (done || read_status(a.status)) rx_choice = -2;
         }
+#if EP_XPRESS_RX_POLL_WARP
+            observed = __shfl_sync(0xffffffffu, !rx ? rx_choice : -1, 0);
+            if (observed == -1) {
+              if constexpr (Profile) { if (!rx && diag.sample >= 0) {
+                const bool draining = dispatch_stage_load(&diag.receive_done[0]) && dispatch_stage_load(&diag.receive_done[1]);
+                mark(DRx + (draining ? DRDrainWait : DRStageWait), true);
+              }}
+              __nanosleep(64);
+            }
+          } while (observed == -1);
+        }
+#endif
         dispatch_rx_sync();
         const int choice = rx_choice;
 #if EP_XPRESS_READY_BATCH
         const int second = rx_second;
 #endif
         if (choice == -2) break;
+#if !EP_XPRESS_RX_POLL_WARP
         if (choice < 0) {
           if constexpr (Profile) { if (!rx && diag.sample >= 0) {
             const bool draining = dispatch_stage_load(&diag.receive_done[0]) && dispatch_stage_load(&diag.receive_done[1]);
@@ -721,6 +769,7 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
           }}
           dispatch_rx_sync(); __nanosleep(64); continue;
         }
+#endif
         mark(DRx + DRPayload, rx == 0);
         const auto& stage = stages[choice];
         char* source = dispatch_pipeline_slot(a, stage.peer, channel);

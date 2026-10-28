@@ -90,6 +90,12 @@ __device__ void packet_pipeline_transport(TransportArgs a) {
     char* box = nullptr;
     uint64_t previous = 0;
     uint32_t iteration = 0;
+#if EP_XPRESS_PACKET_READY_CACHE
+    // This lane owns one task in the current batch. A successful observation
+    // remains valid until that task is consumed: RX has not ACKed the slot,
+    // and TX has not yet reused its credited generation.
+    bool known_ready = false;
+#endif
     while (true) {
       int free_stage = -1;
       bool occupied = false;
@@ -113,6 +119,10 @@ __device__ void packet_pipeline_transport(TransportArgs a) {
       if (!pending && channel + base * a.channels < tasks) {
         const int ordinal = channel + (base + lane) * a.channels;
         mask = 0;
+#if EP_XPRESS_PACKET_READY_CACHE
+        // Never carry a READY/credit observation into a different task.
+        known_ready = false;
+#endif
         if (ordinal < tasks) {
           int peer = 0;
           while (peer + 1 < a.world && ordinal >= offsets[peer + 1]) ++peer;
@@ -128,16 +138,35 @@ __device__ void packet_pipeline_transport(TransportArgs a) {
       error = __shfl_sync(0xffffffffu, error, 0);
       if (error || (!pending && !occupied && channel + base * a.channels >= tasks)) break;
       if (pending && free_stage >= 0) {
+#if EP_XPRESS_PACKET_READY_CACHE
+        // Consume known-ready work before issuing another lane's host load.
+        // Otherwise the following ballot would still wait for unknown peers'
+        // PCIe reads even though a cached task can already fill this stage.
+        unsigned ready = __ballot_sync(0xffffffffu,
+            (pending & (1u << lane)) && known_ready);
+        if (!ready) {
+          if (pending & (1u << lane))
+            known_ready = send ? (!previous || acquire(control(box, 1)) == previous)
+                               : acquire(control(box, 0)) == a.epoch;
+          ready = __ballot_sync(0xffffffffu,
+              (pending & (1u << lane)) && known_ready);
+        }
+#else
         bool available = false;
-        if (pending & (1u << lane))
+        if (pending & (1u << lane)) {
           available = send ? (!previous || acquire(control(box, 1)) == previous)
                            : acquire(control(box, 0)) == a.epoch;
+        }
         const unsigned ready = __ballot_sync(0xffffffffu, available);
+#endif
         if (ready) {
           const int selected = __ffs(ready) - 1;
           const int selected_task = __shfl_sync(0xffffffffu, task, selected);
           const unsigned selected_mask = __shfl_sync(0xffffffffu, mask, selected);
           const uint64_t selected_box = __shfl_sync(0xffffffffu, uint64_t(box), selected);
+          // READY/credit may have been acquired by another lane. Register
+          // shuffles do not order memory: bridge it to the stage publisher.
+          __syncwarp();
           if (!lane) {
             auto& stage = stages[free_stage];
             stage.task = selected_task;
@@ -155,6 +184,14 @@ __device__ void packet_pipeline_transport(TransportArgs a) {
     const int worker = tid - 32;
     int next = 0;
     while (true) {
+#if EP_XPRESS_RX_POLL_WARP
+      // Only the first complete RX worker warp retries an empty shared-stage
+      // scan. The other seven warps wait at the one handoff barrier below.
+      // TX retains its one-scan-per-worker-iteration behavior.
+      if (send || worker < 32) {
+        int polled_choice = -1;
+        do {
+#endif
       if (!worker) {
         choice = -1;
 #if EP_XPRESS_READY_BATCH
@@ -174,6 +211,13 @@ __device__ void packet_pipeline_transport(TransportArgs a) {
         }
         if (done || read_status(a.status)) choice = -2;
       }
+#if EP_XPRESS_RX_POLL_WARP
+          if (send) break;
+          polled_choice = __shfl_sync(0xffffffffu, !worker ? choice : -1, 0);
+          if (polled_choice == -1) __nanosleep(64);
+        } while (polled_choice == -1);
+      }
+#endif
       dispatch_rx_sync();
       const int selected = choice;
       if (selected == -2) break;

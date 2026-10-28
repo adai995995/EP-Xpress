@@ -6,3 +6,7 @@ export EP_XPRESS_RX_FENCE=1
 export EP_XPRESS_ROUTE_PACKED=0
 export EP_XPRESS_READY_BATCH=0
 export EP_XPRESS_PACKET_RECV_LOCAL=0
+# READY scheduling experiments are opt-in and leave this preset unchanged.
+export EP_XPRESS_READY_CACHE=0
+export EP_XPRESS_PACKET_READY_CACHE=0
+export EP_XPRESS_RX_POLL_WARP=0

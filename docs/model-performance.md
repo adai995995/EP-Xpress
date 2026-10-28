@@ -4256,3 +4256,228 @@ dispatch falls from 2.233 to 1.844 ms and packet transport from 1.326 to
 1.237 ms per 48-layer decode forward. GPU forward falls from 9.311 to
 8.820 ms. Both final sessions pass the same output, source, placement,
 exclusivity and no-P2P/NVLink checks used for the independent ablations.
+
+
+## Readiness caching and idle receive polling (2026-10-28)
+
+This experiment retains the selected receive-fence configuration and the same
+hardware, model, software and workload described above. Both new options default
+to zero. Eight warmups precede five timed batches per load in each session.
+NCCL is not rerun: the same archived ten-sample baseline is reused. Both paths
+exclude NVLink and GPU P2P. The complete 256-thread receive group, per-token
+routing, rank deduplication and necessary ACKs remain intact.
+
+### Independent measurements
+
+| Configuration | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| Archived default NCCL | 101.801 | 155.051 | 431.710 | 3557.948 |
+| Fresh previous-publication EP control | 97.079 | 164.956 | 271.325 | 3660.338 |
+| Observation caching, first implementation | 96.746 | 163.738 | 265.724 | 3698.883 |
+| Receive polling warp only | 96.818 | 165.194 | 273.788 | 3660.120 |
+| First cache implementation + receive polling warp | 98.457 | 164.101 | 284.472 | 3695.915 |
+| Same-source EP control, both new options off | 96.418 | 164.900 | 305.510 | 3671.399 |
+
+The first cache implementation retains confirmed READY/credit observations but
+still polls unconfirmed peers before selecting a task. Its B32 TPS rises 1.1%
+against the fresh previous-publication control while B1 falls 0.7%. Receive-warp
+polling alone is essentially unchanged at B32. Combining them does not establish
+an additional benefit. These small differences are not a general throughput
+claim; the same-source control itself changes B32 TPS by +0.3%. B32 TTFT varies
+substantially between batches and sessions.
+
+The separate uninstrumented B32 trace reports dispatch/packet transport intervals
+of 1.828/1.233 ms for the fresh control, 1.743/1.240 ms for observation caching,
+and 1.840/1.221 ms for receive-warp polling, per 48-layer decode forward.
+The polling change shifts small costs between transports without reducing the
+model's critical path materially.
+
+### Fine dispatch diagnosis
+
+A separate off/on/on/off capture measures the existing dispatch role counters.
+It is not pooled with production timing. The baseline capture contains 49,152
+CTA samples covering 12,288 rank-local operations, with all eight ranks,
+complete split TX/RX groups, zero error status and no dropped samples. Each
+role's phase partition is checked independently.
+
+For B32, the rank-local CTA window averages 49.70 microseconds; the last CTA is
+always an RX CTA. Its payload leader reports:
+
+| RX leader interval | Microseconds |
+| --- | ---: |
+| Wait for a shared stage | 34.47 |
+| Read and place payload | 9.73 |
+| Completion synchronization | 1.08 |
+| Final ACK-drain wait | 3.86 |
+
+The two concurrent control warps each spend about 16.5 microseconds in the
+READY-poll interval, 6.6-6.8 in descriptor/allocation work, 4.5-4.8 in metadata,
+5.8-6.2 in metadata commit, 4.5-4.8 in ACK publication and 3.7-4.0 in drain.
+These control timelines overlap one another and the payload leader: **do not
+sum them**. The first stage appears at about 16.2 microseconds, with receive
+completion around 40 microseconds. The long stage wait therefore includes the
+continuing control/receive pipeline as well as initial remote readiness.
+
+At B1, rank zero is explicitly the token source for this diagnostic capture.
+Other ranks average a 43.84-microsecond local window; their last RX CTA spends
+39.92 microseconds waiting for a stage and 1.10 reading payload. Empty
+notifications and rank arrival skew matter here. The profile does not identify
+all that waiting as physical PCIe latency or as an avoidable barrier.
+
+Instrumentation increases TPOT by 3.1% at B1 and 6.3% at B32. These are diagnostic
+instruction intervals, not unperturbed PCIe transfer time, and the clocks are
+compared only within a rank. Together with the full-model polling ablation,
+they prioritize control task supply over simply increasing payload CTA count.
+
+### Ready-first scheduling
+
+Code inspection identified an additional dependency in the first cache version:
+a lane with a confirmed READY still waits for unknown lanes' host acquisitions
+before the warp can select it. The final cache implementation first ballots its
+confirmed pending set. If nonempty it consumes that set without new host reads;
+only an empty set triggers polling. Each task is consumed once, so the finite
+cache cannot indefinitely postpone unknown peers. This applies to packet READY
+and previous-generation TX credit as well as dispatch notifications. See the
+[lifetime and synchronization argument](control-progress.md).
+
+
+The synchronization review also found an existing missing memory-ordering bridge
+between the packet lane that acquires READY/credit and lane zero that publishes
+the shared stage. The final source adds a control-warp join before publication,
+including when the performance options are disabled. Non-direct indexed dispatch
+likewise joins before other lanes read host descriptors; direct slots already
+have the needed join. Final candidate and control measurements use this same
+corrected source. The earlier cache-first prototype without this correction is
+not used as the final performance or correctness result.
+
+The final wide-vector eight-rank check exercises changing, skewed and empty
+routes, CUDA Graph bucket/channel changes, multiple outstanding handles and
+more than 32 packet tasks per CTA. It passes with ready-first caching enabled.
+Earlier independent checks cover the observation cache and polling options with
+H=2048/int32 and H=258/int64, including multi-batch task reuse. Optional
+non-direct dispatch, independent metadata retirement and two-ready-payload
+batching are code-reviewed combinations, not claims of final GPU coverage.
+
+The publication runtime is checked against all 45 inputs of its measured
+snapshot; unrelated local latency-instrumentation development is excluded.
+The opt-in [control-progress preset](../adapters/sglang/presets/host_sm_bf16_ep8_graph_control_progress.sh)
+sets dispatch READY caching on, packet caching off and receive-warp polling
+off. Its exported EP/NCCL settings are checked against the isolated candidate
+below. The existing read-progress preset explicitly leaves all new options off. Neither preset caches a previous
+invocation's routes or substitutes workload-specific outputs.
+
+
+### Coupled cache results and repeat
+
+Only the two identical ready-first candidate sessions are pooled. The final
+control includes the required warp handoff fix and disables both new options.
+
+| Configuration | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| Archived default NCCL, ten samples | 101.801 | 155.051 | 431.710 | 3557.948 |
+| Final-source EP, new options off, five samples | 97.356 | 164.839 | 307.801 | 3667.622 |
+| Ready-first cache, first session | 97.367 | 163.375 | 291.768 | 3702.625 |
+| Ready-first cache, repeat | 96.157 | 163.527 | 264.457 | 3689.694 |
+| Ready-first cache, ten-sample mean | 96.762 | 163.451 | 278.113 | 3696.160 |
+
+The candidate B32 TPS mean is **0.8% higher** than the same-source EP control,
+while B1 is **0.8% lower**. The B32 sample ranges overlap: this is a small observed
+workload tradeoff, not evidence of a broadly superior default. Both new options
+therefore remain **off in the existing read-progress preset**; the separate
+control-progress preset remains explicitly opt-in. The final isolated preset
+uses dispatch caching only, as detailed below. Receive-warp polling does not
+establish a model gain and remains off in both presets.
+
+Relative to archived NCCL, the candidate B1/B32 decode means are 5.4%/3.9%
+higher, with TTFT means 5.0%/35.6% lower. Most of that advantage predates this
+change. The final control's B32 TTFT is unusually high compared with the fresh
+previous-publication control (271.325 ms), and candidate TTFT changes from
+291.768 to 264.457 ms between identical sessions. This experiment does **not**
+establish an additional prefill improvement.
+
+Across the ten candidate samples, B1 TPS spans 162.94-164.17 (sample standard
+deviation 0.46) and B32 spans 3647.14-3748.31 (standard deviation 28.07).
+B1/B32 TTFT spans 95.32-98.30 / 250.30-318.84 ms. Final-source control B32 TPS
+spans 3632.91-3701.44. These are observed ranges, not confidence intervals.
+
+The separate traces with native role counters disabled show dispatch transport
+falling from 1.852 ms to 1.734/1.740 ms per 48-layer B32 forward. Packet transport
+rises from 1.237 to 1.269/1.279 ms, while GPU forward falls from 8.822 to
+8.718/8.725 ms. Dispatch improves modestly, part of the saving is offset in
+packet combine, and the overall result agrees with the small end-to-end gain.
+Packet preparation and reduction remain about 0.101 and 0.137 ms.
+
+The final fine capture passes the same complete eight-rank, 49,152-sample
+validation as the baseline. Its B32 last RX leader reports stage wait 23.60,
+payload 9.66, completion 1.06 and ACK-drain wait 3.35 microseconds. The rank-local
+window falls from 49.70 to 38.24 microseconds, but this **is not a production
+23% speedup**: baseline native instrumentation adds 0.592 ms to TPOT, while the
+final capture changes it by -0.037 ms (consistent with noise). The change in
+instrumentation perturbation is comparable to the apparent phase-window saving
+across 48 layers. Individual phases must not be assigned an uninstrumented
+causal saving from these counters alone.
+
+All final model sessions pass the original four exact greedy output probes,
+with identical common-prefix logprobs. They verify the expected prompt hashes,
+32 output tokens, source manifests, model/framework/image/topology, NUMA page
+placement and sampled GPU exclusivity. SHM transport is observed with no
+P2P/NET/NVLS and zero NVLink counter deltas. No new NCCL measurement is included.
+
+
+### Isolate dispatch scheduling from packet scheduling
+
+The coupled cache saves about 0.115 ms in dispatch but adds about 0.037 ms in
+packet transport, offsetting roughly one third of the dispatch saving in the
+separate B32 traces. That comparison alone does not identify whether the packet
+increase comes from packet scheduling or changed arrival times upstream.
+The publication therefore provides independent build options:
+`READY_CACHE` controls dispatch, and `PACKET_READY_CACHE` controls packet READY
+and previous-bank TX credit. Both default to zero; reproducing the coupled
+candidate now requires setting both to one.
+
+This split changes only compile-time selection. Preprocessed dispatch/packet
+bodies for new 0/0 and 1/1 configurations match the preceding uncached/coupled
+paths; 1/0 uses the already validated dispatch cache with the unchanged uncached
+packet path. All required warp handoffs and ACKs remain. No additional broad
+functional suite is run for this configuration-only isolation.
+
+
+| Publication source configuration | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| All new scheduling options off | 96.778 | 165.035 | 276.602 | 3660.431 |
+| Dispatch cache only | 97.057 | 163.658 | 299.753 | 3697.432 |
+
+Each row has five measured batches per load. Dispatch-only raises B32 TPS by
+1.0% and lowers B1 TPS by 0.8% against its exact-source control. Its B32 TPS
+range is 3647.03-3740.78 (sample standard deviation 38.85), overlapping the
+control's 3631.09-3697.50 (standard deviation 26.40). Candidate B1 TPS spans
+162.91-164.06 (standard deviation 0.44). B32 TTFT spans 252.60-340.89 ms for
+the candidate and 250.67-304.98 ms for the control. No prefill gain is established.
+The dispatch-only session is not pooled with the differently configured
+coupled-cache sessions above, and no new repeat is presented as stronger
+statistical evidence for this last isolation.
+
+Dispatch-only does not materially outperform the coupled candidate or resolve
+its B1 tradeoff. Its separate B32 trace records dispatch 1.745 ms, packet
+transport 1.258 ms and forward 8.721 ms. Restoring packet's uncached scheduling
+does not fully restore the earlier packet interval; the increase cannot be
+assigned entirely to packet READY caching. Arrival timing, compiler layout and
+ordinary measurement variation remain possible contributors.
+
+The final opt-in preset enables **dispatch caching only** and matches all 59
+exported EP/NCCL settings of this measured configuration. The existing
+read-progress preset and all native defaults leave **dispatch cache, packet
+cache and receive-warp polling off**. This preserves the previous selection
+while keeping the measured experiments independently reproducible. The
+necessary acquire-to-publisher synchronization fix is always retained.
+Both publication-source model sessions pass the same exact output, source,
+placement, transport and exclusivity checks described above.
+
+The remaining evidence favors reducing descriptor/metadata preparation and
+host-visible control transactions on the receive critical path. More payload
+CTAs or deleting ACKs is not supported by these measurements. Confirmed READY
+caching removes one real dependency but cannot eliminate initial remote arrival
+or the work required to publish a correct compact layout. The next design
+should reduce that work per ready group while preserving dynamic routes and
+full payload receive width; simply assigning another warp to polling has not
+shown an end-to-end benefit.

@@ -112,7 +112,8 @@ def load(*, verbose: bool = False):
         if ring_split not in {"0", "1"}:
             raise ValueError("EP_XPRESS_RING_SPLIT must be 0 or 1")
         host_options = {}
-        for option in ("ROUTE_PACKED", "RX_FENCE", "READY_BATCH", "PACKET_RECV_LOCAL"):
+        for option in ("ROUTE_PACKED", "RX_FENCE", "READY_BATCH", "PACKET_RECV_LOCAL",
+                       "READY_CACHE", "PACKET_READY_CACHE", "RX_POLL_WARP"):
             key = "EP_XPRESS_" + option
             value = os.environ.get(key, "0")
             if value not in {"0", "1"}:
