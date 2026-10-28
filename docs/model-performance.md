@@ -3983,3 +3983,142 @@ original on four short greedy output probes and their common-prefix logprobs.
 These are bounded correctness checks, not exhaustive workload or fault-tolerance
 coverage. The runtime source manifest is verified before each model launch;
 raw traces and deployment details remain outside the public repository.
+
+## Direct dispatch slots and independent progress (2026-10-28)
+
+This follows the small-decode experiment above, on the same eight H20D GPUs,
+SGLang 0.5.21, BF16 Qwen3-30B-A3B-Instruct-2507, TP/DP/EP8, Triton experts
+and FlashInfer. Prompts contain 512 tokens and outputs contain 32 tokens.
+Prefill is eager; decode uses full CUDA Graph buckets 1/2/4/8. There are eight
+warmup batches and five measured batches per load and session. Producer NUMA
+placement, exclusive GPU use, prompt hashes, output lengths and source manifests
+are verified. Both comparisons exclude P2P/NVLink; the archived ten-sample NCCL
+mean is reused. No new NCCL benchmark was run.
+
+The allocated channel count remains 32, active model decode dispatch channels
+remain two, and combine retains four-row packets on eight channels. Precision,
+rank deduplication, per-invocation routing, ACK protection and the separate
+rank-ordered HBM reduction are unchanged. See
+[the protocol notes](host-address-pipeline.md) for the four opt-in build options.
+
+### Sequential ablations
+
+| Configuration | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| Archived default NCCL, ten samples | 101.801 | 155.051 | 431.710 | 3557.948 |
+| Previous small-decode EP, ten samples | 99.035 | 161.107 | 269.852 | 3366.264 |
+| Direct dispatch slots | 97.113 | 162.273 | 294.995 | 3420.192 |
+| Direct slots + independent metadata/ACK warps | 97.580 | 160.593 | 294.887 | 3401.959 |
+| Direct slots + packet pipeline | 96.223 | 161.711 | 306.417 | 3471.698 |
+| Direct slots + packet pipeline + split generic dispatch | 98.410 | 162.346 | 291.759 | 3463.138 |
+
+The independent metadata/ACK experiment is not selected: extra roles preserved
+the full payload group but did not improve this model's decode throughput.
+The packet pipeline overlaps preparation and commit with one 256-thread payload
+group. It improves the B32 mean by 1.5% over direct slots alone in these sessions.
+Generic TX/RX splitting has no clear incremental model benefit here. B32 TTFT
+varies substantially with scheduling; these means do not establish a prefill
+improvement from either new pipeline. Ablation sessions are not pooled as if
+they were repeated measurements of one identical executable.
+
+Separate B32 diagnostic replays report the following medians across ranks,
+in milliseconds per complete 48-layer decode forward:
+
+| Configuration | GPU forward | Dispatch transport | Packet transport | Packet prepare | HBM reduction |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Previous small-decode EP | 9.547 | 2.360 | 1.428 | 0.101 | 0.137 |
+| Direct slots | 9.424 | 2.240 | 1.423 | 0.101 | 0.137 |
+| Direct slots + independent metadata/ACK | 9.483 | 2.278 | 1.458 | 0.101 | 0.137 |
+| Direct slots + packet pipeline | 9.306 | 2.241 | 1.331 | 0.101 | 0.136 |
+| Direct slots + packet pipeline + split generic dispatch | 9.308 | 2.230 | 1.315 | 0.101 | 0.136 |
+
+Dispatch initialization/finalization remains approximately 0.118 ms. These are
+kernel intervals from diagnostic runs, not physical bandwidth or the timed
+HTTP request metrics. They support improvements from removing dependent host
+descriptor reads and overlapping packet control with payload, but do not
+separate the remaining PCIe read latency, READY wait and credit wait.
+
+### Current communication-only sweep
+
+The final source also passes the same seven-shape communication benchmark:
+eight ranks, BF16 H=2048, top-k 8, 128 experts, eight active dispatch channels,
+eight warmups and twenty measured samples with eight changing route patterns.
+Routes include rank duplication, hotspots and padding. Producer NUMA placement
+is verified. Values are medians of the maximum rank duration for each sample;
+they are neither model latency nor physical PCIe bandwidth.
+
+Here "control" is the previous small-decode configuration, with all four new
+options disabled, on the current source. "Candidate" enables direct slots,
+packet pipelining and split generic dispatch; independent metadata/ACK is off.
+This differs from the earlier sweep's older control. Model dispatch uses two
+active decode channels, whereas this sweep uses eight throughout.
+
+| Tokens/rank | Control dispatch (us) | Candidate dispatch (us) | Control combine (us) | Candidate combine (us) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 54.14 | 49.79 | 36.66 | 37.79 |
+| 4 | 60.50 | 58.34 | 40.29 | 39.54 |
+| 16 | 69.73 | 65.34 | 77.60 | 60.16 |
+| 64 | 140.16 | 106.58 | 236.22 | 148.96 |
+| 256 | 477.98 | 322.40 | 952.99 | 567.23 |
+| 1024 | 1088.29 | 1088.67 | 1154.45 | 1172.91 |
+| 4096 | 3993.01 | 3270.70 | 4449.86 | 4474.98 |
+
+At 64/256 tokens, bounded dispatch falls by 24.0%/32.5% and combine by
+36.9%/40.5%. The 4096-token generic dispatch falls by 18.1%; the 1024-token
+case is unchanged. Generic combine is unchanged by these options and varies
+by 0.6%-1.6%. The one-token combine median increases by 3.1%. These results
+support retaining split generic dispatch as an opt-in option for large
+transfers, but do not establish a model TTFT gain. Improvements over the
+previous small-decode candidate also do not imply all shapes beat every
+older transport configuration or NCCL.
+
+### Final publication-source verification
+
+A fresh control and final candidate were measured using exactly the runtime
+source prepared for publication. The source manifest verifies all 45 inputs;
+unrelated local development changes are excluded. Each row below is the mean
+of five measured batches per load, except the archived ten-sample NCCL row.
+
+| Configuration | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| Archived default NCCL | 101.801 | 155.051 | 431.710 | 3557.948 |
+| Same-day previous EP configuration | 96.742 | 160.820 | 291.224 | 3372.967 |
+| Final direct slots + packet pipeline + split generic dispatch | 97.145 | 161.556 | 297.836 | 3469.614 |
+
+The final B32 TPS mean improves by **2.9%** over the same-day control and
+remains **2.5% below NCCL**. B1 changes by only +0.5%; its sample ranges overlap.
+The same-day control agrees with the previous archived EP TPS mean to within
+0.2% at B32. B32 TTFT is 2.3% higher than the same-day control; both sessions
+have broad overlapping TTFT ranges, so a TTFT improvement is not established.
+Compared with archived NCCL, final B1/B32 TTFT is 4.6%/31.0% lower and B1 TPS
+is 4.2% higher. The measured small-decode workload is not evidence of a general
+twofold throughput gain.
+
+The final diagnostic replay reduces dispatch transport from 2.374 to 2.237 ms
+and packet transport from 1.429 to 1.317 ms per 48-layer decode forward; GPU
+forward falls from 9.567 to 9.304 ms. Dispatch is still the larger communication
+interval. The shape sweep's larger percentage gains should not be substituted
+for this full-model improvement.
+
+Final B1 TPS spans 160.66-161.93 (sample standard deviation 0.51), and B32
+spans 3456.07-3489.02 (standard deviation 13.84). Same-day control B32 spans
+3350.25-3388.30 (standard deviation 18.88); archived NCCL spans 3503.53-3613.55.
+Final B1/B32 TTFT spans 96.01-98.36 / 278.89-327.63 ms. These are observed
+ranges, not confidence intervals.
+
+The [direct-slot preset](../adapters/sglang/presets/host_sm_bf16_ep8_graph_direct.sh)
+reproduces this opt-in configuration. All 52 exported EP/NCCL settings were
+checked against the measured configuration. Independent metadata/ACK remains
+off, and all four new options default to zero outside the preset. No routing
+pattern is cached or inferred from benchmark outputs. The bounded direct-slot
+path supports up to 32 source slots per active channel; larger work retains
+the generic ring. A general channel/path policy is still separate work.
+
+Focused eight-rank CUDA checks passed for dynamic/skewed/empty routes,
+int32/int64 expert IDs, H=2048 vector and H=258 scalar payloads, Graph bucket
+changes, eager fallback, multiple outstanding handles and small-ring wraparound.
+Both final seven-shape sweeps pass numerical validation. Every model variant
+matches the original four greedy output probes and their common-prefix logprobs.
+Live arena snapshots verify producer NUMA placement; monitoring observes no
+external GPU processes, no P2P/NET/NVLS transports and zero NVLink counter deltas.
+These checks cover the measured contracts, not every possible workload.

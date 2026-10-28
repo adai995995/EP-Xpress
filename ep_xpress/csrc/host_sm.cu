@@ -230,6 +230,27 @@ static_assert(EP_XPRESS_HOST_READ64 == 0 || EP_XPRESS_HOST_READ64 == 1);
 #ifndef EP_XPRESS_DISPATCH_SPLIT
 #define EP_XPRESS_DISPATCH_SPLIT 0
 #endif
+#ifndef EP_XPRESS_DISPATCH_DIRECT
+#define EP_XPRESS_DISPATCH_DIRECT 0
+#endif
+static_assert(EP_XPRESS_DISPATCH_DIRECT == 0 || EP_XPRESS_DISPATCH_DIRECT == 1);
+static_assert(!EP_XPRESS_DISPATCH_DIRECT ||
+              (EP_XPRESS_DECODE_DISPATCH_PIPELINE && !EP_XPRESS_DECODE_CONTROL_RECORDS));
+#ifndef EP_XPRESS_DISPATCH_RETIRE
+#define EP_XPRESS_DISPATCH_RETIRE 0
+#endif
+static_assert(EP_XPRESS_DISPATCH_RETIRE == 0 || EP_XPRESS_DISPATCH_RETIRE == 1);
+static_assert(!EP_XPRESS_DISPATCH_RETIRE || EP_XPRESS_DISPATCH_DIRECT);
+#ifndef EP_XPRESS_PACKET_PIPELINE
+#define EP_XPRESS_PACKET_PIPELINE 0
+#endif
+static_assert(EP_XPRESS_PACKET_PIPELINE == 0 || EP_XPRESS_PACKET_PIPELINE == 1);
+static_assert(!EP_XPRESS_PACKET_PIPELINE || EP_XPRESS_DECODE_PACKET_ROWS > 0);
+constexpr int kPacketTransportThreads = kThreads + (EP_XPRESS_PACKET_PIPELINE ? 32 : 0);
+#ifndef EP_XPRESS_RING_SPLIT
+#define EP_XPRESS_RING_SPLIT 0
+#endif
+static_assert(EP_XPRESS_RING_SPLIT == 0 || EP_XPRESS_RING_SPLIT == 1);
 #ifndef EP_XPRESS_DISPATCH_DEFER_RECLAIM
 #define EP_XPRESS_DISPATCH_DEFER_RECLAIM 0
 #endif
@@ -544,8 +565,8 @@ __global__ void host_sm_finalize_kernel(TransportArgs a) {
 
 // status: 0 success, 1 invalid route/inverse, 2 receive capacity exceeded,
 // 3 timeout, 4 peer abort, 5 operation identity mismatch. An error is sticky.
-// More than one channel requires a cooperative, all-resident launch. Separate
-// producer-only and receiver-only blocks would not provide this liveness.
+// Multiple blocks require a cooperative, all-resident launch. Independent
+// TX/RX roles rely on this residency guarantee for forward progress.
 template <bool Combine, typename Id, bool Profile = false, bool Selective = false, bool SingleFrame = false>
 __global__ void host_sm_transport_kernel(TransportArgs a) {
   static_assert(!SingleFrame || (!Combine && !Selective), "single-frame dispatch only");
@@ -568,7 +589,10 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
   __shared__ uint64_t previous, start;
   __shared__ ProfileState<Profile> profile;
   profile_init(profile);
-  const int tid = threadIdx.x, channel = blockIdx.x;
+  constexpr bool split = EP_XPRESS_RING_SPLIT && Selective && !Combine && !SingleFrame;
+  const int tid = threadIdx.x, channel = split ? blockIdx.x % a.channels : blockIdx.x;
+  const bool send_role = !split || blockIdx.x < a.channels;
+  const bool receive_role = !split || blockIdx.x >= a.channels;
   // Diagnostic-only bounded records. A channel is owned by exactly one CTA;
   // contexts serialize submissions, so the sample cursor needs no atomic.
   __shared__ int sample;
@@ -594,7 +618,8 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
     if (n < 0 || n > a.input_rows) { fail(a.status, 1); n = 0; }
     cursor = int(int64_t(n) * channel / a.channels);
     end = int(int64_t(n) * (channel + 1) / a.channels);
-    producer_done = sent_chunks = terminal_sent = 0;
+    producer_done = send_role ? 0 : 1;
+    sent_chunks = terminal_sent = 0;
     start = a.diagnostics ? ticks_ns() : 0;
   }
   for (int peer = tid; peer < a.world; peer += blockDim.x) {
@@ -618,6 +643,7 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
     if (tid == 0) error = read_status(a.status);
     __syncthreads();
     if (error) break;
+    if (send_role) {
     char* send_slot = own + kArenaHeader + (sent_chunks % a.slots) * a.slot_stride;
     if (tid == 0) previous = (SingleFrame || producer_done) ? 0 : acquire(control(send_slot, 0));
     __syncthreads();
@@ -821,6 +847,8 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
       }
     }
     __syncthreads();
+    } // Producer role. Receivers do not depend on local send progress.
+    if (receive_role) {
     profile_phase(profile, PPeerPoll);
     // Poll peers concurrently, then process each available chunk in parallel
     // tiles. ACK is published only after every thread has finished all reads.
@@ -1053,12 +1081,13 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
       }
       __syncthreads();
     }
+    } // Receiver role. Only this role ACKs remote payload and terminals.
     if constexpr (!Combine) {
       if (a.decode_profile) profile_phase(profile, PAckDrainCheck);
     }
-    const int unfinished_peers = __syncthreads_or(tid < a.world && !peer_done[tid]);
+    const int unfinished_peers = __syncthreads_or(receive_role && tid < a.world && !peer_done[tid]);
     bool unacked = false;
-    if (producer_done && (Selective || !unfinished_peers)) {
+    if (send_role && producer_done && (Selective || !unfinished_peers)) {
       for (int i = tid; i < (SingleFrame ? 1 : a.slots) * a.world; i += blockDim.x) {
         int peer = i % a.world;
         if (peer == a.rank) continue;
@@ -1074,7 +1103,7 @@ __global__ void host_sm_transport_kernel(TransportArgs a) {
       // Publish end-of-operation only after every selected reader has released
       // all payload slots. A separate terminal ACK protects epoch reuse, without
       // making nonreaders part of payload-slot credits.
-      if (tid == 0 && producer_done && !outstanding && !terminal_sent) {
+      if (send_role && tid == 0 && producer_done && !outstanding && !terminal_sent) {
         if (a.diagnostics) host_store64(own + 24, a.identity);
         release(dispatch_terminal(a, own), a.epoch << 32);
         terminal_sent = 1;
@@ -2481,10 +2510,11 @@ int max_channels_current_device(int world = 1) {
 #if EP_XPRESS_DECODE_PACKET_ROWS > 0
   int packet_capacity;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &packet_capacity, host_sm_packet_transport_kernel<false>, kThreads, 0));
+      &packet_capacity, host_sm_packet_transport_kernel<false>, kPacketTransportThreads, 0));
   mailbox_capacity = std::min(mailbox_capacity, packet_capacity);
 #endif
-  const int capacity = std::min({32, pipeline_capacity, sms * mailbox_capacity / kMailboxRoles, sms * std::min({a, b, selective_a, selective_b, mailbox_capacity, single_a, single_b, single_profile_a, single_profile_b}),
+  const int ring_capacity = sms * std::min(selective_a, selective_b) / (EP_XPRESS_RING_SPLIT ? 2 : 1);
+  const int capacity = std::min({32, ring_capacity, pipeline_capacity, sms * mailbox_capacity / kMailboxRoles, sms * std::min({a, b, selective_a, selective_b, mailbox_capacity, single_a, single_b, single_profile_a, single_profile_b}),
                                  sms * std::min({c, diagnostic, warp_pair_capacity}) / world});
   capacities.emplace(key, capacity);
   return capacity;
@@ -2492,11 +2522,13 @@ int max_channels_current_device(int world = 1) {
 
 template <bool Combine, typename Id, bool Profile = false, bool Selective = false, bool WarpCombine = false, bool SingleFrame = false, bool Pipeline = false>
 void launch_transport(TransportArgs args, cudaStream_t stream) {
+  constexpr bool split_ring = EP_XPRESS_RING_SPLIT && Selective && !Combine && !SingleFrame && !Pipeline;
+  TORCH_CHECK(!split_ring || !Profile, "split ring requires operation latency or CUDA timeline profiling");
   const int64_t elements = int64_t(args.capacity) * args.hidden * (Combine ? args.world : 1);
   const int blocks = int(std::max<int64_t>(1, std::min<int64_t>(4096, (elements + kThreads - 1) / kThreads)));
   host_sm_init_kernel<Combine><<<blocks, kThreads, 0, stream>>>(args);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  const int lanes = args.channels * (Combine ? args.world : (Pipeline ? kDispatchRoles : 1));
+  const int lanes = args.channels * (Combine ? args.world : (Pipeline ? kDispatchRoles : (split_ring ? 2 : 1)));
   constexpr int transport_threads = Pipeline ? kDispatchPipelineThreads : kThreads;
   if (lanes == 1) {
     if constexpr (Pipeline) host_sm_dispatch_pipeline_kernel<Id, Profile><<<1, transport_threads, 0, stream>>>(args);
@@ -2742,6 +2774,8 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
 }
 
 void PreparedHostSM::prepare_decode_profile(torch::Tensor storage, bool dispatch) {
+  TORCH_CHECK(dispatch || !EP_XPRESS_PACKET_PIPELINE,
+              "packet pipeline uses overlapping roles; use operation latency or a CUDA timeline instead of sequential phase counters");
   const bool pipeline_profile = dispatch && EP_XPRESS_DECODE_DISPATCH_PIPELINE;
   const c10::cuda::CUDAGuard guard(impl_->device);
   eager_stream(impl_->device);
@@ -2757,7 +2791,7 @@ void PreparedHostSM::prepare_decode_profile(torch::Tensor storage, bool dispatch
       &resident, host_sm_mailbox_combine_kernel<true>, kThreads, 0));
 #if EP_XPRESS_DECODE_PACKET_ROWS > 0
   if (!dispatch) C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &resident, host_sm_packet_transport_kernel<true>, kThreads, 0));
+      &resident, host_sm_packet_transport_kernel<true>, kPacketTransportThreads, 0));
 #endif
   if (pipeline_profile) {
     int resident64;
@@ -3012,15 +3046,16 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
                                          : host_sm_mailbox_combine_kernel<false>;
 #endif
     const int blocks = a.channels * kMailboxRoles;
+    constexpr int transport_threads = EP_XPRESS_DECODE_PACKET_ROWS ? kPacketTransportThreads : kThreads;
     if (blocks == 1) {
       void* arguments[] = {&a};
       C10_CUDA_CHECK(cudaLaunchKernel(reinterpret_cast<const void*>(kernel),
-          dim3(1), dim3(kThreads), arguments, shared_bytes, stream));
+          dim3(1), dim3(transport_threads), arguments, shared_bytes, stream));
     }
     else {
       void* arguments[] = {&a};
       C10_CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<const void*>(kernel),
-          dim3(blocks), dim3(kThreads), arguments, shared_bytes, stream));
+          dim3(blocks), dim3(transport_threads), arguments, shared_bytes, stream));
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 #if EP_XPRESS_DECODE_PACKET_ROWS > 0

@@ -95,12 +95,30 @@ def load(*, verbose: bool = False):
             raise ValueError("EP_XPRESS_DECODE_CONTROL_RECORDS must be 0 or 1")
         if decode_control_records == "1" and decode_dispatch_pipeline != "1":
             raise ValueError("decode control records require EP_XPRESS_DECODE_DISPATCH_PIPELINE=1")
+        dispatch_direct = os.environ.get("EP_XPRESS_DISPATCH_DIRECT", "0")
+        if dispatch_direct not in {"0", "1"}:
+            raise ValueError("EP_XPRESS_DISPATCH_DIRECT must be 0 or 1")
+        if dispatch_direct == "1" and (decode_dispatch_pipeline != "1" or decode_control_records != "0"):
+            raise ValueError("direct slots require the dispatch pipeline without duplicated control records")
+        dispatch_retire = os.environ.get("EP_XPRESS_DISPATCH_RETIRE", "0")
+        if dispatch_retire not in {"0", "1"}:
+            raise ValueError("EP_XPRESS_DISPATCH_RETIRE must be 0 or 1")
+        if dispatch_retire == "1" and dispatch_direct != "1":
+            raise ValueError("independent dispatch metadata/ACK roles require direct slots")
+        packet_pipeline = os.environ.get("EP_XPRESS_PACKET_PIPELINE", "0")
+        if packet_pipeline not in {"0", "1"}:
+            raise ValueError("EP_XPRESS_PACKET_PIPELINE must be 0 or 1")
+        ring_split = os.environ.get("EP_XPRESS_RING_SPLIT", "0")
+        if ring_split not in {"0", "1"}:
+            raise ValueError("EP_XPRESS_RING_SPLIT must be 0 or 1")
         decode_ack_batch = os.environ.get("EP_XPRESS_DECODE_ACK_BATCH", "1")
         if decode_ack_batch not in {"1", "2", "4", "8"}:
             raise ValueError("EP_XPRESS_DECODE_ACK_BATCH must be 1, 2, 4, or 8")
         decode_packet_rows = os.environ.get("EP_XPRESS_DECODE_PACKET_ROWS", "0")
         if decode_packet_rows not in {"0", "2", "4", "8"}:
             raise ValueError("EP_XPRESS_DECODE_PACKET_ROWS must be 0, 2, 4, or 8")
+        if packet_pipeline == "1" and decode_packet_rows == "0":
+            raise ValueError("packet pipelining requires decode packet transport")
         reuse_return_index = os.environ.get("EP_XPRESS_REUSE_RETURN_INDEX", "0")
         if reuse_return_index not in {"0", "1"}:
             raise ValueError("EP_XPRESS_REUSE_RETURN_INDEX must be 0 or 1")
@@ -126,6 +144,10 @@ def load(*, verbose: bool = False):
                                          or decode_ready_prefetch != "0"):
             raise ValueError("packet transport replaces legacy combine scheduling; disable those options")
         cuda_flags = ["-O3", "-lineinfo",
+                      f"-DEP_XPRESS_DISPATCH_DIRECT={dispatch_direct}",
+                      f"-DEP_XPRESS_DISPATCH_RETIRE={dispatch_retire}",
+                      f"-DEP_XPRESS_PACKET_PIPELINE={packet_pipeline}",
+                      f"-DEP_XPRESS_RING_SPLIT={ring_split}",
                       f"-DEP_XPRESS_HOST_READ64={host_read64}",
                       f"-DEP_XPRESS_DISPATCH_WRITE_UNROLL={dispatch_write_unroll}",
                       f"-DEP_XPRESS_REUSE_RETURN_INDEX={reuse_return_index}",

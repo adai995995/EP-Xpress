@@ -21,17 +21,20 @@ __device__ __forceinline__ char* packet_box(TransportArgs a, int producer, int t
 // A load-then-store loop would serialize the PCIe round trip for every row.
 template <bool Vector>
 __device__ __forceinline__ void packet_receive(TransportArgs a, char* payload,
-                                              int peer, int tile, unsigned mask) {
+                                              int peer, int tile, unsigned mask,
+                                              int worker = -1, int workers = 0) {
+  if (worker < 0) worker = threadIdx.x;
+  if (!workers) workers = blockDim.x;
   constexpr int unroll = 4;
   const int units = a.hidden / (Vector ? 8 : 2);
   const int64_t total = int64_t(kPacketRows) * units;
   using Value = typename std::conditional<Vector, uint4, uint32_t>::type;
-  for (int64_t base = threadIdx.x; base < total; base += blockDim.x * unroll) {
+  for (int64_t base = worker; base < total; base += workers * unroll) {
     Value values[unroll];
     bool live[unroll];
 #pragma unroll
     for (int j = 0; j < unroll; ++j) {
-      const int64_t i = base + j * blockDim.x;
+      const int64_t i = base + j * workers;
       const int offset = int(i / units), h = int(i % units);
       live[j] = i < total && (mask & (1u << offset));
       if (live[j]) {
@@ -43,7 +46,7 @@ __device__ __forceinline__ void packet_receive(TransportArgs a, char* payload,
 #pragma unroll
     for (int j = 0; j < unroll; ++j) {
       if (live[j]) {
-        const int64_t i = base + j * blockDim.x;
+        const int64_t i = base + j * workers;
         const int token = tile * kPacketRows + int(i / units), h = int(i % units);
         auto* target = a.packet_scratch + (int64_t(peer) * a.mailbox_tokens + token) * a.hidden;
         if constexpr (Vector) reinterpret_cast<uint4*>(target)[h] = values[j];
@@ -118,8 +121,14 @@ __global__ void host_sm_packet_prepare_kernel(TransportArgs a) {
 // waiting for all contributors of the first token. No cross-CTA barrier or
 // host atomic is needed. A window drains before moving on; this is bounded
 // lookahead, not a claim of globally work-conserving scheduling.
+#include "host_sm_packet_pipeline.h"
+
 template <bool Profile = false>
 __global__ void host_sm_packet_transport_kernel(TransportArgs a) {
+#if EP_XPRESS_PACKET_PIPELINE
+  packet_pipeline_transport(a);
+  return;
+#endif
   if (a.device_epoch) a.epoch = *a.device_epoch;
   const int tid = threadIdx.x, channel = blockIdx.x % a.channels;
   const bool send = blockIdx.x < a.channels;
