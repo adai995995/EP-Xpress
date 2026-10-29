@@ -295,26 +295,6 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
     }
     __syncthreads();
     if (!read_status(a.status)) {
-      for (int64_t i = tid; i < int64_t(local_count) * (a.hidden / 2); i += blockDim.x) {
-        const int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
-        reinterpret_cast<uint32_t*>(a.output + int64_t(local_base + row) * a.hidden)[h] =
-            reinterpret_cast<const uint32_t*>(a.input + int64_t(first + local[row] * token_stride) * a.hidden)[h];
-      }
-      for (int i = tid; i < local_count * a.topk; i += blockDim.x) {
-        const int row = i / a.topk, k = i % a.topk;
-        const int64_t source = int64_t(first + local[row] * token_stride) * a.topk + k;
-        const int64_t expert = ids[source];
-        const int64_t out = int64_t(local_base + row) * a.topk + k;
-        a.output_ids[out] = expert >= 0 && a.expert_rank[expert] == a.rank ? a.expert_local[expert] : -1;
-        a.output_weights[out] = expert >= 0 ? a.weights[source] : 0.0f;
-      }
-      if (tid < local_count) {
-        a.output_inverse[int64_t(local_base + tid) * 2] = a.rank;
-        a.output_inverse[int64_t(local_base + tid) * 2 + 1] = first + local[tid] * token_stride;
-        a.local_rows[first + local[tid] * token_stride] = local_base + tid;
-        a.owner_rows[int64_t(a.rank) * a.capacity + local_owner + tid] = local_base + tid;
-        dispatch_return_row(a, a.rank, first + local[tid] * token_stride, local_base + tid);
-      }
       mark(DTxMetadata, tid == 0);
 #if !EP_XPRESS_DECODE_CONTROL_RECORDS
       for (int i = tid; i < remote_count * a.topk; i += blockDim.x) {
@@ -408,6 +388,33 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
       release(reinterpret_cast<uint64_t*>(dispatch_index(a, slot, tid)),
               (a.epoch << 32) | uint64_t(notifications[tid]));
     __syncthreads();
+    // Remote publication depends only on the completed host writes. Materialize
+    // the disjoint local output afterwards, while peer RX CTAs can make progress.
+    // Its output range was reserved above; later kernels still wait for this
+    // entire dispatch, so no consumer can observe an unfinished local row.
+    mark(DTxRouteLocal, tid == 0);
+    if (!read_status(a.status)) {
+      for (int64_t i = tid; i < int64_t(local_count) * (a.hidden / 2); i += blockDim.x) {
+        const int row = int(i / (a.hidden / 2)), h = int(i % (a.hidden / 2));
+        reinterpret_cast<uint32_t*>(a.output + int64_t(local_base + row) * a.hidden)[h] =
+            reinterpret_cast<const uint32_t*>(a.input + int64_t(first + local[row] * token_stride) * a.hidden)[h];
+      }
+      for (int i = tid; i < local_count * a.topk; i += blockDim.x) {
+        const int row = i / a.topk, k = i % a.topk;
+        const int64_t source = int64_t(first + local[row] * token_stride) * a.topk + k;
+        const int64_t expert = ids[source];
+        const int64_t out = int64_t(local_base + row) * a.topk + k;
+        a.output_ids[out] = expert >= 0 && a.expert_rank[expert] == a.rank ? a.expert_local[expert] : -1;
+        a.output_weights[out] = expert >= 0 ? a.weights[source] : 0.0f;
+      }
+      if (tid < local_count) {
+        a.output_inverse[int64_t(local_base + tid) * 2] = a.rank;
+        a.output_inverse[int64_t(local_base + tid) * 2 + 1] = first + local[tid] * token_stride;
+        a.local_rows[first + local[tid] * token_stride] = local_base + tid;
+        a.owner_rows[int64_t(a.rank) * a.capacity + local_owner + tid] = local_base + tid;
+        dispatch_return_row(a, a.rank, first + local[tid] * token_stride, local_base + tid);
+      }
+    }
     if constexpr (Profile) {
       if (!tid && diag.sample >= 0) {
         const uint64_t now = ticks_ns();

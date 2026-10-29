@@ -4567,3 +4567,150 @@ reverted, including the default-off switch. The retained runtime remains the
 preceding implementation; only this result record is published. Its existing
 advantage over archived NCCL must not be attributed to this unsuccessful batch
 experiment.
+
+## Remote publication before local materialization (2026-10-29)
+
+The bounded dispatch pipeline previously copied its local rows, local expert
+metadata and inverse/return indices before writing and publishing remote data.
+Local materialization is now performed after remote READY publication. Local
+output ranges are still reserved first, so simultaneous receive CTAs cannot
+overwrite them. All remote payload and metadata writers still execute their
+system fence and CTA join before the existing release publications. Local
+expert computation remains ordered after completion of the entire dispatch
+kernel. Rank deduplication, dynamic routing, full-width receive groups, return
+indices, ACK ownership and deterministic combine reduction are unchanged.
+
+This removes a dependency that remote consumers did not need. It also moves
+local-only GPU writes outside the pre-publication system-fence interval. The
+change applies to the existing bounded decode pipeline; eager prefill and the
+general ring fallback are unchanged. It does not specialize on observed token
+values, expert choices, or benchmark batch labels.
+
+### Matched model measurements
+
+The configuration remains eight H20D GPUs, Qwen3-30B-A3B BF16, SGLang v0.5.21,
+TP/DP/EP=8, 512 input and 32 output tokens, decode Graph buckets 1/2/4/8,
+Triton experts and eager prefill. Both paths disable NVLink and GPU P2P.
+Dispatch uses two active decode channels and packet combine uses eight channels
+with four-row packets. The archived default-NCCL baseline is reused.
+
+Two independent model sessions were run for both the unchanged EP control and
+early publication. Each session uses eight warmup batches followed by five
+measured batches at each concurrency. The following values are arithmetic
+means of the resulting ten observations per concurrency; Decode TPS is the
+aggregate steady-state output throughput used in earlier comparisons.
+
+| Configuration | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| Archived default NCCL | 101.801 | 155.051 | 431.710 | 3557.948 |
+| Unchanged EP, fresh control | 97.545 | 164.970 | 281.399 | 3656.999 |
+| Earlier remote publication | 97.813 | 166.533 | 280.221 | 3697.343 |
+
+Earlier publication improves B1/B32 Decode TPS by **0.95%/1.10%** over the fresh
+EP control. The two individual candidate sessions give B1 TPS 166.573/166.492
+and B32 TPS 3694.378/3700.308; control sessions give 165.008/164.933 and
+3659.725/3654.272. The improvement is small and reproduced across these runs.
+
+Across ten observations, control B1 TPS spans 164.571-165.229 with sample
+standard deviation 0.234; the candidate spans 166.356-166.952 with standard
+deviation 0.168. Control B32 TPS spans 3609.010-3704.731 (29.717), and the
+candidate spans 3673.709-3741.094 (22.680). These are observed variations, not
+claims about all serving loads. B32 TTFT spans 252.070-327.241 ms for control
+and 251.339-341.765 ms for the candidate. No TTFT improvement is established.
+
+Compared with archived NCCL, the earlier-publication path has 7.41%/3.92%
+higher B1/B32 Decode TPS and 3.92%/35.09% lower TTFT. Most of that advantage
+predates this change. It must not be attributed entirely to publication order,
+nor generalized to consumer GPUs that were not measured here.
+
+Separate model traces report median per-rank times over complete 48-layer
+decode forward steps. They include waiting and are not pure payload-transfer
+times or additional throughput observations:
+
+| Configuration | Dispatch (ms) | Packet combine (ms) | Forward window (ms) |
+| --- | ---: | ---: | ---: |
+| Control, session 1 | 1.848 | 1.240 | 8.815 |
+| Control, session 2 | 1.843 | 1.228 | 8.803 |
+| Earlier publication, session 1 | 1.763 | 1.212 | 8.717 |
+| Earlier publication, session 2 | 1.746 | 1.210 | 8.708 |
+
+### Independent changes without a demonstrated gain
+
+The owner-list candidate started from the unchanged control. It explicitly
+omitted owner-row/count maintenance only when bounded dispatch produced the
+matching per-handle packet return index. Public inverse rows and generic
+fallbacks remained valid. It produced B1/B32 TPS 165.134/3655.064 in five
+observations per concurrency, providing no end-to-end throughput gain. The
+implementation and its extra API argument are not retained.
+
+Two channel ablations started from earlier publication, changing one setting
+each. Four dispatch channels produced B1/B32 TPS 166.570/3683.917. Four combine
+channels produced 166.296/3690.828. Neither improves on the repeated
+two-dispatch/eight-combine result, so the selected preset is unchanged. In the
+four-combine-channel trace, dispatch is 1.701 ms but combine increases to
+1.334 ms and the full forward is 8.760 ms. A shorter isolated dispatch interval
+does not establish an end-to-end benefit.
+
+Both code candidates passed focused eight-rank dynamic-route checks with
+int32 IDs at hidden width 2048 and int64 IDs at width 258. Those checks cover
+changing weights and routes, empty/skewed ranks, same-rank expert deduplication,
+multiple outstanding handles, Graph bucket/channel changes and eager fallback.
+All seven completed model sessions have four exact greedy output matches and
+zero common-prefix logprob difference. Prompt hashes, output lengths, model,
+image, framework source, topology, producer-NUMA placement and sampled GPU
+exclusivity were verified. Transport records show SHM without P2P/NET/NVLS and
+zero available NVLink counter deltas.
+
+### Inline data/flag LL experiment, not retained
+
+A separate combine prototype tested the data-plus-generation publication idea
+used by [NCCL LL](https://github.com/NVIDIA/nccl/blob/v2.30.7-1/src/device/prims_ll.h).
+It encoded two BF16 values and a 32-bit generation in one naturally aligned
+64-bit host word, using the documented mapped-memory access guarantee in the
+[CUDA programming guide](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/understanding-memory.html).
+Each receiver validated the generation of every word before consuming its data.
+The control warp selected peers whose first live word had arrived, while the
+complete payload CTA retained its receive width. Ordinary packet-wide READY
+publication and the preceding TX system fence were removed from this prototype;
+receive completion, ACK credit and deterministic reduction were retained.
+
+Each logical producer/destination/tile queue advanced its generation only for
+actual packets. Two alternating banks retained per-queue credit. Periodic
+refreshes covered inactive words in both banks to prevent stale data flags from
+matching after wrap. A test build shortened flags to eight bits: 520 changing
+route steps crossed wrap on 194 logical queues while also exercising delayed
+readers and more than 32 live tasks per CTA. That check passed. Four production-
+flag checks also passed, covering dynamic Graph routes at hidden widths 2048
+and 258 plus delayed-reader bank reuse at 7 and 129 tokens. No dispatch or host
+rendezvous was inserted between the lifetime-test combine calls.
+
+The prototype's completed full-model session passed the same output,
+transport, NUMA and exclusivity checks. Its five-observation means were:
+
+| Configuration | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| Earlier publication, repeated reference | 97.813 | 166.533 | 280.221 | 3697.343 |
+| Add inline data/flag combine | 96.699 | 164.444 | 285.357 | 3582.210 |
+
+Decode TPS regresses by 1.25%/3.11%. B1 TPS spans 164.222-164.622 with standard
+deviation 0.187, and B32 spans 3549.412-3606.154 with standard deviation 28.655.
+The prototype doubles payload wire bytes, adds per-word flag processing and
+permits data reads to encounter a partially written packet. Removing the
+packet-wide publication dependency did not offset these costs in this
+implementation. Its separate B32 trace has dispatch 1.751 ms, packet combine
+1.459 ms and a complete forward window of 8.962 ms. Dispatch stays near the
+earlier-publication reference, while combine grows from about 1.211 ms. This
+comparison does not isolate the individual contributions or rule out other
+LL layouts.
+
+The initial prototype was stopped at bootstrap by the existing allocation-ABI
+check; its larger wire layout was then described consistently on both sides.
+Extending a lifetime test to 520 steps also required bounded, exactly
+representable BF16 inputs: its original unbounded integer reference introduced
+different rounding before and after reduction. Those failed attempts supplied
+no model performance observations. Both issues were resolved before the
+successful checks and model comparison above.
+
+The LL implementation, allocation/API extensions and test-only changes are not
+retained in the repository. The final runtime change is solely earlier remote
+dispatch publication, with the existing two/eight-channel preset unchanged.
