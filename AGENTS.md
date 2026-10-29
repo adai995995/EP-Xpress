@@ -1,5 +1,7 @@
 # Contributor instructions
 
+- Develop directly on `main`. Create a separate Git branch only when the user
+  explicitly requests one.
 - Keep this repository independent of inference frameworks. Framework-specific
   imports and patches belong in adapters; CUDA transport belongs in the core.
 - Preserve inference-only BF16 dispatch/combine contracts and apply routing
