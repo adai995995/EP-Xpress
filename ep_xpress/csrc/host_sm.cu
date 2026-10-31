@@ -2817,9 +2817,11 @@ PreparedHostSM::PreparedHostSM(torch::Tensor expert_rank, torch::Tensor expert_l
 }
 
 void PreparedHostSM::prepare_decode_profile(torch::Tensor storage, bool dispatch) {
-  TORCH_CHECK(dispatch || !EP_XPRESS_PACKET_PIPELINE,
-              "packet pipeline uses overlapping roles; use operation latency or a CUDA timeline instead of sequential phase counters");
   const bool pipeline_profile = dispatch && EP_XPRESS_DECODE_DISPATCH_PIPELINE;
+  int fields = pipeline_profile ? int(DFieldCount) : int(PFieldCount);
+#if EP_XPRESS_PACKET_PIPELINE && EP_XPRESS_DECODE_PACKET_ROWS > 0
+  if (!dispatch) fields = QFieldCount;
+#endif
   const c10::cuda::CUDAGuard guard(impl_->device);
   eager_stream(impl_->device);
   auto& args = dispatch ? impl_->dispatch : impl_->combine;
@@ -2827,7 +2829,7 @@ void PreparedHostSM::prepare_decode_profile(torch::Tensor storage, bool dispatch
               "prepare decode profiling once before any submission or graph capture");
   tensor_check(storage, at::kLong, 3, impl_->device, "decode profile");
   TORCH_CHECK(storage.size(0) >= 2 && storage.size(0) <= 4097 &&
-              storage.size(1) == impl_->combine.channels * (dispatch ? (pipeline_profile ? kDispatchRoles : 1) : kMailboxRoles) && storage.size(2) == (pipeline_profile ? DFieldCount : PFieldCount) + 4,
+              storage.size(1) == impl_->combine.channels * (dispatch ? (pipeline_profile ? kDispatchRoles : 1) : kMailboxRoles) && storage.size(2) == fields + 4,
               "invalid decode profile shape");
   int resident = 0, sms = 0;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -2854,6 +2856,12 @@ void PreparedHostSM::prepare_decode_profile(torch::Tensor storage, bool dispatch
 
 std::vector<std::string> host_sm_decode_profile_fields(bool dispatch) {
   auto fields = dispatch && EP_XPRESS_DECODE_DISPATCH_PIPELINE ? kDispatchProfileFields : kProfileFields;
+#if EP_XPRESS_PACKET_PIPELINE && EP_XPRESS_DECODE_PACKET_ROWS > 0
+  if (!dispatch) {
+    TORCH_INTERNAL_ASSERT(kPacketRoleFields.size() == QFieldCount);
+    fields = kPacketRoleFields;
+  }
+#endif
   fields.insert(fields.end(), {"epoch", "local_tokens", "input_capacity", "active_channels"});
   return fields;
 }
@@ -3066,11 +3074,14 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
       transition.record(c10::cuda::getStreamFromExternal(impl_->mailbox_stream, device.index()));
       transition.block(c10::cuda::getCurrentCUDAStream(device.index()));
     }
-    // Graph replays need a device-side generation even with no init kernel.
+    // Packet preparation advances its generation before the transport node.
+    // The legacy mailbox path has no preparation grid and retains this node.
+#if EP_XPRESS_DECODE_PACKET_ROWS == 0
     if (a.device_epoch) {
       advance_mailbox_epoch<<<1, 1, 0, stream>>>(a.device_epoch);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
+#endif
 #if EP_XPRESS_DECODE_PACKET_ROWS > 0
     // Packet tasks are peer/tile jobs, not token-owned CTAs. Keep their optional
     // concurrency control independent of dispatch, bounded by bootstrap's

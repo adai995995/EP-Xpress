@@ -1,0 +1,1893 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-31",
+  "base_commit": "594d1dc75b3a3021d186f2e96e7ceda2e96435a6",
+  "configuration": {
+    "gpus": "8 x NVIDIA H20D",
+    "model": "Qwen3-30B-A3B-Instruct-2507",
+    "dtype": "BF16",
+    "sglang": "v0.5.21",
+    "tp": 8,
+    "dp": 8,
+    "ep": 8,
+    "expert_backend": "Triton",
+    "attention_backend": "FlashInfer",
+    "decode_graph_buckets": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "prefill_graph": false,
+    "input_tokens": 512,
+    "output_tokens": 32,
+    "prefix_cache": false,
+    "P2P": false,
+    "NVLink": false,
+    "sglang_commit": "e00930c5489053f26d86b179cee0d087f846acbb",
+    "hidden_size": 2048,
+    "layers": 48,
+    "experts": 128,
+    "topk": 8,
+    "driver_versions": [
+      "580.105.08"
+    ],
+    "dispatch_channels": 2,
+    "packet_combine_channels": 8,
+    "packet_rows": 4,
+    "prefill_combine_rows": 16,
+    "slots": 2,
+    "chunk_bytes": 4194304,
+    "host_budget_bytes": 1073741824,
+    "host_placement": "producer NUMA",
+    "framework_nccl": "2.30.7+cuda13.3"
+  },
+  "nccl_baseline": "../baselines/sglang_h20d_ep8_bf16_host.json",
+  "warmups_per_session_per_batch": 8,
+  "measured_repeats_per_session_per_batch": 5,
+  "aggregation": "Arithmetic mean of repeat-level observations. Sessions have equal sample counts. Variation is observed, not a confidence interval.",
+  "variants": {
+    "control": {
+      "sessions": [
+        {
+          "ordinal": 1,
+          "metrics": {
+            "1": {
+              "ttft_mean_ms": {
+                "mean": 96.81881973519921,
+                "min": 95.64422210678458,
+                "max": 97.4219380877912,
+                "sample_stddev": 0.7975653989975462,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 166.72757767949233,
+                "min": 166.4364858095918,
+                "max": 167.01283161534866,
+                "sample_stddev": 0.21499257819485718,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 282.8445357270539,
+                "min": 281.79507004097104,
+                "max": 283.7716741487384,
+                "sample_stddev": 0.8057569991665746,
+                "samples": 5
+              }
+            },
+            "32": {
+              "ttft_mean_ms": {
+                "mean": 257.6055171113694,
+                "min": 249.95550357562024,
+                "max": 281.91202915331814,
+                "sample_stddev": 13.663077641535565,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 3678.89481844997,
+                "min": 3651.425009364679,
+                "max": 3706.6399968340334,
+                "sample_stddev": 23.132790922717273,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 551.0038044303656,
+                "min": 542.3311786726117,
+                "max": 573.7287360243499,
+                "sample_stddev": 12.826397951010406,
+                "samples": 5
+              }
+            }
+          },
+          "decode_trace_ms": {
+            "1": {
+              "forward_ms": 6.417622253417969,
+              "dispatch_transport": 1.0503189697265625,
+              "dispatch_init_finalize": 0.109698486328125,
+              "combine_packet_transport": 0.944752197265625,
+              "combine_packet_prepare": 0.0951287841796875,
+              "combine_packet_reduce": 0.1334296875
+            },
+            "32": {
+              "forward_ms": 8.724075714111327,
+              "dispatch_transport": 1.762464111328125,
+              "dispatch_init_finalize": 0.11757098388671874,
+              "combine_packet_transport": 1.2155521240234375,
+              "combine_packet_prepare": 0.10105612182617188,
+              "combine_packet_reduce": 0.13635531616210939
+            }
+          }
+        },
+        {
+          "ordinal": 2,
+          "metrics": {
+            "1": {
+              "ttft_mean_ms": {
+                "mean": 98.95412549376488,
+                "min": 96.48122871294618,
+                "max": 104.87390402704477,
+                "sample_stddev": 3.3880565460916485,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 166.7077542716302,
+                "min": 166.372876893735,
+                "max": 166.88313551735246,
+                "sample_stddev": 0.21144071665914502,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 285.0076322443783,
+                "min": 282.3176640085876,
+                "max": 291.0510152578354,
+                "sample_stddev": 3.4537919307333746,
+                "samples": 5
+              }
+            },
+            "32": {
+              "ttft_mean_ms": {
+                "mean": 313.4804683882976,
+                "min": 260.65252772241365,
+                "max": 340.9770083380863,
+                "sample_stddev": 30.904063172231396,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 3712.1257955357737,
+                "min": 3685.470496376067,
+                "max": 3749.410478954035,
+                "sample_stddev": 25.810217328423384,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 594.8646988719702,
+                "min": 557.0388613268733,
+                "max": 614.0720057301223,
+                "sample_stddev": 22.03306076276958,
+                "samples": 5
+              }
+            }
+          },
+          "decode_trace_ms": {
+            "1": {
+              "forward_ms": 6.430416931152344,
+              "dispatch_transport": 1.0660549926757812,
+              "dispatch_init_finalize": 0.10997540283203125,
+              "combine_packet_transport": 0.9402294311523437,
+              "combine_packet_prepare": 0.09486981201171875,
+              "combine_packet_reduce": 0.13373760986328126
+            },
+            "32": {
+              "forward_ms": 8.718146514892577,
+              "dispatch_transport": 1.7596291503906252,
+              "dispatch_init_finalize": 0.11775930786132813,
+              "combine_packet_transport": 1.220435119628906,
+              "combine_packet_prepare": 0.10103366088867188,
+              "combine_packet_reduce": 0.1363702392578125
+            }
+          }
+        }
+      ],
+      "decision": "unchanged current main",
+      "metrics": {
+        "1": {
+          "ttft_mean_ms": {
+            "mean": 97.88647261448205,
+            "median": 97.34895615838468,
+            "min": 95.64422210678458,
+            "max": 104.87390402704477,
+            "sample_stddev": 2.578952793656534,
+            "samples": 10
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 166.71766597556126,
+            "median": 166.78284050911688,
+            "min": 166.372876893735,
+            "max": 167.01283161534866,
+            "sample_stddev": 0.20130086937743147,
+            "samples": 10
+          },
+          "latency_ms": {
+            "mean": 283.9260839857161,
+            "median": 283.4396834950894,
+            "min": 281.79507004097104,
+            "max": 291.0510152578354,
+            "sample_stddev": 2.624863139885635,
+            "samples": 10
+          }
+        },
+        "32": {
+          "ttft_mean_ms": {
+            "mean": 285.5429927498335,
+            "median": 271.2822784378659,
+            "min": 249.95550357562024,
+            "max": 340.9770083380863,
+            "sample_stddev": 37.07648055823311,
+            "samples": 10
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 3695.510306992872,
+            "median": 3694.4161351151542,
+            "min": 3651.425009364679,
+            "max": 3749.410478954035,
+            "sample_stddev": 28.99409505562481,
+            "samples": 10
+          },
+          "latency_ms": {
+            "mean": 572.9342516511679,
+            "median": 565.3837986756116,
+            "min": 542.3311786726117,
+            "max": 614.0720057301223,
+            "sample_stddev": 28.69249641928913,
+            "samples": 10
+          }
+        }
+      }
+    },
+    "rx_metadata": {
+      "sessions": [
+        {
+          "ordinal": 1,
+          "metrics": {
+            "1": {
+              "ttft_mean_ms": {
+                "mean": 98.75536346808076,
+                "min": 96.36831982061267,
+                "max": 106.46465700119734,
+                "sample_stddev": 4.325559523197479,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 165.03523198712801,
+                "min": 164.82403742988592,
+                "max": 165.61479729110664,
+                "sample_stddev": 0.32979785284641344,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 286.6903539747,
+                "min": 283.6512718349695,
+                "max": 294.63754408061504,
+                "sample_stddev": 4.488794072174617,
+                "samples": 5
+              }
+            },
+            "32": {
+              "ttft_mean_ms": {
+                "mean": 272.5180342211388,
+                "min": 249.74519333045464,
+                "max": 328.78125096613076,
+                "sample_stddev": 32.338107860274626,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 3691.7694899013104,
+                "min": 3655.494915430623,
+                "max": 3725.5134548822434,
+                "sample_stddev": 29.678907839600267,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 563.205115031451,
+                "min": 546.695948112756,
+                "max": 605.0944090820849,
+                "sample_stddev": 24.085688302908554,
+                "samples": 5
+              }
+            }
+          },
+          "decode_trace_ms": {
+            "1": {
+              "forward_ms": 6.499684020996094,
+              "dispatch_transport": 1.1364921264648438,
+              "dispatch_init_finalize": 0.11002197265625,
+              "combine_packet_transport": 0.9428093872070312,
+              "combine_packet_prepare": 0.09488140869140625,
+              "combine_packet_reduce": 0.13368304443359375
+            },
+            "32": {
+              "forward_ms": 8.71942367553711,
+              "dispatch_transport": 1.7572763977050783,
+              "dispatch_init_finalize": 0.11761614990234376,
+              "combine_packet_transport": 1.2250895996093751,
+              "combine_packet_prepare": 0.100964599609375,
+              "combine_packet_reduce": 0.13653591918945313
+            }
+          }
+        }
+      ],
+      "decision": "not retained: single-request regression and no repeated B32 gain",
+      "metrics": {
+        "1": {
+          "ttft_mean_ms": {
+            "mean": 98.75536346808076,
+            "median": 96.92237805575132,
+            "min": 96.36831982061267,
+            "max": 106.46465700119734,
+            "sample_stddev": 4.325559523197479,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 165.03523198712801,
+            "median": 164.88136132695777,
+            "min": 164.82403742988592,
+            "max": 165.61479729110664,
+            "sample_stddev": 0.32979785284641344,
+            "samples": 5
+          },
+          "latency_ms": {
+            "mean": 286.6903539747,
+            "median": 285.03482788801193,
+            "min": 283.6512718349695,
+            "max": 294.63754408061504,
+            "sample_stddev": 4.488794072174617,
+            "samples": 5
+          }
+        },
+        "32": {
+          "ttft_mean_ms": {
+            "mean": 272.5180342211388,
+            "median": 261.0503340692958,
+            "min": 249.74519333045464,
+            "max": 328.78125096613076,
+            "sample_stddev": 32.338107860274626,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 3691.7694899013104,
+            "median": 3679.5819286362644,
+            "min": 3655.494915430623,
+            "max": 3725.5134548822434,
+            "sample_stddev": 29.678907839600267,
+            "samples": 5
+          },
+          "latency_ms": {
+            "mean": 563.205115031451,
+            "median": 555.9782409109175,
+            "min": 546.695948112756,
+            "max": 605.0944090820849,
+            "sample_stddev": 24.085688302908554,
+            "samples": 5
+          }
+        }
+      }
+    },
+    "short_queue_only": {
+      "sessions": [
+        {
+          "ordinal": 1,
+          "metrics": {
+            "1": {
+              "ttft_mean_ms": {
+                "mean": 97.02525837346911,
+                "min": 95.54975666105747,
+                "max": 98.04126201197505,
+                "sample_stddev": 1.021646481776372,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 170.0971456699484,
+                "min": 169.8362984965251,
+                "max": 170.43803464771705,
+                "sample_stddev": 0.23495717323513374,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 279.36355378478765,
+                "min": 278.17022800445557,
+                "max": 280.15708131715655,
+                "sample_stddev": 0.8326936976432269,
+                "samples": 5
+              }
+            },
+            "32": {
+              "ttft_mean_ms": {
+                "mean": 292.29667402396444,
+                "min": 274.15150091110263,
+                "max": 326.1728588404367,
+                "sample_stddev": 20.10232770450772,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 3755.327189316169,
+                "min": 3724.7881019011907,
+                "max": 3779.9442798259656,
+                "sample_stddev": 22.606686699810876,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 576.8309681676328,
+                "min": 561.0797670669854,
+                "max": 598.6206298694015,
+                "sample_stddev": 13.916569704437423,
+                "samples": 5
+              }
+            }
+          },
+          "decode_trace_ms": {
+            "1": {
+              "forward_ms": 6.297823852539063,
+              "dispatch_transport": 1.0781520385742187,
+              "dispatch_init_finalize": 0.1100377197265625,
+              "combine_packet_transport": 0.8103855590820312,
+              "combine_packet_prepare": 0.0949134521484375,
+              "combine_packet_reduce": 0.1335421142578125
+            },
+            "32": {
+              "forward_ms": 8.588209747314453,
+              "dispatch_transport": 1.7549811401367186,
+              "dispatch_init_finalize": 0.11762332153320312,
+              "combine_packet_transport": 1.1022731323242188,
+              "combine_packet_prepare": 0.10078067016601562,
+              "combine_packet_reduce": 0.13623025512695314
+            }
+          }
+        }
+      ],
+      "decision": "independent ablation; repeat in final combination",
+      "metrics": {
+        "1": {
+          "ttft_mean_ms": {
+            "mean": 97.02525837346911,
+            "median": 97.08938514813781,
+            "min": 95.54975666105747,
+            "max": 98.04126201197505,
+            "sample_stddev": 1.021646481776372,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 170.0971456699484,
+            "median": 170.12572594003086,
+            "min": 169.8362984965251,
+            "max": 170.43803464771705,
+            "sample_stddev": 0.23495717323513374,
+            "samples": 5
+          },
+          "latency_ms": {
+            "mean": 279.36355378478765,
+            "median": 279.62179807946086,
+            "min": 278.17022800445557,
+            "max": 280.15708131715655,
+            "sample_stddev": 0.8326936976432269,
+            "samples": 5
+          }
+        },
+        "32": {
+          "ttft_mean_ms": {
+            "mean": 292.29667402396444,
+            "median": 284.52160402957816,
+            "min": 274.15150091110263,
+            "max": 326.1728588404367,
+            "sample_stddev": 20.10232770450772,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 3755.327189316169,
+            "median": 3755.534337713911,
+            "min": 3724.7881019011907,
+            "max": 3779.9442798259656,
+            "sample_stddev": 22.606686699810876,
+            "samples": 5
+          },
+          "latency_ms": {
+            "mean": 576.8309681676328,
+            "median": 573.9918719045818,
+            "min": 561.0797670669854,
+            "max": 598.6206298694015,
+            "sample_stddev": 13.916569704437423,
+            "samples": 5
+          }
+        }
+      }
+    },
+    "epoch_prepare_only": {
+      "sessions": [
+        {
+          "ordinal": 1,
+          "metrics": {
+            "1": {
+              "ttft_mean_ms": {
+                "mean": 97.39478956907988,
+                "min": 95.27627471834421,
+                "max": 100.59028305113316,
+                "sample_stddev": 1.968701605755558,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 168.20208900213112,
+                "min": 167.71746711418302,
+                "max": 168.80803639125546,
+                "sample_stddev": 0.4731404316815491,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 281.79503520950675,
+                "min": 279.010190628469,
+                "max": 285.5241256766021,
+                "sample_stddev": 2.357320414930386,
+                "samples": 5
+              }
+            },
+            "32": {
+              "ttft_mean_ms": {
+                "mean": 275.39857374795247,
+                "min": 249.98620084079448,
+                "max": 299.9567723018117,
+                "sample_stddev": 19.83758228436687,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 3720.988386414755,
+                "min": 3685.2107921956385,
+                "max": 3765.587472778821,
+                "sample_stddev": 29.07821266331699,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 564.7057978436351,
+                "min": 544.90937711671,
+                "max": 582.9659532755613,
+                "sample_stddev": 15.983528819836053,
+                "samples": 5
+              }
+            }
+          },
+          "decode_trace_ms": {
+            "1": {
+              "forward_ms": 6.336456970214844,
+              "dispatch_transport": 1.0411014404296874,
+              "dispatch_init_finalize": 0.11002008056640625,
+              "combine_packet_transport": 0.936176025390625,
+              "combine_packet_prepare": 0.09688055419921875,
+              "combine_packet_reduce": 0.132969970703125
+            },
+            "32": {
+              "forward_ms": 8.642680908203126,
+              "dispatch_transport": 1.7368252563476563,
+              "dispatch_init_finalize": 0.11745535278320313,
+              "combine_packet_transport": 1.2177421875,
+              "combine_packet_prepare": 0.11278250122070313,
+              "combine_packet_reduce": 0.13627133178710937
+            }
+          }
+        }
+      ],
+      "decision": "independent ablation; repeat in final combination",
+      "metrics": {
+        "1": {
+          "ttft_mean_ms": {
+            "mean": 97.39478956907988,
+            "median": 96.9892549328506,
+            "min": 95.27627471834421,
+            "max": 100.59028305113316,
+            "sample_stddev": 1.968701605755558,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 168.20208900213112,
+            "median": 168.28231368650094,
+            "min": 167.71746711418302,
+            "max": 168.80803639125546,
+            "sample_stddev": 0.4731404316815491,
+            "samples": 5
+          },
+          "latency_ms": {
+            "mean": 281.79503520950675,
+            "median": 281.519474927336,
+            "min": 279.010190628469,
+            "max": 285.5241256766021,
+            "sample_stddev": 2.357320414930386,
+            "samples": 5
+          }
+        },
+        "32": {
+          "ttft_mean_ms": {
+            "mean": 275.39857374795247,
+            "median": 276.4541806682246,
+            "min": 249.98620084079448,
+            "max": 299.9567723018117,
+            "sample_stddev": 19.83758228436687,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 3720.988386414755,
+            "median": 3719.0762244940684,
+            "min": 3685.2107921956385,
+            "max": 3765.587472778821,
+            "sample_stddev": 29.07821266331699,
+            "samples": 5
+          },
+          "latency_ms": {
+            "mean": 564.7057978436351,
+            "median": 567.2342116013169,
+            "min": 544.90937711671,
+            "max": 582.9659532755613,
+            "sample_stddev": 15.983528819836053,
+            "samples": 5
+          }
+        }
+      }
+    },
+    "final": {
+      "sessions": [
+        {
+          "ordinal": 1,
+          "metrics": {
+            "1": {
+              "ttft_mean_ms": {
+                "mean": 97.12014915421605,
+                "min": 96.57672559842467,
+                "max": 97.68779389560223,
+                "sample_stddev": 0.5013809943914492,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 171.68610675436483,
+                "min": 171.0126791714234,
+                "max": 172.28432199619115,
+                "sample_stddev": 0.5137482422029429,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 277.8034915216267,
+                "min": 276.87946800142527,
+                "max": 278.53622287511826,
+                "sample_stddev": 0.6770347984247397,
+                "samples": 5
+              }
+            },
+            "32": {
+              "ttft_mean_ms": {
+                "mean": 270.75267954787705,
+                "min": 255.55663302657194,
+                "max": 287.03268806566484,
+                "sample_stddev": 14.845001119654604,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 3761.2497406539633,
+                "min": 3733.041699532325,
+                "max": 3809.905664653908,
+                "sample_stddev": 33.807088417394716,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 552.5711186230183,
+                "min": 536.8364532478154,
+                "max": 570.8642238751054,
+                "sample_stddev": 15.594408120206856,
+                "samples": 5
+              }
+            }
+          },
+          "decode_trace_ms": {
+            "1": {
+              "forward_ms": 6.215830749511719,
+              "dispatch_transport": 1.0554068603515625,
+              "dispatch_init_finalize": 0.1099527587890625,
+              "combine_packet_transport": 0.8222091064453125,
+              "combine_packet_prepare": 0.09687249755859376,
+              "combine_packet_reduce": 0.13289404296875
+            },
+            "32": {
+              "forward_ms": 8.532920166015625,
+              "dispatch_transport": 1.7493926696777344,
+              "dispatch_init_finalize": 0.11748587036132813,
+              "combine_packet_transport": 1.0969080200195314,
+              "combine_packet_prepare": 0.11267315673828125,
+              "combine_packet_reduce": 0.13630657958984377
+            }
+          }
+        },
+        {
+          "ordinal": 2,
+          "metrics": {
+            "1": {
+              "ttft_mean_ms": {
+                "mean": 97.16165866702795,
+                "min": 95.87620198726654,
+                "max": 98.26405486091971,
+                "sample_stddev": 0.9420984616815433,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 171.80669037360258,
+                "min": 171.6936135761702,
+                "max": 171.93112628241298,
+                "sample_stddev": 0.11356151144561552,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 277.69545894116163,
+                "min": 276.27412928268313,
+                "max": 278.9116930216551,
+                "sample_stddev": 1.0172219792686388,
+                "samples": 5
+              }
+            },
+            "32": {
+              "ttft_mean_ms": {
+                "mean": 298.60410043620504,
+                "min": 262.67501086113043,
+                "max": 314.7008515079506,
+                "sample_stddev": 21.477947558740407,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 3778.465329845437,
+                "min": 3748.110626055058,
+                "max": 3821.9135805157634,
+                "sample_stddev": 30.639265439782022,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 576.3199674896896,
+                "min": 541.0842909477651,
+                "max": 589.3079778179526,
+                "sample_stddev": 20.0113863668516,
+                "samples": 5
+              }
+            }
+          },
+          "decode_trace_ms": {
+            "1": {
+              "forward_ms": 6.212024841308594,
+              "dispatch_transport": 1.0414647216796875,
+              "dispatch_init_finalize": 0.11014453125,
+              "combine_packet_transport": 0.8210145874023438,
+              "combine_packet_prepare": 0.097152099609375,
+              "combine_packet_reduce": 0.132965087890625
+            },
+            "32": {
+              "forward_ms": 8.52793505859375,
+              "dispatch_transport": 1.7452022705078125,
+              "dispatch_init_finalize": 0.11760595703125,
+              "combine_packet_transport": 1.0964690551757812,
+              "combine_packet_prepare": 0.11273422241210937,
+              "combine_packet_reduce": 0.13623968505859374
+            }
+          }
+        }
+      ],
+      "decision": "retained: two completed model sessions improve B1/B32 Decode TPS without an established TTFT change",
+      "metrics": {
+        "1": {
+          "ttft_mean_ms": {
+            "mean": 97.140903910622,
+            "median": 96.9854537397623,
+            "min": 95.87620198726654,
+            "max": 98.26405486091971,
+            "sample_stddev": 0.7118081242155593,
+            "samples": 10
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 171.7463985639837,
+            "median": 171.74803579562985,
+            "min": 171.0126791714234,
+            "max": 172.28432199619115,
+            "sample_stddev": 0.35647735101263645,
+            "samples": 10
+          },
+          "latency_ms": {
+            "mean": 277.7494752313942,
+            "median": 277.7023215312511,
+            "min": 276.27412928268313,
+            "max": 278.9116930216551,
+            "sample_stddev": 0.8166084530031512,
+            "samples": 10
+          }
+        },
+        "32": {
+          "ttft_mean_ms": {
+            "mean": 284.67838999204105,
+            "median": 286.2259780376917,
+            "min": 255.55663302657194,
+            "max": 314.7008515079506,
+            "sample_stddev": 22.769275770606075,
+            "samples": 10
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 3769.8575352497,
+            "median": 3763.7806021216,
+            "min": 3733.041699532325,
+            "max": 3821.9135805157634,
+            "sample_stddev": 31.741449476508755,
+            "samples": 10
+          },
+          "latency_ms": {
+            "mean": 564.4455430563539,
+            "median": 569.1335995215923,
+            "min": 536.8364532478154,
+            "max": 589.3079778179526,
+            "sample_stddev": 21.041187524582828,
+            "samples": 10
+          }
+        }
+      }
+    }
+  },
+  "final_relative_change_percent": {
+    "control": {
+      "1": {
+        "ttft_mean_ms": -0.7616667389746534,
+        "steady_state_output_tokens_per_s": 3.01631657268977,
+        "latency_ms": -2.175428431095705
+      },
+      "32": {
+        "ttft_mean_ms": -0.30279249701284927,
+        "steady_state_output_tokens_per_s": 2.0118257583030985,
+        "latency_ms": -1.4816200236501653
+      }
+    },
+    "archived_nccl": {
+      "1": {
+        "ttft_mean_ms": -4.578048826855808,
+        "steady_state_output_tokens_per_s": 10.767796151248877,
+        "latency_ms": -7.978781292759097
+      },
+      "32": {
+        "ttft_mean_ms": -34.05800303157977,
+        "steady_state_output_tokens_per_s": 5.9559456399064015,
+        "latency_ms": -26.06449751685693
+      }
+    }
+  },
+  "profiling_before_optimization": {
+    "dispatch": {
+      "scope": "New full-model, real-route diagnostics. Role timelines overlap. Leader payload excludes stragglers counted in completion. Off/on kernels both retain instrumentation resources; compare plain performance separately. No cross-GPU clock subtraction.",
+      "groups": {
+        "1": {
+          "rx": {
+            "cta_samples": 12288,
+            "cta_elapsed_mean_us": 36.514671875,
+            "roles": {
+              "ctrl0": {
+                "span_mean_us": 35.2905859375,
+                "phase_mean_us": {
+                  "ctrl0_ready_poll": 22.04696875,
+                  "ctrl0_descriptor_alloc": 2.3389296875,
+                  "ctrl0_metadata": 0.534375,
+                  "ctrl0_metadata_commit": 0.6693776041666667,
+                  "ctrl0_stage_wait": 0.121921875,
+                  "ctrl0_ack_publish": 5.971401041666667,
+                  "ctrl0_ack_drain": 3.069205729166667,
+                  "ctrl0_other": 0.53840625
+                },
+                "phase_fraction_of_role": {
+                  "ctrl0_ready_poll_ns": 0.6247266279184317,
+                  "ctrl0_descriptor_alloc_ns": 0.06627630642467283,
+                  "ctrl0_metadata_ns": 0.015142140199836403,
+                  "ctrl0_metadata_commit_ns": 0.018967596779269732,
+                  "ctrl0_stage_wait_ns": 0.0034547988298047794,
+                  "ctrl0_ack_publish_ns": 0.169206627859398,
+                  "ctrl0_ack_drain_ns": 0.08696953160829526,
+                  "ctrl0_other_ns": 0.015256370380291309
+                }
+              },
+              "ctrl1": {
+                "span_mean_us": 27.717677083333335,
+                "phase_mean_us": {
+                  "ctrl1_ready_poll": 17.041320312499998,
+                  "ctrl1_descriptor_alloc": 1.8263932291666667,
+                  "ctrl1_metadata": 0.0,
+                  "ctrl1_metadata_commit": 0.0,
+                  "ctrl1_stage_wait": 0.0,
+                  "ctrl1_ack_publish": 6.0170208333333335,
+                  "ctrl1_ack_drain": 2.2922838541666666,
+                  "ctrl1_other": 0.5406588541666667
+                },
+                "phase_fraction_of_role": {
+                  "ctrl1_ready_poll_ns": 0.6148177663396968,
+                  "ctrl1_descriptor_alloc_ns": 0.0658927233936526,
+                  "ctrl1_metadata_ns": 0.0,
+                  "ctrl1_metadata_commit_ns": 0.0,
+                  "ctrl1_stage_wait_ns": 0.0,
+                  "ctrl1_ack_publish_ns": 0.21708243498339094,
+                  "ctrl1_ack_drain_ns": 0.08270115303222936,
+                  "ctrl1_other_ns": 0.019505922251030386
+                }
+              },
+              "rx": {
+                "span_mean_us": 36.301088541666665,
+                "phase_mean_us": {
+                  "rx_stage_wait": 32.711638020833334,
+                  "rx_payload": 0.45715625,
+                  "rx_completion": 0.05524479166666667,
+                  "rx_ack_drain_wait": 3.0770494791666665,
+                  "rx_other": 0.0
+                },
+                "phase_fraction_of_role": {
+                  "rx_stage_wait_ns": 0.9011200306923762,
+                  "rx_payload_ns": 0.012593458443409282,
+                  "rx_completion_ns": 0.0015218494509677382,
+                  "rx_ack_drain_wait_ns": 0.08476466141324676,
+                  "rx_other_ns": 0.0
+                }
+              }
+            }
+          },
+          "tx": {
+            "cta_samples": 12288,
+            "cta_elapsed_mean_us": 7.343643229166667,
+            "roles": {
+              "tx": {
+                "span_mean_us": 7.213953125,
+                "phase_mean_us": {
+                  "tx_route_local": 2.0572317708333334,
+                  "tx_credit_wait": 0.0,
+                  "tx_metadata": 0.25952864583333335,
+                  "tx_payload": 0.212234375,
+                  "tx_publish": 4.684958333333333
+                },
+                "phase_fraction_of_role": {
+                  "tx_route_local_ns": 0.2851739864657539,
+                  "tx_credit_wait_ns": 0.0,
+                  "tx_metadata_ns": 0.03597592628290516,
+                  "tx_payload_ns": 0.029419982542512015,
+                  "tx_publish_ns": 0.6494301047088289
+                }
+              }
+            }
+          }
+        },
+        "32": {
+          "rx": {
+            "cta_samples": 12288,
+            "cta_elapsed_mean_us": 47.1641875,
+            "roles": {
+              "ctrl0": {
+                "span_mean_us": 42.37253385416667,
+                "phase_mean_us": {
+                  "ctrl0_ready_poll": 14.95496875,
+                  "ctrl0_descriptor_alloc": 6.470606770833333,
+                  "ctrl0_metadata": 4.509458333333333,
+                  "ctrl0_metadata_commit": 5.7598515625,
+                  "ctrl0_stage_wait": 1.1251015625,
+                  "ctrl0_ack_publish": 4.719059895833333,
+                  "ctrl0_ack_drain": 4.254338541666667,
+                  "ctrl0_other": 0.5791484375
+                },
+                "phase_fraction_of_role": {
+                  "ctrl0_ready_poll_ns": 0.3529401569769332,
+                  "ctrl0_descriptor_alloc_ns": 0.1527075721528287,
+                  "ctrl0_metadata_ns": 0.10642408945505863,
+                  "ctrl0_metadata_commit_ns": 0.1359336116722132,
+                  "ctrl0_stage_wait_ns": 0.026552614634098973,
+                  "ctrl0_ack_publish_ns": 0.1113707268976384,
+                  "ctrl0_ack_drain_ns": 0.10040321299426656,
+                  "ctrl0_other_ns": 0.013668015216962296
+                }
+              },
+              "ctrl1": {
+                "span_mean_us": 42.55382291666667,
+                "phase_mean_us": {
+                  "ctrl1_ready_poll": 15.141966145833333,
+                  "ctrl1_descriptor_alloc": 6.586231770833333,
+                  "ctrl1_metadata": 4.616286458333334,
+                  "ctrl1_metadata_commit": 5.903458333333334,
+                  "ctrl1_stage_wait": 1.156890625,
+                  "ctrl1_ack_publish": 4.640765625,
+                  "ctrl1_ack_drain": 3.9256328125,
+                  "ctrl1_other": 0.5825911458333334
+                },
+                "phase_fraction_of_role": {
+                  "ctrl1_ready_poll_ns": 0.3558309244150851,
+                  "ctrl1_descriptor_alloc_ns": 0.15477414999190975,
+                  "ctrl1_metadata_ns": 0.10848112206918346,
+                  "ctrl1_metadata_commit_ns": 0.13872921229413632,
+                  "ctrl1_stage_wait_ns": 0.027186526279097036,
+                  "ctrl1_ack_publish_ns": 0.10905637394995113,
+                  "ctrl1_ack_drain_ns": 0.09225100222340972,
+                  "ctrl1_other_ns": 0.013690688777227468
+                }
+              },
+              "rx": {
+                "span_mean_us": 46.948184895833336,
+                "phase_mean_us": {
+                  "rx_stage_wait": 32.484598958333336,
+                  "rx_payload": 9.442453125,
+                  "rx_completion": 1.0399765625,
+                  "rx_ack_drain_wait": 3.98115625,
+                  "rx_other": 0.0
+                },
+                "phase_fraction_of_role": {
+                  "rx_stage_wait_ns": 0.6919244914453839,
+                  "rx_payload_ns": 0.20112498802563974,
+                  "rx_completion_ns": 0.022151581894112763,
+                  "rx_ack_drain_wait_ns": 0.08479893863486358,
+                  "rx_other_ns": 0.0
+                }
+              }
+            }
+          },
+          "tx": {
+            "cta_samples": 12288,
+            "cta_elapsed_mean_us": 13.6665625,
+            "roles": {
+              "tx": {
+                "span_mean_us": 13.537044270833333,
+                "phase_mean_us": {
+                  "tx_route_local": 6.782388020833333,
+                  "tx_credit_wait": 0.0,
+                  "tx_metadata": 0.5961796874999999,
+                  "tx_payload": 0.9581692708333334,
+                  "tx_publish": 5.200307291666666
+                },
+                "phase_fraction_of_role": {
+                  "tx_route_local_ns": 0.5010242919458084,
+                  "tx_credit_wait_ns": 0.0,
+                  "tx_metadata_ns": 0.04404061001591889,
+                  "tx_payload_ns": 0.07078127630104507,
+                  "tx_publish_ns": 0.3841538217372276
+                }
+              }
+            }
+          }
+        }
+      },
+      "instrumentation_perturbation": {
+        "1": {
+          "off": {
+            "graph_window_us": {
+              "n": 128,
+              "mean": 6208.404926300049,
+              "p50": 6187.64404296875,
+              "p90": 6214.36611328125,
+              "p99": 6738.446186523437,
+              "min": 6143.52197265625,
+              "max": 6763.576171875
+            },
+            "dispatch_us": {
+              "n": 128,
+              "mean": 1848.195875,
+              "p50": 1901.5905,
+              "p90": 2099.9838,
+              "p99": 2600.7358300000014,
+              "min": 1076.7969999999993,
+              "max": 2723.1699999999996
+            },
+            "packet_us": {
+              "n": 128,
+              "mean": 414.9110078125,
+              "p50": 342.67099999999994,
+              "p90": 933.8999000000003,
+              "p99": 1057.12346,
+              "min": 264.15700000000004,
+              "max": 1072.765
+            }
+          },
+          "on": {
+            "graph_window_us": {
+              "n": 128,
+              "mean": 6364.973976135254,
+              "p50": 6363.635498046875,
+              "p90": 6385.084375,
+              "p99": 6422.035092773437,
+              "min": 6319.54345703125,
+              "max": 6488.9970703125
+            },
+            "dispatch_us": {
+              "n": 128,
+              "mean": 2003.713109375,
+              "p50": 2078.0510000000004,
+              "p90": 2263.5868000000005,
+              "p99": 2344.63882,
+              "min": 1247.3279999999997,
+              "max": 2389.2799999999997
+            },
+            "packet_us": {
+              "n": 128,
+              "mean": 416.5127109375,
+              "p50": 344.3035,
+              "p90": 942.8795,
+              "p99": 1068.1440000000002,
+              "min": 263.87300000000005,
+              "max": 1088.5800000000002
+            }
+          }
+        },
+        "32": {
+          "off": {
+            "graph_window_us": {
+              "n": 128,
+              "mean": 8819.18480682373,
+              "p50": 8790.05712890625,
+              "p90": 8911.06044921875,
+              "p99": 9030.540190429687,
+              "min": 8721.47802734375,
+              "max": 9118.048828125
+            },
+            "dispatch_us": {
+              "n": 128,
+              "mean": 1873.5760546875,
+              "p50": 1885.4115000000002,
+              "p90": 1939.4984,
+              "p99": 2005.2362400000004,
+              "min": 1740.0700000000002,
+              "max": 2052.139
+            },
+            "packet_us": {
+              "n": 128,
+              "mean": 1223.7238671875,
+              "p50": 1213.0254999999997,
+              "p90": 1322.4585,
+              "p99": 1379.1007500000003,
+              "min": 1096.6060000000002,
+              "max": 1390.275
+            }
+          },
+          "on": {
+            "graph_window_us": {
+              "n": 128,
+              "mean": 9432.257526397705,
+              "p50": 9409.015869140625,
+              "p90": 9530.030859375,
+              "p99": 9616.045,
+              "min": 9341.92578125,
+              "max": 9620.71142578125
+            },
+            "dispatch_us": {
+              "n": 128,
+              "mean": 2441.1271484375,
+              "p50": 2437.2425000000003,
+              "p90": 2552.3269999999993,
+              "p99": 2584.79383,
+              "min": 2259.8770000000004,
+              "max": 2640.2589999999996
+            },
+            "packet_us": {
+              "n": 128,
+              "mean": 1271.3580078125,
+              "p50": 1251.1745,
+              "p90": 1393.5471,
+              "p99": 1470.20699,
+              "min": 1140.552,
+              "max": 1491.2719999999997
+            }
+          }
+        }
+      }
+    },
+    "combine": {
+      "scope": "New full-model, real-route diagnostics. Role timelines overlap. Leader payload excludes stragglers counted in completion. Off/on kernels both retain instrumentation resources; compare plain performance separately. No cross-GPU clock subtraction.",
+      "groups": {
+        "1": {
+          "rx_empty": {
+            "cta_samples": 45622,
+            "cta_elapsed_mean_us": 1.7812543071325238,
+            "roles": {
+              "control": {
+                "span_mean_us": 0.8412018762877559,
+                "phase_mean_us": {
+                  "control_task_prepare": 0.0,
+                  "control_ready_poll": 0.0,
+                  "control_credit_poll": 0.0,
+                  "control_stage_wait": 0.5983211608434527,
+                  "control_commit": 0.0,
+                  "control_other": 0.2428807154443032
+                },
+                "phase_fraction_of_role": {
+                  "control_task_prepare_ns": 0.0,
+                  "control_ready_poll_ns": 0.0,
+                  "control_credit_poll_ns": 0.0,
+                  "control_stage_wait_ns": 0.7112694083420954,
+                  "control_commit_ns": 0.0,
+                  "control_other_ns": 0.28873059165790455
+                }
+              },
+              "worker": {
+                "span_mean_us": 1.1717981675507432,
+                "phase_mean_us": {
+                  "worker_stage_wait": 1.1717981675507432,
+                  "worker_payload": 0.0,
+                  "worker_completion": 0.0,
+                  "worker_commit": 0.0,
+                  "worker_other": 0.0
+                },
+                "phase_fraction_of_role": {
+                  "worker_stage_wait_ns": 1.0,
+                  "worker_payload_ns": 0.0,
+                  "worker_completion_ns": 0.0,
+                  "worker_commit_ns": 0.0,
+                  "worker_other_ns": 0.0
+                }
+              }
+            },
+            "assigned_tasks_histogram": {
+              "0": 45622
+            },
+            "direction_tasks_histogram": {
+              "2": 24,
+              "3": 310,
+              "4": 1144,
+              "5": 948,
+              "6": 176,
+              "7": 12,
+              "0": 43008
+            },
+            "ready_or_credit_poll_rounds": {
+              "samples": 45622,
+              "mean": 0
+            },
+            "missing_poll_rounds": {
+              "samples": 45622,
+              "mean": 0
+            }
+          },
+          "rx_active": {
+            "cta_samples": 3530,
+            "cta_elapsed_mean_us": 19.85896430594901,
+            "roles": {
+              "control": {
+                "span_mean_us": 18.84200793201133,
+                "phase_mean_us": {
+                  "control_task_prepare": 1.3593382436260624,
+                  "control_ready_poll": 9.932673087818698,
+                  "control_credit_poll": 0.0,
+                  "control_stage_wait": 5.945799433427762,
+                  "control_commit": 1.286254957507082,
+                  "control_other": 0.31794220963172803
+                },
+                "phase_fraction_of_role": {
+                  "control_task_prepare_ns": 0.07214402246995322,
+                  "control_ready_poll_ns": 0.5271557640597178,
+                  "control_credit_poll_ns": 0.0,
+                  "control_stage_wait_ns": 0.31556081787473617,
+                  "control_commit_ns": 0.0682652805448521,
+                  "control_other_ns": 0.0168741150507407
+                }
+              },
+              "worker": {
+                "span_mean_us": 19.252795467422096,
+                "phase_mean_us": {
+                  "worker_stage_wait": 17.225881019830027,
+                  "worker_payload": 1.8034946175637394,
+                  "worker_completion": 0.139485552407932,
+                  "worker_commit": 0.0839342776203966,
+                  "worker_other": 0.0
+                },
+                "phase_fraction_of_role": {
+                  "worker_stage_wait_ns": 0.8947210314979019,
+                  "worker_payload_ns": 0.09367442876622545,
+                  "worker_completion_ns": 0.007244950617376958,
+                  "worker_commit_ns": 0.004359589118495695,
+                  "worker_other_ns": 0.0
+                }
+              }
+            },
+            "assigned_tasks_histogram": {
+              "1": 3530
+            },
+            "direction_tasks_histogram": {
+              "5": 1580,
+              "4": 1144,
+              "6": 528,
+              "3": 186,
+              "2": 8,
+              "7": 84
+            },
+            "rows_per_nonempty_cta": {
+              "samples": 3530,
+              "mean": 1
+            },
+            "ready_or_credit_poll_rounds": {
+              "samples": 3530,
+              "mean": 7.319830028328612
+            },
+            "missing_poll_rounds": {
+              "samples": 3530,
+              "mean": 6.319830028328612
+            },
+            "first_ready_us": {
+              "samples": 3530,
+              "mean": 14.6385223796034
+            },
+            "first_stage_us": {
+              "samples": 3530,
+              "mean": 14.847166005665722
+            },
+            "worker_initial_task_wait_us": {
+              "samples": 3530,
+              "mean": 14.916224362606233
+            },
+            "worker_after_last_commit_wait_us": {
+              "samples": 3530,
+              "mean": 2.3096566572237958
+            }
+          },
+          "tx_empty": {
+            "cta_samples": 45622,
+            "cta_elapsed_mean_us": 1.6737412651790804,
+            "roles": {
+              "control": {
+                "span_mean_us": 0.7895755556529744,
+                "phase_mean_us": {
+                  "control_task_prepare": 0.0,
+                  "control_ready_poll": 0.0,
+                  "control_credit_poll": 0.0,
+                  "control_stage_wait": 0.5686260137652887,
+                  "control_commit": 0.0,
+                  "control_other": 0.22094954188768576
+                },
+                "phase_fraction_of_role": {
+                  "control_task_prepare_ns": 0.0,
+                  "control_ready_poll_ns": 0.0,
+                  "control_credit_poll_ns": 0.0,
+                  "control_stage_wait_ns": 0.7201666891714222,
+                  "control_commit_ns": 0.0,
+                  "control_other_ns": 0.2798333108285777
+                }
+              },
+              "worker": {
+                "span_mean_us": 1.0908253035816053,
+                "phase_mean_us": {
+                  "worker_stage_wait": 1.0908253035816053,
+                  "worker_payload": 0.0,
+                  "worker_completion": 0.0,
+                  "worker_commit": 0.0,
+                  "worker_other": 0.0
+                },
+                "phase_fraction_of_role": {
+                  "worker_stage_wait_ns": 1.0,
+                  "worker_payload_ns": 0.0,
+                  "worker_completion_ns": 0.0,
+                  "worker_commit_ns": 0.0,
+                  "worker_other_ns": 0.0
+                }
+              }
+            },
+            "assigned_tasks_histogram": {
+              "0": 45622
+            },
+            "direction_tasks_histogram": {
+              "0": 20912,
+              "1": 24710
+            },
+            "ready_or_credit_poll_rounds": {
+              "samples": 45622,
+              "mean": 0
+            },
+            "missing_poll_rounds": {
+              "samples": 45622,
+              "mean": 0
+            }
+          },
+          "tx_active": {
+            "cta_samples": 3530,
+            "cta_elapsed_mean_us": 9.587562606232295,
+            "roles": {
+              "control": {
+                "span_mean_us": 8.49086912181303,
+                "phase_mean_us": {
+                  "control_task_prepare": 1.3957076487252125,
+                  "control_ready_poll": 0.0,
+                  "control_credit_poll": 1.4368634560906515,
+                  "control_stage_wait": 4.640108781869689,
+                  "control_commit": 0.7177246458923513,
+                  "control_other": 0.3004645892351275
+                },
+                "phase_fraction_of_role": {
+                  "control_task_prepare_ns": 0.16437747758231738,
+                  "control_ready_poll_ns": 0.0,
+                  "control_credit_poll_ns": 0.16922454409282453,
+                  "control_stage_wait_ns": 0.5464821934363887,
+                  "control_commit_ns": 0.08452899645438153,
+                  "control_other_ns": 0.0353867884340879
+                }
+              },
+              "worker": {
+                "span_mean_us": 8.98057790368272,
+                "phase_mean_us": {
+                  "worker_stage_wait": 5.625391501416431,
+                  "worker_payload": 1.2509189801699716,
+                  "worker_completion": 2.0204237960339944,
+                  "worker_commit": 0.08384362606232294,
+                  "worker_other": 0.0
+                },
+                "phase_fraction_of_role": {
+                  "worker_stage_wait_ns": 0.6263952678490314,
+                  "worker_payload_ns": 0.13929159053973572,
+                  "worker_completion_ns": 0.22497703574348674,
+                  "worker_commit_ns": 0.00933610586774607,
+                  "worker_other_ns": 0.0
+                }
+              }
+            },
+            "assigned_tasks_histogram": {
+              "1": 3530
+            },
+            "direction_tasks_histogram": {
+              "1": 3530
+            },
+            "rows_per_nonempty_cta": {
+              "samples": 3530,
+              "mean": 1
+            },
+            "ready_or_credit_poll_rounds": {
+              "samples": 3530,
+              "mean": 1
+            },
+            "missing_poll_rounds": {
+              "samples": 3530,
+              "mean": 0
+            },
+            "first_ready_us": {
+              "samples": 3530,
+              "mean": 3.5401518413597732
+            },
+            "first_stage_us": {
+              "samples": 3530,
+              "mean": 3.7489042492917846
+            },
+            "worker_initial_task_wait_us": {
+              "samples": 3530,
+              "mean": 3.794230028328612
+            },
+            "worker_after_last_commit_wait_us": {
+              "samples": 3530,
+              "mean": 1.8311614730878187
+            }
+          }
+        },
+        "32": {
+          "rx_empty": {
+            "cta_samples": 12306,
+            "cta_elapsed_mean_us": 1.7888197627173736,
+            "roles": {
+              "control": {
+                "span_mean_us": 0.8427186738176499,
+                "phase_mean_us": {
+                  "control_task_prepare": 0.0,
+                  "control_ready_poll": 0.0,
+                  "control_credit_poll": 0.0,
+                  "control_stage_wait": 0.6005707784820412,
+                  "control_commit": 0.0,
+                  "control_other": 0.24214789533560865
+                },
+                "phase_fraction_of_role": {
+                  "control_task_prepare_ns": 0.0,
+                  "control_ready_poll_ns": 0.0,
+                  "control_credit_poll_ns": 0.0,
+                  "control_stage_wait_ns": 0.7126586809348366,
+                  "control_commit_ns": 0.0,
+                  "control_other_ns": 0.2873413190651633
+                }
+              },
+              "worker": {
+                "span_mean_us": 1.180567528035105,
+                "phase_mean_us": {
+                  "worker_stage_wait": 1.180567528035105,
+                  "worker_payload": 0.0,
+                  "worker_completion": 0.0,
+                  "worker_commit": 0.0,
+                  "worker_other": 0.0
+                },
+                "phase_fraction_of_role": {
+                  "worker_stage_wait_ns": 1.0,
+                  "worker_payload_ns": 0.0,
+                  "worker_completion_ns": 0.0,
+                  "worker_commit_ns": 0.0,
+                  "worker_other_ns": 0.0
+                }
+              }
+            },
+            "assigned_tasks_histogram": {
+              "0": 12306
+            },
+            "direction_tasks_histogram": {
+              "3": 110,
+              "4": 1224,
+              "5": 3990,
+              "6": 4992,
+              "7": 1990
+            },
+            "ready_or_credit_poll_rounds": {
+              "samples": 12306,
+              "mean": 0
+            },
+            "missing_poll_rounds": {
+              "samples": 12306,
+              "mean": 0
+            }
+          },
+          "rx_active": {
+            "cta_samples": 36846,
+            "cta_elapsed_mean_us": 20.525805352005644,
+            "roles": {
+              "control": {
+                "span_mean_us": 19.497535906204202,
+                "phase_mean_us": {
+                  "control_task_prepare": 1.3708707593768659,
+                  "control_ready_poll": 10.150136676979862,
+                  "control_credit_poll": 0.0,
+                  "control_stage_wait": 6.358786299734028,
+                  "control_commit": 1.3002260218205504,
+                  "control_other": 0.31751614829289476
+                },
+                "phase_fraction_of_role": {
+                  "control_task_prepare_ns": 0.07030994921469276,
+                  "control_ready_poll_ns": 0.520585612756843,
+                  "control_credit_poll_ns": 0.0,
+                  "control_stage_wait_ns": 0.3261328164914744,
+                  "control_commit_ns": 0.06668668431105762,
+                  "control_other_ns": 0.016284937225932213
+                }
+              },
+              "worker": {
+                "span_mean_us": 19.919267003202517,
+                "phase_mean_us": {
+                  "worker_stage_wait": 17.476395375346033,
+                  "worker_payload": 2.215408131140422,
+                  "worker_completion": 0.14377680073820767,
+                  "worker_commit": 0.08368669597785378,
+                  "worker_other": 0.0
+                },
+                "phase_fraction_of_role": {
+                  "worker_stage_wait_ns": 0.8773613693985963,
+                  "worker_payload_ns": 0.11121936016943998,
+                  "worker_completion_ns": 0.007217976480514668,
+                  "worker_commit_ns": 0.004201293951449069,
+                  "worker_other_ns": 0.0
+                }
+              }
+            },
+            "assigned_tasks_histogram": {
+              "1": 36846
+            },
+            "direction_tasks_histogram": {
+              "7": 13930,
+              "6": 14976,
+              "5": 6650,
+              "3": 66,
+              "4": 1224
+            },
+            "rows_per_nonempty_cta": {
+              "samples": 36846,
+              "mean": 3.095207078108886
+            },
+            "ready_or_credit_poll_rounds": {
+              "samples": 36846,
+              "mean": 7.3498887260489605
+            },
+            "missing_poll_rounds": {
+              "samples": 36846,
+              "mean": 6.3498887260489605
+            },
+            "first_ready_us": {
+              "samples": 36846,
+              "mean": 14.864983987407046
+            },
+            "first_stage_us": {
+              "samples": 36846,
+              "mean": 15.073154209412149
+            },
+            "worker_initial_task_wait_us": {
+              "samples": 36846,
+              "mean": 15.151049014818433
+            },
+            "worker_after_last_commit_wait_us": {
+              "samples": 36846,
+              "mean": 2.3253463605276012
+            }
+          },
+          "tx_empty": {
+            "cta_samples": 12306,
+            "cta_elapsed_mean_us": 1.7438699821225419,
+            "roles": {
+              "control": {
+                "span_mean_us": 0.8090362424833415,
+                "phase_mean_us": {
+                  "control_task_prepare": 0.0,
+                  "control_ready_poll": 0.0,
+                  "control_credit_poll": 0.0,
+                  "control_stage_wait": 0.5781790996261986,
+                  "control_commit": 0.0,
+                  "control_other": 0.23085714285714287
+                },
+                "phase_fraction_of_role": {
+                  "control_task_prepare_ns": 0.0,
+                  "control_ready_poll_ns": 0.0,
+                  "control_credit_poll_ns": 0.0,
+                  "control_stage_wait_ns": 0.7146516673362796,
+                  "control_commit_ns": 0.0,
+                  "control_other_ns": 0.2853483326637204
+                }
+              },
+              "worker": {
+                "span_mean_us": 1.157070697220868,
+                "phase_mean_us": {
+                  "worker_stage_wait": 1.157070697220868,
+                  "worker_payload": 0.0,
+                  "worker_completion": 0.0,
+                  "worker_commit": 0.0,
+                  "worker_other": 0.0
+                },
+                "phase_fraction_of_role": {
+                  "worker_stage_wait_ns": 1.0,
+                  "worker_payload_ns": 0.0,
+                  "worker_completion_ns": 0.0,
+                  "worker_commit_ns": 0.0,
+                  "worker_other_ns": 0.0
+                }
+              }
+            },
+            "assigned_tasks_histogram": {
+              "0": 12306
+            },
+            "direction_tasks_histogram": {
+              "0": 752,
+              "1": 1372,
+              "2": 1776,
+              "3": 1280,
+              "4": 1056,
+              "5": 1008,
+              "6": 720,
+              "7": 4342
+            },
+            "ready_or_credit_poll_rounds": {
+              "samples": 12306,
+              "mean": 0
+            },
+            "missing_poll_rounds": {
+              "samples": 12306,
+              "mean": 0
+            }
+          },
+          "tx_active": {
+            "cta_samples": 36846,
+            "cta_elapsed_mean_us": 12.242713130326223,
+            "roles": {
+              "control": {
+                "span_mean_us": 11.27166172718884,
+                "phase_mean_us": {
+                  "control_task_prepare": 1.5511263095044239,
+                  "control_ready_poll": 0.0,
+                  "control_credit_poll": 1.3655660858709222,
+                  "control_stage_wait": 6.542647777234978,
+                  "control_commit": 1.5166224827661077,
+                  "control_other": 0.2956990718124084
+                },
+                "phase_fraction_of_role": {
+                  "control_task_prepare_ns": 0.1376129223043385,
+                  "control_ready_poll_ns": 0.0,
+                  "control_credit_poll_ns": 0.12115037861515875,
+                  "control_stage_wait_ns": 0.580451040457787,
+                  "control_commit_ns": 0.1345518096154181,
+                  "control_other_ns": 0.026233849007297697
+                }
+              },
+              "worker": {
+                "span_mean_us": 11.662653856592303,
+                "phase_mean_us": {
+                  "worker_stage_wait": 6.375464582315583,
+                  "worker_payload": 1.731453074960647,
+                  "worker_completion": 3.4722944145904577,
+                  "worker_commit": 0.08344178472561473,
+                  "worker_other": 0.0
+                },
+                "phase_fraction_of_role": {
+                  "worker_stage_wait_ns": 0.5466564180597591,
+                  "worker_payload_ns": 0.14846132760614728,
+                  "worker_completion_ns": 0.2977276404913404,
+                  "worker_commit_ns": 0.007154613842753238,
+                  "worker_other_ns": 0.0
+                }
+              }
+            },
+            "assigned_tasks_histogram": {
+              "1": 36846
+            },
+            "direction_tasks_histogram": {
+              "7": 30394,
+              "5": 1680,
+              "6": 2160,
+              "4": 1056,
+              "3": 768,
+              "2": 592,
+              "1": 196
+            },
+            "rows_per_nonempty_cta": {
+              "samples": 36846,
+              "mean": 3.095207078108886
+            },
+            "ready_or_credit_poll_rounds": {
+              "samples": 36846,
+              "mean": 1
+            },
+            "missing_poll_rounds": {
+              "samples": 36846,
+              "mean": 0
+            },
+            "first_ready_us": {
+              "samples": 36846,
+              "mean": 3.5732734082397
+            },
+            "first_stage_us": {
+              "samples": 36846,
+              "mean": 3.7821575204906908
+            },
+            "worker_initial_task_wait_us": {
+              "samples": 36846,
+              "mean": 3.8469652065353093
+            },
+            "worker_after_last_commit_wait_us": {
+              "samples": 36846,
+              "mean": 2.5284993757802745
+            }
+          }
+        }
+      },
+      "instrumentation_perturbation": {
+        "1": {
+          "off": {
+            "graph_window_us": {
+              "n": 128,
+              "mean": 6229.746044158936,
+              "p50": 6209.27734375,
+              "p90": 6245.62548828125,
+              "p99": 6852.456513671875,
+              "min": 6164.158203125,
+              "max": 6872.375
+            },
+            "dispatch_us": {
+              "n": 128,
+              "mean": 1824.2745859375,
+              "p50": 1882.1810000000003,
+              "p90": 2074.8345000000004,
+              "p99": 2474.379730000001,
+              "min": 1028.6390000000001,
+              "max": 2531.3990000000003
+            },
+            "packet_us": {
+              "n": 128,
+              "mean": 463.51567187499995,
+              "p50": 390.9935,
+              "p90": 1001.3177000000001,
+              "p99": 1115.47813,
+              "min": 303.90199999999993,
+              "max": 1137.8900000000003
+            }
+          },
+          "on": {
+            "graph_window_us": {
+              "n": 128,
+              "mean": 6276.814308166504,
+              "p50": 6269.5908203125,
+              "p90": 6305.7470703125,
+              "p99": 6391.362509765625,
+              "min": 6210.2060546875,
+              "max": 6464.90185546875
+            },
+            "dispatch_us": {
+              "n": 128,
+              "mean": 1818.1555,
+              "p50": 1892.9544999999998,
+              "p90": 2071.7493999999997,
+              "p99": 2150.06156,
+              "min": 1028.483,
+              "max": 2238.4030000000002
+            },
+            "packet_us": {
+              "n": 128,
+              "mean": 516.0685703125,
+              "p50": 440.6065,
+              "p90": 1068.6602000000003,
+              "p99": 1182.7988400000002,
+              "min": 354.848,
+              "max": 1205.279000000001
+            }
+          }
+        },
+        "32": {
+          "off": {
+            "graph_window_us": {
+              "n": 128,
+              "mean": 8743.358306884766,
+              "p50": 8713.2587890625,
+              "p90": 8836.81796875,
+              "p99": 9005.175170898438,
+              "min": 8658.72509765625,
+              "max": 9211.5693359375
+            },
+            "dispatch_us": {
+              "n": 128,
+              "mean": 1745.057921875,
+              "p50": 1741.965,
+              "p90": 1807.4271999999996,
+              "p99": 1919.7105099999997,
+              "min": 1644.6760000000002,
+              "max": 2080.3249999999994
+            },
+            "packet_us": {
+              "n": 128,
+              "mean": 1281.73871875,
+              "p50": 1274.1950000000002,
+              "p90": 1381.0827000000002,
+              "p99": 1417.44419,
+              "min": 1153.6889999999999,
+              "max": 1423.6510000000003
+            }
+          },
+          "on": {
+            "graph_window_us": {
+              "n": 128,
+              "mean": 8803.156936645508,
+              "p50": 8778.922119140625,
+              "p90": 8903.07021484375,
+              "p99": 8995.257060546875,
+              "min": 8708.19677734375,
+              "max": 9052.4482421875
+            },
+            "dispatch_us": {
+              "n": 128,
+              "mean": 1741.2603984375,
+              "p50": 1744.114,
+              "p90": 1803.4919999999995,
+              "p99": 1838.27259,
+              "min": 1630.92,
+              "max": 1868.9290000000008
+            },
+            "packet_us": {
+              "n": 128,
+              "mean": 1345.76503125,
+              "p50": 1336.467,
+              "p90": 1431.4016000000001,
+              "p99": 1477.30551,
+              "min": 1225.7329999999995,
+              "max": 1481.9529999999997
+            }
+          }
+        }
+      }
+    }
+  },
+  "timing_limits": [
+    "End-to-end measurements are collected without prepared phase profiling or CUDA tracing.",
+    "Separate traces report per-rank interval unions over 48-layer forwards; never sum GPU ranks.",
+    "Role timers overlap and perturb execution. Prepared-disabled mode retains instrumentation resources.",
+    "B1 ordinary trace summaries select the active DECODE rank; phase profiles also contain idle-rank work.",
+    "B32 TTFT includes scheduling and varies across sessions; no TTFT gain is established by these decode changes."
+  ],
+  "verification": [
+    "Same GPU identity/topology, driver, framework source, model configuration, execution settings and timed prompt hashes.",
+    "Original saved image filesystem restored after local image removal; new wrapper ID, 217 locked packages verified.",
+    "Actual framework NCCL initialization version matches the archive; source manifests verified for every run.",
+    "Four exact greedy token matches and zero common-prefix logprob difference for every completed model session.",
+    "Producer NUMA placement verified before and after profiling.",
+    "No external GPU process observed during completed sessions.",
+    "SHM transport verified, no P2P/NET/NVLS channels, available NVLink counter deltas zero.",
+    "Focused eight-GPU checks cover changing routes/weights, empty/skewed ranks, vector/scalar widths, bucket/channel changes and eager fallback.",
+    "Final focused Graph check covers replay, diagnostic reset/overflow, role partitioning and payload/task accounting."
+  ],
+  "excluded_attempts": [
+    {
+      "stage": "final model startup",
+      "reason": "Container received SIGKILL and was removed before readiness; no model measurement produced."
+    }
+  ],
+  "kernel_source_sha256": {
+    "ep_xpress/csrc/host_sm.cu": "310512921d8ce22a048a465a0d3d819b17b0d4782956fe3fca6d16d25ed5a497",
+    "ep_xpress/csrc/host_sm_packet.h": "6f377053682e37bd81bd4e6f1a6c2f5e6a1ad2258743d6cdedb10ba21f93591f",
+    "ep_xpress/csrc/host_sm_packet_pipeline.h": "7853cff3755a4e91415960719fd5db5440dd8c1dc796855117daaf011c222257"
+  }
+}

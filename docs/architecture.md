@@ -1260,3 +1260,46 @@ still uses the system-acquire helper. All metadata offsets retain natural
 8-byte alignment. This reduces load instructions without changing the wire
 format, synchronization ownership or payload. PCIe transaction counts are not
 inferred from instruction width alone.
+
+### Packet queue length and concurrent role diagnostics
+
+The packet pipeline selects its schedule from the current GPU-generated task
+counts. A physical TX or RX CTA assigned zero or one packet bypasses the two-stage
+descriptor scheduler. Its control lane acquires the matching READY or previous
+bank credit, hands the descriptor to all 256 payload workers through a CTA join,
+and publishes READY/ACK only after their required fences and completion join.
+One packet may contain several live tokens. This selection does not use a
+benchmark batch label, cached routes, or an assumed single-token workload.
+
+CTAs assigned multiple packets retain the independent control warp and two-stage
+pipeline. TX/RX grids, resident-block progress requirements, actual-publication
+bank credit, vector/scalar transfers and rank-ordered HBM reduction are unchanged.
+There is still no outgoing final ACK drain in packet combine: a bank is reclaimed
+when a later producer actually needs to reuse it. Empty tasks do not manufacture
+READY or ACK traffic.
+
+Packet preparation now advances the device epoch once, in block zero/thread zero.
+No other preparation block consumes that epoch. Stream/Graph ordering of the
+complete preparation grid before transport supplies the dependency; a separate
+epoch kernel is unnecessary. The non-packet mailbox path retains its original
+epoch kernel.
+
+`prepare_decode_profile(stage="combine")` supports the actual packet pipeline
+with schema 4. It records separate concurrent control and payload-leader
+timelines, task/row/byte counts, READY and old-bank credit polling, and first/last
+payload offsets. `short_queue` identifies the schedule used on each invocation.
+Timers use existing joins; they add no host reads or synchronization barriers.
+The short-queue worker interval ends before the common completion join; the
+control stage-wait interval includes that join. This differs from the general
+pipeline worker's completion interval and must be respected when comparing them.
+
+Prepare storage before capture/submission, start a sampling session outside
+capture, and read it once at the completed request boundary. Overflow increments
+the drop count instead of overwriting earlier samples. Without preparation, the
+normal template has no timer/counter operations. Prepared-but-disabled contexts
+retain diagnostic kernel resources, so even an off/on comparison does not measure
+the production specialization. Role intervals overlap, clocks are GPU-local, and
+leader payload intervals exclude slower workers covered by their completion
+join. Neither role sums nor cross-GPU timestamp subtraction gives a critical-path
+speedup. Preparation/epoch and the later HBM reduction require separate timeline
+measurement.

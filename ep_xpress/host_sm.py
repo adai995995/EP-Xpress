@@ -561,6 +561,32 @@ class HostSMContext(Context):
             for channel, header in enumerate(raw[0]):
                 for i in range(min(header[0], state["max_samples"])):
                     samples.append({"channel": channel, "values": raw[i + 1][channel]})
+            if "control_task_prepare_ns" in state["fields"]:
+                return {
+                    "schema_version": 4, "stage": "combine_packet_pipeline", "rank": self.rank,
+                    "cta_roles": "independent_tx_rx",
+                    "fields": state["fields"], "samples": samples,
+                    "dropped_samples": sum(row[2] for row in raw[0]), "status": int(self._status.item()),
+                    "phase_fields": [],
+                    "role_phase_fields": {
+                        "control": [f"control_{f}_ns" for f in (
+                            "task_prepare", "ready_poll", "credit_poll", "stage_wait", "commit", "other")],
+                        "worker": [f"worker_{f}_ns" for f in (
+                            "stage_wait", "payload", "completion", "commit", "other")],
+                    },
+                    "timing": "Concurrent control/worker leader intervals; never sum roles as wall time. "
+                        "Each role partitions its end-minus-begin offsets. No added synchronization. "
+                        "Payload is a leader instruction interval. Pipeline completion includes fence and worker join; "
+                        "short-queue worker timing ends before the common CTA join, which is included in "
+                        "control stage wait. short_queue records that distinction. "
+                        "Control READY/credit polling includes flag reads, votes and bookkeeping; "
+                        "stage wait includes shared-stage scans and worker completion/backpressure. "
+                        "Worker stage wait includes initial task supply and waiting for final commit. "
+                        "Credit is for a previously used bank, not a current outgoing ACK drain. "
+                        "Only transport is sampled; preparation/epoch and reduction are outside these counters. "
+                        "Disabled prepared contexts retain diagnostic kernel resources. "
+                        "GPU clocks are local; record writes excluded.",
+                }
             if "ctrl0_ready_poll_ns" in state["fields"]:
                 tx = ["tx_route_local_ns", "tx_credit_wait_ns", "tx_metadata_ns", "tx_payload_ns", "tx_publish_ns"]
                 controls = {f"ctrl{g}": [f"ctrl{g}_{f}_ns" for f in (

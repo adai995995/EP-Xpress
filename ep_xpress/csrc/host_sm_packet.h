@@ -71,6 +71,11 @@ __device__ __forceinline__ void packet_receive(TransportArgs a, char* payload,
 // is no CPU inspection, route cache, or assumption that graph shapes are live.
 __global__ void host_sm_packet_prepare_kernel(TransportArgs a) {
   const int peer = blockIdx.x, tid = threadIdx.x;
+  // No preparation CTA consumes the generation. The following transport node
+  // waits for this entire grid, including this single-owner update, to finish.
+  if (!peer && !tid && a.device_epoch) {
+    if (++*a.device_epoch >= (uint64_t(1) << 31)) asm volatile("trap;");
+  }
   __shared__ int send_count, receive_count;
   if (!tid) {
     send_count = receive_count = 0;
@@ -136,7 +141,7 @@ __global__ void host_sm_packet_prepare_kernel(TransportArgs a) {
 template <bool Profile = false>
 __global__ void host_sm_packet_transport_kernel(TransportArgs a) {
 #if EP_XPRESS_PACKET_PIPELINE
-  packet_pipeline_transport(a);
+  packet_pipeline_transport<Profile>(a);
   return;
 #endif
   if (a.device_epoch) a.epoch = *a.device_epoch;

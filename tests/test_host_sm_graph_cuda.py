@@ -139,12 +139,18 @@ def _worker(rank, init_file, fused, single_frame=False, chunk_bytes=4096, id_bit
             assert report["samples"]
             for sample in report["samples"]:
                 values = dict(zip(report["fields"], sample["values"]))
-                if report["schema_version"] == 3:
+                if report["schema_version"] in (3, 4):
                     for role, fields in report["role_phase_fields"].items():
                         begin = 0 if role == "tx" else values[role + "_begin_offset_ns"]
                         assert sum(values[k] for k in fields) == values[role + "_end_offset_ns"] - begin
-                    assert values["rx_payload_bytes"] == hidden * 2 * sum(
-                        values[f"ctrl{g}_payload_rows"] for g in range(2))
+                    if report["schema_version"] == 3:
+                        assert values["rx_payload_bytes"] == hidden * 2 * sum(
+                            values[f"ctrl{g}_payload_rows"] for g in range(2))
+                    else:
+                        assert values["worker_payload_bytes"] == hidden * 2 * values["worker_payload_rows"]
+                        assert values["worker_payload_rows"] == values["control_payload_rows"]
+                        assert values["worker_packets"] == values["control_published_tasks"] == values["assigned_tasks"]
+                        assert values["short_queue"] == int(values["assigned_tasks"] <= 1)
                     assert values["end_ns"] - values["begin_ns"] == values["elapsed_ns"]
                 else:
                     assert values["elapsed_ns"] == sum(values[k] for k in report["phase_fields"])

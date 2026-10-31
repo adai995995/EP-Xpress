@@ -4714,3 +4714,129 @@ successful checks and model comparison above.
 The LL implementation, allocation/API extensions and test-only changes are not
 retained in the repository. The final runtime change is solely earlier remote
 dispatch publication, with the existing two/eight-channel preset unchanged.
+
+
+## Task-count-selected packet combine and epoch preparation (2026-10-31)
+
+Two changes are retained: remove the two-stage descriptor scheduler for a CTA
+with at most one actual packet, and advance the packet epoch in the existing
+preparation grid. Both select work from freshly generated GPU task counts.
+Multiple-task queues retain the pipeline, every RX CTA retains 256 payload
+workers, and ACKs, fences, bank lifetime, routing weights and reduction order
+remain intact. No new tuning flag or benchmark-specific route assumption is
+introduced. A packet can contain multiple live tokens.
+
+The packet-pipeline profiler now observes the current implementation directly.
+It is optional and unprepared in the performance runs. The default-off role
+counters distinguish task preparation, READY, old-bank credit, payload and
+completion instead of treating concurrent roles as sequential phases.
+
+### Matched model comparison
+
+The configuration is unchanged: eight H20D GPUs, Qwen3-30B-A3B-Instruct-2507
+BF16, SGLang v0.5.21, TP/DP/EP=8, input/output lengths 512/32, eager prefill,
+decode Graph buckets 1/2/4/8, Triton experts, two dispatch channels and eight
+four-row packet-combine channels. Both implementations disable NVLink and P2P.
+The default-NCCL archive is reused; the EP control and final implementation each
+have two fresh sessions with eight warmups and five measured batches per
+concurrency per session. The table averages ten observations per concurrency.
+Decode TPS is aggregate steady-state output throughput.
+
+| Configuration | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| Archived default NCCL | 101.801 | 155.051 | 431.710 | 3557.948 |
+| Unchanged current main | 97.886 | 166.718 | 285.543 | 3695.510 |
+| Short queues + epoch preparation | 97.141 | 171.746 | 284.678 | 3769.858 |
+
+The final combination improves Decode TPS by **3.02%/2.01%** over the fresh EP
+control and **10.77%/5.96%** over archived NCCL for B1/B32. The latter comparison
+includes earlier optimizations and is not the contribution of this change alone.
+TTFT is effectively unchanged relative to current main; no additional TTFT
+benefit is established. These results cover the tested model and load range,
+not all MoE shapes or consumer GPU systems.
+
+Control session means give B1 TPS 166.728/166.708 and B32 TPS 3678.895/3712.126.
+Final session means give B1 TPS 171.686/171.807 and B32 TPS 3761.250/3778.465.
+
+B1 TPS ranges are 166.373–167.013 (sample standard deviation 0.201) for control and
+171.013–172.284 (sample standard deviation 0.356) for the final combination.
+B32 TPS ranges are 3651.425–3749.410 (sample standard deviation 28.994) and
+3733.042–3821.914 (sample standard deviation 31.741), respectively.
+B32 TTFT ranges are 249.956–340.977 (sample standard deviation 37.076) ms and
+255.557–314.701 (sample standard deviation 22.769) ms. These ranges describe observed
+variation, not confidence intervals.
+
+Separate uninstrumented model traces show B32 dispatch at about 1.76 ms before
+and 1.75 ms after, packet combine at 1.218 ms before and 1.097 ms after, and the
+complete 48-layer forward window at about 8.72 ms before and 8.53 ms after.
+The B1 source-rank packet interval decreases from about 0.943 to 0.822 ms.
+The final traces also eliminate 384 independent epoch kernels across eight
+decode steps: one per MoE layer per step. These are diagnostic timeline intervals,
+not additional throughput samples or pure payload times.
+
+### Profiling and independent ablations
+
+Before optimization, B32 dispatch RX CTAs have a sampled mean interval of
+47.16 us: worker stage wait is 32.49 us, payload instructions 9.44 us, completion
+1.04 us, and tail ACK wait 3.98 us. Each of the two concurrent control warps
+spends roughly 15 us in READY polling, 6.5 us in descriptor allocation, 4.5 us
+in metadata instructions and 5.8 us in metadata completion. These overlapping
+role intervals must not be added. Instrumentation increases the median B32
+dispatch interval from 1.885 to 2.437 ms in the prepared off/on pair, about 29%.
+Those counters locate work but do not predict a 29% production speedup.
+
+Packet-combine counters give a more specific scheduling observation: all active
+B32 CTAs in these samples process one packet, averaging 3.095 live tokens per
+packet. Every TX credit check succeeds on its first polling round. RX payload
+instructions average 2.215 us, while initial task supply averages 15.151 us and
+the worker's wait after its last commit averages 2.325 us. That last interval
+includes control retirement/termination of the shared stage; it is not an
+outgoing current-generation ACK drain. Current packet combine already reclaims
+banks on later reuse. A larger buffer does not address the observed zero-credit-
+miss case. The packet profiler's prepared off/on B32 transport medians are
+1.274/1.336 ms, about 4.9% perturbation. Normal performance uses neither prepared
+profiler. All clocks and intervals are local to a GPU; no peer timestamp
+subtraction is used.
+
+Three independent, single-session ablations preceded the repeated final model:
+
+| Candidate | B1 Decode TPS | B32 Decode TPS | Disposition |
+| --- | ---: | ---: | --- |
+| Route metadata loaded by full RX group | 165.035 | 3691.769 | Not retained |
+| Short-queue scheduling only | 170.097 | 3755.327 | Retested in final combination |
+| Epoch inside preparation only | 168.202 | 3720.988 | Retested in final combination |
+
+The metadata move regresses single-request TPS by about 1% and provides no
+repeatable B32 advantage. Its B1 dispatch trace grows from about 1.05 to 1.14 ms.
+Moving work to RX lengthens that path rather than removing the dependency, so
+this candidate is not included, even as a disabled option. The retained schedule
+removes control handoffs where no second task exists; it does not reduce the
+receive group's width. Dispatch task supply remains a larger next target than
+packet payload volume, but the failed metadata move is evidence that relocation
+alone is insufficient. Preparation and the separate HBM reduction remain
+outside the transport counters and have not been fused in this change.
+
+### Verification and runtime provenance
+
+The original local runtime image had been removed. Its saved filesystem was
+restored before the full-model runs, with a new image wrapper ID. All 217 locked
+package versions, framework source, model configuration, GPU identity/topology,
+driver and timed prompt hashes were checked. Actual SGLang NCCL initialization
+logs match the archived version, 2.30.7+cuda13.3. The restored wrapper is not
+claimed to have the old image ID. These checks and the repeated fresh EP control
+support reusing the archive for this EP-only comparison.
+
+Every completed model run has four exact greedy token matches and zero
+common-prefix logprob difference. Producer NUMA placement passes before/after
+profiling; sampled GPU ownership shows no external process; transport records
+show SHM without P2P/NET/NVLS and zero available NVLink counter deltas. Focused
+checks cover changing routes/weights, empty/skewed ranks, both aligned width
+2048/int32 IDs and scalar-tail width 258/int64 IDs, Graph bucket/channel changes,
+multiple handles and eager fallback. The final Graph diagnostic check passes
+replay, reset/overflow, role partition and task/byte accounting.
+
+One final-model startup was killed and its container removed before readiness.
+It supplied no performance data and is excluded; both subsequent full-model
+sessions completed. Raw deployment details remain private. Reviewed aggregates,
+per-session measurements and the profiling limitations are stored in the
+[measurement record](../benchmarks/reports/sglang_h20d_ep8_bf16_short_queue.json).
