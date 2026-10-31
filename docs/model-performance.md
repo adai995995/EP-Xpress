@@ -4840,3 +4840,107 @@ It supplied no performance data and is excluded; both subsequent full-model
 sessions completed. Raw deployment details remain private. Reviewed aggregates,
 per-session measurements and the profiling limitations are stored in the
 [measurement record](../benchmarks/reports/sglang_h20d_ep8_bf16_short_queue.json).
+
+## 2026-10-31: dispatch task supply and READY scheduling ablations
+
+No transport change from this round is retained. The library remains at the
+transport implementation in `4586f75`; only this experiment record is added.
+Four independent candidates preserve live routing, deduplication, route weights,
+full-width payload reception and required READY/ACK lifetime ordering. Their
+full-model results do not establish a convincing improvement across B1 and B32.
+
+The comparison uses the same eight H20D GPUs, Qwen3-30B-A3B-Instruct-2507 BF16,
+SGLang v0.5.21, TP/DP/EP8, Triton experts, FlashInfer attention, eager prefill,
+decode Graph buckets 1/2/4/8, 512 input tokens and 32 output tokens. Each session
+has eight warmups and five measured repeats per batch size. Current-main control
+and the independent-receiver candidate each have two sessions; other candidates
+have one. The archived two-session NCCL baseline is reused.
+
+All accepted runs verify SHM transport, no P2P/NET/NVLS transport, zero NVLink
+counters, GPU exclusivity, producer NUMA allocation and eight ranks reporting
+32 requested/effective physical channels. Active decode dispatch remains two
+channels and packet combine eight. Four greedy outputs and their common-prefix
+log probabilities match the reference. The saved runtime filesystem and locked
+dependencies are verified as in the preceding experiment; the image wrapper
+differs, while SGLang initializes NCCL 2.30.7+cuda13.3.
+
+### Independent changes and full-model results
+
+The scheduling ideas draw on
+[DeepEP's sender/receiver ownership](https://github.com/deepseek-ai/DeepEP/blob/v1.2.1/csrc/kernels/intranode.cu)
+and [NCCL Simple's per-connection wait/post roles](https://github.com/NVIDIA/nccl/blob/v2.30.7-1/src/device/prims_simple.h).
+Those implementations motivate separating independent progress, but do not
+establish that moving a wait improves mapped-host PCIe communication.
+
+1. **TX-owned ACK drain:** poll this channel's outgoing current-generation ACKs
+   in its independent resident TX CTA, overlapping RX progress. Whole-kernel
+   completion still protects buffer reuse. The combined-CTA fallback keeps its
+   original ordering.
+2. **Later local allocation:** reserve compact local output and owner rows after
+   remote READY publication, using the existing post-publication join.
+3. **Batched empty ACKs:** separate acquired zero-bitmaps from nonempty tasks,
+   admit a nonempty payload first, then let the relevant lanes ACK empty
+   notifications together. Nonempty metadata/payload completion remains required.
+4. **Independent peer receivers:** assign the two existing peer groups separate
+   RX CTAs, each retaining 256 payload threads and two stages. There is still one
+   TX CTA per channel and no extra wire notification or ACK. The common block
+   changes from 320 to 288 threads, so this is not an isolated test of only RX
+   parallelism. Occupancy limits and diagnostic storage use the actual role count.
+
+| Implementation | Sessions | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Archived default NCCL | 2 | 101.801 | 155.051 | 431.710 | 3557.948 |
+| Unchanged current main | 2 | 100.050 | 171.859 | 291.731 | 3780.232 |
+| TX-owned ACK drain | 1 | 96.641 | 171.929 | 263.565 | 3751.460 |
+| Later local allocation | 1 | 96.601 | 172.324 | 299.487 | 3773.045 |
+| Batched empty ACKs | 1 | 96.133 | 170.602 | 275.214 | 3766.205 |
+| Independent peer receivers | 2 | 96.881 | 172.306 | 290.164 | 3784.236 |
+
+Relative to the fresh current-main mean, B1/B32 TPS changes are +0.04%/-0.76%
+for TX ACK drain, +0.27%/-0.19% for later local allocation, -0.73%/-0.37% for
+empty ACK batching, and +0.26%/+0.11% for independent receivers. None is retained.
+The last candidate's B32 session means are 3791.101 and 3777.371, versus control
+means of 3785.109 and 3775.354. Its apparent first-session gain becomes negligible
+on repeat. A small positive pooled mean is insufficient to justify changing the
+default under the requested rollback criterion.
+
+Control/candidate B32 TPS ranges are 3735.339–3813.532 / 3742.265–3825.246, with
+sample standard deviations 26.019 / 29.495. B1 TPS ranges are 171.508–172.458 /
+172.076–172.679. These are observed ranges, not confidence intervals. The control
+B1 TTFT range includes a 123.844 ms observation, which is retained in its mean;
+the other control session averages 97.065 ms. Control/candidate B32 TTFT ranges
+are 257.059–325.995 / 252.524–328.390 ms. These decode-path changes do not establish
+an additional prefill improvement.
+
+### What the traces establish
+
+Separate traces with native role counters unprepared show current-main B32
+dispatch at 1.748/1.753 ms per 48-layer forward, packet combine near 1.103 ms,
+and the GPU forward window at 8.532/8.538 ms. TX ACK drain increases dispatch
+to 1.775 ms; later local allocation gives 1.750 ms. Independent receivers give
+1.726 ms initially but 1.760 ms on repeat, with forward windows of 8.515/8.543 ms.
+The small dispatch improvement therefore does not persist across captures.
+These short diagnostic traces are separate from timed 32-output-token requests.
+
+The experiments remove code-level ordering without establishing a useful change
+to the end-to-end critical path. Earlier ACK polling may change PCIe contention
+and rank progress, but this round does not isolate that mechanism. More RX
+workers also do not create ready tasks sooner. The next investigation should
+separate producer publication and arrival skew from receiver task preparation
+before removing another synchronization or increasing CTA count. Necessary
+payload/metadata completion before ACK remains part of the protocol.
+
+Focused checks cover eight-rank changing routes, empty/skewed owners and aligned
+and non-aligned hidden sizes. TX ACK drain additionally passes Graph/profile
+reset and overflow checks. Independent receivers initially expose a test that
+hardcodes two CTA roles: routing and timing-partition assertions pass, but its
+sample-count assertion fails. After using the native role count and checking
+unique per-CTA samples, the five-rank Graph/profile reset-overflow test passes.
+No model timing is accepted from that failed check. The candidate and its test
+adaptation are discarded together; no rejected feature switch is added.
+
+Current main still has observed B1/B32 Decode TPS 10.84%/6.25% above archived
+NCCL, with TTFT means 1.72%/32.42% lower. Those are existing advantages, not gains
+from this round. Full aggregate statistics, session results, source fingerprints
+and validation scope are in
+[`sglang_h20d_ep8_bf16_dispatch_supply.json`](../benchmarks/reports/sglang_h20d_ep8_bf16_dispatch_supply.json).
