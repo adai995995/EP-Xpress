@@ -243,6 +243,43 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
   };
 
   if (tid < kDispatchStages) stages[tid].state = 0;
+  if (tx) {
+    // Tile the live token x top-k domain over the complete existing TX CTA.
+    // Width follows top-k, with a strided tail for top-k > one warp; every
+    // legal per-channel row count is covered without a model/batch special case.
+    const int route_width = a.topk >= 32 ? 32 : 1 << (32 - __clz(a.topk - 1));
+    const int groups_per_warp = 32 / route_width;
+    const int route_lane = lane % route_width;
+    for (int base = (tid / 32) * groups_per_warp; base < n;
+         base += (blockDim.x / 32) * groups_per_warp) {
+      const int row = base + lane / route_width;
+      const int64_t route_base = int64_t(first + row * token_stride) * a.topk;
+      uint64_t mask = 0;
+      if (row < n) {
+        for (int k = route_lane; k < a.topk; k += route_width) {
+          const int64_t expert = ids[route_base + k];
+          if (expert == -1) continue;
+          if (expert < 0 || expert >= a.experts ||
+              (a.diagnostics && !isfinite(a.weights[route_base + k]))) {
+            fail(a.status, 1); continue;
+          }
+          if (a.diagnostics)
+            for (int j = 0; j < k; ++j)
+              if (ids[route_base + j] == expert) fail(a.status, 1);
+          mask |= uint64_t(1) << a.expert_rank[expert];
+        }
+      }
+      // All lanes of a warp enter each reduction, including row and top-k
+      // tails. Each tile owns one token, so rank deduplication is exact.
+      for (int distance = route_width / 2; distance; distance /= 2)
+        mask |= __shfl_down_sync(0xffffffffu, mask, distance, route_width);
+      if (row < n && route_lane == 0) {
+        masks[row] = mask;
+        a.expected_ranks[first + row * token_stride] = int64_t(mask);
+      }
+    }
+  }
+  // Reuse the existing entry join: route preparation adds no CTA barrier.
   __syncthreads();
   // Independent resident RX CTAs can consume peers while this channel sends.
   if (tx) {
@@ -263,23 +300,8 @@ __global__ void host_sm_dispatch_pipeline_kernel(TransportArgs a) {
     mark(DTxRouteLocal, tid == 0);
 #endif
     if (tid < 32) {
-      uint64_t mask = 0;
-      if (lane < n) {
-        for (int k = 0; k < a.topk; ++k) {
-          const int64_t expert = ids[int64_t(first + lane * token_stride) * a.topk + k];
-          if (expert == -1) continue;
-          if (expert < 0 || expert >= a.experts ||
-              (a.diagnostics && !isfinite(a.weights[int64_t(first + lane * token_stride) * a.topk + k]))) {
-            fail(a.status, 1); continue;
-          }
-          if (a.diagnostics)
-            for (int j = 0; j < k; ++j)
-              if (ids[int64_t(first + lane * token_stride) * a.topk + j] == expert) fail(a.status, 1);
-          mask |= uint64_t(1) << a.expert_rank[expert];
-        }
-        masks[lane] = mask;
-        a.expected_ranks[first + lane * token_stride] = int64_t(mask);
-      }
+      // The entry CTA join publishes route masks from every routing tile.
+      const uint64_t mask = lane < n ? masks[lane] : 0;
       const uint32_t local_bits = __ballot_sync(0xffffffffu, mask & (uint64_t(1) << a.rank));
       const uint32_t remote_bits = __ballot_sync(0xffffffffu, mask & ~(uint64_t(1) << a.rank));
       const uint32_t before = (uint32_t(1) << lane) - 1;

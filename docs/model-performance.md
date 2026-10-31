@@ -4944,3 +4944,101 @@ NCCL, with TTFT means 1.72%/32.42% lower. Those are existing advantages, not gai
 from this round. Full aggregate statistics, session results, source fingerprints
 and validation scope are in
 [`sglang_h20d_ep8_bf16_dispatch_supply.json`](../benchmarks/reports/sglang_h20d_ep8_bf16_dispatch_supply.json).
+
+## 2026-10-31: general dispatch descriptor batches and route preparation
+
+Only cooperative GPU route-mask preparation is retained. The two receive-side
+batching implementations are discarded. The retained code operates on the live
+token-by-top-k domain; it has no model, request-batch or expert-distribution
+special case. Larger messages continue through the existing transport fallback.
+
+### Independent implementations
+
+The receive candidate admits two acquired, nonempty peer frames into two free
+stages. Half-warps prepare their descriptors, wire lists, row addresses and
+metadata concurrently; loops cover every valid frame row and top-k tail. The
+256-thread payload receive group remains unchanged. No peer waits to form a
+batch, and ACK still requires both metadata and payload completion. A second
+independent version selects pairs from the nonempty READY bitmap, avoiding
+attempted pairs with empty notifications. Neither version gives a useful overall
+improvement under the rollback criterion.
+
+The retained TX change replaces a serial top-k scan per token lane with tiles
+spread over the existing CTA. Tile width follows top-k, values wider than a warp
+use strided loads, and warp reductions build the same rank-deduplication mask.
+Partial tiles participate with zero masks. The existing entry CTA join publishes
+the completed masks; no additional CTA, barrier, buffer, CPU readback or host
+signal is introduced. Host payload publication, receive scheduling, ACK and
+buffer-reuse ordering are unchanged. Routing IDs and weights remain live GPU
+data on every Graph replay.
+
+[DeepEP LL](https://github.com/deepseek-ai/DeepEP/blob/v1.2.1/csrc/kernels/internode_ll.cu)
+provides an example of assigning token fanout work to parallel warp roles;
+[NCCL Simple](https://github.com/NVIDIA/nccl/blob/v2.30.7-1/src/device/prims_simple.h)
+separates connection roles across lanes. These inform the scheduling work here;
+the transport remains mapped-host PCIe.
+
+### Full-model measurements
+
+The configuration remains eight H20D GPUs, Qwen3-30B-A3B-Instruct-2507 BF16,
+SGLang v0.5.21, TP/DP/EP8, Triton experts, FlashInfer, eager prefill and decode
+Graph buckets 1/2/4/8. Requests contain 512 input and 32 output tokens. There are
+eight warmups and five measured repeats per workload per session. Control and
+retained TX each have two independent sessions; each receive candidate has one.
+The archived two-session default NCCL baseline is reused.
+
+| Implementation | Sessions | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Archived default NCCL | 2 | 101.801 | 155.051 | 431.710 | 3557.948 |
+| Unchanged current main | 2 | 96.614 | 171.902 | 277.323 | 3773.153 |
+| Paired descriptor and row-address preparation | 1 | 97.325 | 171.132 | 278.883 | 3791.888 |
+| Pair only acquired nonempty READY peers | 1 | 98.489 | 171.091 | 252.663 | 3777.780 |
+| Tile token x top-k preparation over the existing TX CTA | 2 | 96.391 | 173.881 | 272.108 | 3804.489 |
+
+Relative to the pooled current-main observations, retained TX increases B1/B32
+Decode TPS by **1.15%/0.83%**. The corresponding paired-session changes are
++1.17%/+0.71% and +1.13%/+0.95%. These are small gains, with the same direction
+in both sessions. Current-main B32 TPS spans 3722.657–3822.965 with sample standard
+deviation 31.347; retained TX spans 3768.151–3834.157 with standard deviation
+25.778. The ranges overlap and are not confidence intervals. The paired descriptor
+candidate changes B1/B32 TPS by -0.45%/+0.50%; nonempty-READY selection changes
+it by -0.47%/+0.12%. Both are discarded, including their feature logic.
+
+B32 TTFT varies substantially: control spans 248.928–352.348 ms, while retained
+TX spans 249.037–325.910 ms. These changes touch bounded decode dispatch; the
+unchanged prefill path and serving batch formation prevent attributing the TTFT
+mean differences to this optimization. Relative to archived NCCL, the retained
+version's observed B1/B32 Decode TPS is **12.14%/6.93%** higher; most of that
+advantage existed before this round.
+
+### Trace and correctness scope
+
+Separate traces, with native role counters unprepared, support the TX result.
+Median-across-ranks dispatch time per 48-layer decode forward changes from
+1.056/1.071 ms to 0.979/0.977 ms for B1, and from 1.743/1.740 ms to
+1.675/1.662 ms for B32. B32 packet combine remains near 1.10 ms. The B32 forward
+window changes from 8.526/8.531 ms to 8.465/8.451 ms. The first receive batch
+candidate reduces B32 dispatch to 1.689 ms, but increases B1 dispatch and does
+not establish a useful full-model gain. These short eight-output traces are
+separate from timed requests and do not measure pure PCIe bandwidth.
+
+Focused checks cover eight-rank changing routes, empty inputs, Graph bucket
+switches, eager fallback and outstanding handles. Added five-rank checks use
+noncontiguous ownership, hidden size 258, top-k 3/33, full 32-row receive stages,
+changing route masks and weights, and exact BF16 references. Retained TX and
+the nonempty-READY refinement encode source-rank/row identity across payload
+columns, exposing address swaps that repeated values could hide. Each top-k
+uses a fresh process group after an initial sequential-context fixture stalled
+in Gloo group recreation; no failed-check timings enter the comparison.
+
+All accepted model sessions verify identical benchmark prompt hashes, matching
+greedy outputs and common-prefix log probabilities, GPU exclusivity, producer
+NUMA placement, SHM transport, absent P2P/NET/NVLS transport and zero NVLink
+counters. All ranks retain 32 requested/effective physical channels; active
+decode dispatch/combine widths remain 2/8. Runtime restoration and dependency
+checks follow the preceding experiment. These tests establish functionality for
+the exercised dynamic routes, not performance on other GPU families or models.
+
+Full aggregate statistics, session results, source fingerprints and verification
+scope are in
+[`sglang_h20d_ep8_bf16_route_preparation.json`](../benchmarks/reports/sglang_h20d_ep8_bf16_route_preparation.json).
