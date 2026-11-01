@@ -5042,3 +5042,97 @@ the exercised dynamic routes, not performance on other GPU families or models.
 Full aggregate statistics, session results, source fingerprints and verification
 scope are in
 [`sglang_h20d_ep8_bf16_route_preparation.json`](../benchmarks/reports/sglang_h20d_ep8_bf16_route_preparation.json).
+
+## 2026-10-31: dispatch metadata ownership and early TX preparation
+
+Neither candidate from this round is retained. The runtime stays at `b579d77`.
+The receive-side move regresses both workloads. Earlier send-side metadata
+preparation gives a small B1 improvement, but no repeatable B32 improvement;
+under the requested conservative retention criterion it is discarded too.
+No rejected feature flag or alternate runtime path is added.
+
+### Independent changes
+
+The RX candidate moves route-ID/weight reads, local-expert mapping, inverse
+indices and owner/return-row writes from the control warp into the existing
+256-thread receive group. Metadata temporaries end before the unchanged unrolled
+payload loop. One existing receive completion covers both metadata and payload;
+ACK still follows the fence and group join. The controller publishes the stage
+descriptor and has no metadata postwork on this path. This differs from the
+earlier failed RX-metadata experiment, which retained route arrays across the
+unrolled payload loop, but it still does not improve throughput.
+
+The independent TX candidate writes a remote token's shared route metadata from
+the existing token-by-top-k tile once its destination mask is known. Each lane
+retains only its first expert ID; wider top-k uses strided traversal. This removes
+the later metadata loop without introducing another CTA, barrier or signal.
+Early writes apply only to direct slots with synchronous prior-generation
+reclamation. Deferred-reclaim mode keeps writes after credit acquisition.
+
+Both candidates preserve live GPU routes/weights on every replay, rank
+deduplication, one source payload write, full receive width and required
+READY/ACK ordering. They do not branch on a model or request batch size.
+
+### Full-model measurements and decision
+
+The configuration is unchanged: eight H20D GPUs, Qwen3-30B-A3B-Instruct-2507
+BF16, SGLang v0.5.21, TP/DP/EP8, Triton experts, FlashInfer, eager prefill,
+decode Graph buckets 1/2/4/8, 512 input and 32 output tokens. Each session uses
+eight warmups and five measured repeats per workload. The order is control,
+RX, TX, then a reverse-order TX/control repeat. NCCL is the archived two-session
+baseline, not a new measurement.
+
+| Implementation | Sessions | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Archived default NCCL | 2 | 101.801 | 155.051 | 431.710 | 3557.948 |
+| Unchanged current main | 2 | 96.261 | 174.022 | 280.800 | 3805.795 |
+| RX owns metadata and payload materialization | 1 | 96.485 | 170.834 | 260.562 | 3632.459 |
+| Prepare metadata in the TX route tile | 2 | 96.962 | 174.640 | 302.758 | 3808.197 |
+
+Relative to the pooled fresh control, RX reduces B1/B32 Decode TPS by
+1.83%/4.55%. TX changes it by +0.36%/+0.06%. TX's paired B32 changes reverse
+direction, from -0.24% to +0.37%; B1 changes are +0.24% and +0.47%. The small B1
+gain is recorded, not described as zero, but does not establish a broad benefit.
+B32 control/TX TPS sample standard deviations are 26.642/26.855, compared with
+a pooled mean difference of only 2.402 TPS. These are observed variations,
+not independent-trial confidence intervals.
+
+The decode-only changes leave prefill on its existing path. B32 TTFT spans
+248.430–342.072 ms for control and 257.020–327.447 ms for TX; mean differences
+cannot be attributed to a prefill optimization. Retained main's observed B1/B32
+TPS is 12.24%/6.97% above archived NCCL. This advantage existed before this round.
+
+### What the traces establish
+
+Separate eight-output diagnostic traces have native role counters unprepared.
+B32 reports median per-forward intervals across all eight DECODE ranks; B1
+reports the active rank recorded as DECODE, without relabeling the seven IDLE
+ranks. Each forward covers 48 model layers.
+
+Control B32 dispatch is 1.670/1.671 ms, versus 1.983 ms for RX ownership.
+Packet combine changes from about 1.097 ms to 1.138 ms, and the forward window
+from about 8.460 ms to 8.811 ms. The regression is concentrated in dispatch.
+TX B32 dispatch is 1.676/1.683 ms, offering no reduction. Its B1 dispatch is
+0.976/0.944 ms, versus control's 0.981/0.991 ms.
+
+The current controller can read metadata while the receive group copies payload.
+The RX candidate puts metadata work before payload work on participating receive
+threads. Losing some of that overlap is a plausible explanation, not a measured
+stall attribution: these traces do not separate PCIe read latency, register
+pressure or instruction scheduling. Earlier TX writes still precede the required
+join, payload stores and READY fence; eliminating a repeated ID load does not
+guarantee an earlier publication. The next investigation should measure the
+producer-to-READY chain and receiver admission together, preserving the existing
+metadata/payload overlap, before moving more work or increasing CTA count.
+
+Both candidates compile and pass the focused changing-route checks: eight-rank
+Graph replay/stage reuse and five-rank noncontiguous ownership with hidden width
+258, top-k 3/33, full 32-row stages and unique source-row payload tags. RX also
+passes diagnostic Graph reset/overflow and timing-field accounting. This is four
+GPU cases for RX and three for TX, not an exhaustive check of every build mode.
+All five model sessions pass source/runtime, output/logprob, GPU exclusivity,
+producer-NUMA, channel and transport checks. SHM is used; P2P/NET/NVLS are absent
+and available NVLink counters remain zero. Restored runtime provenance follows
+the preceding experiments. No performance claim is made for other hardware or
+models. Reviewed statistics and source fingerprints are in
+[`sglang_h20d_ep8_bf16_metadata_ownership.json`](../benchmarks/reports/sglang_h20d_ep8_bf16_metadata_ownership.json).
