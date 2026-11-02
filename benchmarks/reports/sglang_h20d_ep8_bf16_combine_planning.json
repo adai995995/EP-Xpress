@@ -1,0 +1,1179 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-02",
+  "base_commit": "2797524448d89b29d7c80463fa97e990653b5389",
+  "configuration": {
+    "gpus": "8 x NVIDIA H20D",
+    "model": "Qwen3-30B-A3B-Instruct-2507",
+    "dtype": "BF16",
+    "sglang": "v0.5.21",
+    "tp": 8,
+    "dp": 8,
+    "ep": 8,
+    "expert_backend": "Triton",
+    "attention_backend": "FlashInfer",
+    "decode_graph_buckets": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "prefill_graph": false,
+    "input_tokens": 512,
+    "output_tokens": 32,
+    "prefix_cache": false,
+    "P2P": false,
+    "NVLink": false,
+    "sglang_commit": "e00930c5489053f26d86b179cee0d087f846acbb",
+    "hidden_size": 2048,
+    "layers": 48,
+    "experts": 128,
+    "topk": 8,
+    "driver_versions": [
+      "580.105.08"
+    ],
+    "dispatch_channels": 2,
+    "packet_combine_channels": 8,
+    "packet_rows": 4,
+    "prefill_combine_rows": 16,
+    "slots": 2,
+    "chunk_bytes": 4194304,
+    "host_budget_bytes": 1073741824,
+    "host_placement": "producer NUMA",
+    "framework_nccl": "2.30.7+cuda13.3",
+    "native_build_flags": {
+      "EP_XPRESS_COMBINE_LAST_DATA": "1",
+      "EP_XPRESS_DECODE_ACK_BATCH": "1",
+      "EP_XPRESS_DECODE_CONTROL_RECORDS": "0",
+      "EP_XPRESS_DECODE_CONTROL_WARP": "0",
+      "EP_XPRESS_DECODE_DESCRIPTOR_BATCH": "32",
+      "EP_XPRESS_DECODE_DISPATCH_INDEXED": "1",
+      "EP_XPRESS_DECODE_DISPATCH_PIPELINE": "1",
+      "EP_XPRESS_DECODE_PACKET_CHANNELS": "8",
+      "EP_XPRESS_DECODE_PACKET_ROWS": "4",
+      "EP_XPRESS_DECODE_PEER_BATCH": "2",
+      "EP_XPRESS_DECODE_PUBLISH_BATCH": "8",
+      "EP_XPRESS_DECODE_READY_PREFETCH": "0",
+      "EP_XPRESS_DISPATCH_DEFER_RECLAIM": "0",
+      "EP_XPRESS_DISPATCH_DIRECT": "1",
+      "EP_XPRESS_DISPATCH_READ_UNROLL": "4",
+      "EP_XPRESS_DISPATCH_RETIRE": "0",
+      "EP_XPRESS_DISPATCH_SPLIT": "1",
+      "EP_XPRESS_DISPATCH_WRITE_UNROLL": "4",
+      "EP_XPRESS_HOST_READ64": "1",
+      "EP_XPRESS_PACKET_PIPELINE": "1",
+      "EP_XPRESS_PACKET_READY_CACHE": "0",
+      "EP_XPRESS_PACKET_RECV_LOCAL": "0",
+      "EP_XPRESS_PREFILL_READ_UNROLL": "4",
+      "EP_XPRESS_PREFILL_WRITE_UNROLL": "4",
+      "EP_XPRESS_READY_BATCH": "0",
+      "EP_XPRESS_READY_CACHE": "0",
+      "EP_XPRESS_REUSE_RETURN_INDEX": "1",
+      "EP_XPRESS_RING_SPLIT": "1",
+      "EP_XPRESS_ROUTE_PACKED": "0",
+      "EP_XPRESS_RX_FENCE": "1",
+      "EP_XPRESS_RX_POLL_WARP": "0"
+    }
+  },
+  "nccl_baseline": "../baselines/sglang_h20d_ep8_bf16_host.json",
+  "aggregation": "Arithmetic means of all measured observations. TTFT observations are batch means. No outlier removal; session ranges and sample deviations are descriptive, not confidence intervals.",
+  "warmups_per_session_per_batch": 8,
+  "measured_repeats_per_session_per_batch": 5,
+  "execution_order": [
+    "control 1",
+    "fused 1",
+    "early plan 1",
+    "fused warp 1",
+    "early plan 2",
+    "control 2",
+    "control 3",
+    "early plan 3"
+  ],
+  "variants": {
+    "control": {
+      "description": "Unchanged current main",
+      "decision": "reference",
+      "sessions": [
+        {
+          "session": 1,
+          "metrics": {
+            "1": {
+              "ttft_mean_ms": {
+                "mean": 96.92179653793573,
+                "min": 95.6627200357616,
+                "max": 97.92653564363718,
+                "sample_stddev": 0.8834103240692778,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 174.11251770540088,
+                "min": 173.74491421620618,
+                "max": 174.74966806366405,
+                "sample_stddev": 0.40297724344229924,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 275.0666077248752,
+                "min": 273.73907109722495,
+                "max": 275.8353338576853,
+                "sample_stddev": 0.8896176943764476,
+                "samples": 5
+              }
+            },
+            "32": {
+              "ttft_mean_ms": {
+                "mean": 279.9859459308209,
+                "min": 251.8720351945376,
+                "max": 316.13747355004307,
+                "sample_stddev": 26.891452902093423,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 3810.8524061462654,
+                "min": 3786.0557256434204,
+                "max": 3864.195239543737,
+                "sample_stddev": 30.809741889424995,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 561.5946527570486,
+                "min": 538.3865348994732,
+                "max": 586.0586273483932,
+                "sample_stddev": 21.36036203542272,
+                "samples": 5
+              }
+            }
+          },
+          "trace_ms_per_decode_forward": {
+            "1": {
+              "forward_ms": 6.156211608886719,
+              "dispatch_transport": 0.9837837524414063,
+              "combine_packet_prepare": 0.0968741455078125,
+              "combine_epoch": 0.0,
+              "combine_packet_transport": 0.8191362915039062,
+              "combine_packet_reduce": 0.13317718505859374
+            },
+            "32": {
+              "forward_ms": 8.454285736083985,
+              "dispatch_transport": 1.6622460327148438,
+              "combine_packet_prepare": 0.11262777709960939,
+              "combine_epoch": 0.0,
+              "combine_packet_transport": 1.0983845825195313,
+              "combine_packet_reduce": 0.13662985229492186
+            }
+          }
+        },
+        {
+          "session": 2,
+          "metrics": {
+            "1": {
+              "ttft_mean_ms": {
+                "mean": 96.43816100433469,
+                "min": 94.95605295524001,
+                "max": 97.48069290071726,
+                "sample_stddev": 1.0308738404827644,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 174.0965015355785,
+                "min": 173.43144483424754,
+                "max": 174.62662056987173,
+                "sample_stddev": 0.4452101567592176,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 274.59831181913614,
+                "min": 273.2505612075329,
+                "max": 275.99899703636765,
+                "sample_stddev": 1.2072462362413101,
+                "samples": 5
+              }
+            },
+            "32": {
+              "ttft_mean_ms": {
+                "mean": 287.11503267113585,
+                "min": 251.2765383144142,
+                "max": 326.6112053679535,
+                "sample_stddev": 33.31470290088935,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 3812.2511287448297,
+                "min": 3769.944557560826,
+                "max": 3831.8229737583288,
+                "sample_stddev": 27.66699321130278,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 566.9815796427429,
+                "min": 536.0758523456752,
+                "max": 595.1912361197174,
+                "sample_stddev": 25.069799060048794,
+                "samples": 5
+              }
+            }
+          },
+          "trace_ms_per_decode_forward": {
+            "1": {
+              "forward_ms": 6.148785583496093,
+              "dispatch_transport": 0.9798267822265625,
+              "combine_packet_prepare": 0.0973922119140625,
+              "combine_epoch": 0.0,
+              "combine_packet_transport": 0.8114043579101563,
+              "combine_packet_reduce": 0.133373779296875
+            },
+            "32": {
+              "forward_ms": 8.46551123046875,
+              "dispatch_transport": 1.6641143493652344,
+              "combine_packet_prepare": 0.11296389770507811,
+              "combine_epoch": 0.0,
+              "combine_packet_transport": 1.1096991577148438,
+              "combine_packet_reduce": 0.13669265747070314
+            }
+          }
+        },
+        {
+          "session": 3,
+          "metrics": {
+            "1": {
+              "ttft_mean_ms": {
+                "mean": 96.79577387869358,
+                "min": 95.62533628195524,
+                "max": 98.26042409986258,
+                "sample_stddev": 1.0640202927997204,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 173.83305755504944,
+                "min": 173.50249258566842,
+                "max": 174.30656065591137,
+                "sample_stddev": 0.29657752434380175,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 275.2188330516219,
+                "min": 273.56182131916285,
+                "max": 276.73081401735544,
+                "sample_stddev": 1.2563369254683274,
+                "samples": 5
+              }
+            },
+            "32": {
+              "ttft_mean_ms": {
+                "mean": 288.37824302900117,
+                "min": 259.8506363865454,
+                "max": 325.1980099157663,
+                "sample_stddev": 25.75450637993765,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 3811.6998731372414,
+                "min": 3772.882159836685,
+                "max": 3834.8079856181303,
+                "sample_stddev": 25.576011162195393,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 568.7765458598733,
+                "min": 544.1149650141597,
+                "max": 593.7345921993256,
+                "sample_stddev": 19.16548886449383,
+                "samples": 5
+              }
+            }
+          },
+          "trace_ms_per_decode_forward": {
+            "1": {
+              "forward_ms": 6.1516113891601565,
+              "dispatch_transport": 0.9800446166992187,
+              "combine_packet_prepare": 0.0968634033203125,
+              "combine_epoch": 0.0,
+              "combine_packet_transport": 0.8202910766601562,
+              "combine_packet_reduce": 0.1332645263671875
+            },
+            "32": {
+              "forward_ms": 8.462023864746094,
+              "dispatch_transport": 1.6625285644531251,
+              "combine_packet_prepare": 0.11277377319335938,
+              "combine_epoch": 0.0,
+              "combine_packet_transport": 1.1128777465820312,
+              "combine_packet_reduce": 0.13672821044921873
+            }
+          }
+        }
+      ],
+      "metrics": {
+        "1": {
+          "ttft_mean_ms": {
+            "mean": 96.71857714032133,
+            "median": 96.78111970424652,
+            "min": 94.95605295524001,
+            "max": 98.26042409986258,
+            "sample_stddev": 0.9460620933688633,
+            "samples": 15
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 174.01402559867628,
+            "median": 173.96178383868468,
+            "min": 173.43144483424754,
+            "max": 174.74966806366405,
+            "sample_stddev": 0.38177273735119005,
+            "samples": 15
+          },
+          "latency_ms": {
+            "mean": 274.96125086521107,
+            "median": 275.4052998498082,
+            "min": 273.2505612075329,
+            "max": 276.73081401735544,
+            "sample_stddev": 1.0808346430437132,
+            "samples": 15
+          }
+        },
+        "32": {
+          "ttft_mean_ms": {
+            "mean": 285.1597405436526,
+            "median": 287.4142801447306,
+            "min": 251.2765383144142,
+            "max": 326.6112053679535,
+            "sample_stddev": 26.97883754111191,
+            "samples": 15
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 3811.601136009446,
+            "median": 3805.516197690797,
+            "min": 3769.944557560826,
+            "max": 3864.195239543737,
+            "sample_stddev": 26.022386519503883,
+            "samples": 15
+          },
+          "latency_ms": {
+            "mean": 565.7842594198883,
+            "median": 571.1163165979087,
+            "min": 536.0758523456752,
+            "max": 595.1912361197174,
+            "sample_stddev": 20.612070332806354,
+            "samples": 15
+          }
+        }
+      },
+      "runtime_sha256": {
+        "ep_xpress/host_sm.py": "19f574429f2e914c020867dfa1f12d33b38ad772b92ea86da7af94935d7e0f00",
+        "ep_xpress/csrc/host_sm.cu": "310512921d8ce22a048a465a0d3d819b17b0d4782956fe3fca6d16d25ed5a497",
+        "ep_xpress/csrc/host_sm_packet.h": "6f377053682e37bd81bd4e6f1a6c2f5e6a1ad2258743d6cdedb10ba21f93591f",
+        "ep_xpress/csrc/host_sm_packet_pipeline.h": "7853cff3755a4e91415960719fd5db5440dd8c1dc796855117daaf011c222257"
+      },
+      "change_percent_vs_current_main": {
+        "1": {
+          "ttft_mean_ms": 0.0,
+          "steady_state_output_tokens_per_s": 0.0,
+          "latency_ms": 0.0
+        },
+        "32": {
+          "ttft_mean_ms": 0.0,
+          "steady_state_output_tokens_per_s": 0.0,
+          "latency_ms": 0.0
+        }
+      },
+      "change_percent_vs_archived_nccl": {
+        "1": {
+          "ttft_mean_ms": -4.9929023317379695,
+          "steady_state_output_tokens_per_s": 12.23030163157377,
+          "latency_ms": -8.902548309750358
+        },
+        "32": {
+          "ttft_mean_ms": -33.9465045205196,
+          "steady_state_output_tokens_per_s": 7.129194934225058,
+          "latency_ms": -25.889141952023575
+        }
+      }
+    },
+    "fused": {
+      "description": "Independent TX/RX and reduction CTAs in one transport kernel",
+      "decision": "discard",
+      "sessions": [
+        {
+          "session": 1,
+          "metrics": {
+            "1": {
+              "ttft_mean_ms": {
+                "mean": 96.79058454930782,
+                "min": 94.84112868085504,
+                "max": 98.38303923606873,
+                "sample_stddev": 1.2735301558169907,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 173.92582454103106,
+                "min": 173.44212060990512,
+                "max": 174.46085051277285,
+                "sample_stddev": 0.3770859110141571,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 275.1159030944109,
+                "min": 273.6666100099683,
+                "max": 276.1604441329837,
+                "sample_stddev": 0.9376143913673931,
+                "samples": 5
+              }
+            },
+            "32": {
+              "ttft_mean_ms": {
+                "mean": 289.44523306854535,
+                "min": 262.43848365265876,
+                "max": 326.4775403949898,
+                "sample_stddev": 23.264130657146424,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 3802.3147364470187,
+                "min": 3789.2466874630204,
+                "max": 3829.0409007985727,
+                "sample_stddev": 16.97003265804027,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 570.9433428011835,
+                "min": 549.6983239427209,
+                "max": 597.8598347865045,
+                "sample_stddev": 17.369658581984556,
+                "samples": 5
+              }
+            }
+          },
+          "trace_ms_per_decode_forward": {
+            "1": {
+              "forward_ms": 6.1151513671875,
+              "dispatch_transport": 0.9712179565429687,
+              "combine_packet_prepare": 0.09929595947265625,
+              "combine_epoch": 0.0,
+              "combine_packet_transport": 0.947340576171875,
+              "combine_packet_reduce": 0.0
+            },
+            "32": {
+              "forward_ms": 8.470060882568358,
+              "dispatch_transport": 1.6755077209472655,
+              "combine_packet_prepare": 0.1128004150390625,
+              "combine_epoch": 0.0,
+              "combine_packet_transport": 1.2768927001953125,
+              "combine_packet_reduce": 0.0
+            }
+          }
+        }
+      ],
+      "metrics": {
+        "1": {
+          "ttft_mean_ms": {
+            "mean": 96.79058454930782,
+            "median": 97.02674299478531,
+            "min": 94.84112868085504,
+            "max": 98.38303923606873,
+            "sample_stddev": 1.2735301558169907,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 173.92582454103106,
+            "median": 173.94459945453997,
+            "min": 173.44212060990512,
+            "max": 174.46085051277285,
+            "sample_stddev": 0.3770859110141571,
+            "samples": 5
+          },
+          "latency_ms": {
+            "mean": 275.1159030944109,
+            "median": 275.33253002911806,
+            "min": 273.6666100099683,
+            "max": 276.1604441329837,
+            "sample_stddev": 0.9376143913673931,
+            "samples": 5
+          }
+        },
+        "32": {
+          "ttft_mean_ms": {
+            "mean": 289.44523306854535,
+            "median": 288.33180776564404,
+            "min": 262.43848365265876,
+            "max": 326.4775403949898,
+            "sample_stddev": 23.264130657146424,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 3802.3147364470187,
+            "median": 3793.8313948484833,
+            "min": 3789.2466874630204,
+            "max": 3829.0409007985727,
+            "sample_stddev": 16.97003265804027,
+            "samples": 5
+          },
+          "latency_ms": {
+            "mean": 570.9433428011835,
+            "median": 570.3385001979768,
+            "min": 549.6983239427209,
+            "max": 597.8598347865045,
+            "sample_stddev": 17.369658581984556,
+            "samples": 5
+          }
+        }
+      },
+      "runtime_sha256": {
+        "ep_xpress/host_sm.py": "19f574429f2e914c020867dfa1f12d33b38ad772b92ea86da7af94935d7e0f00",
+        "ep_xpress/csrc/host_sm.cu": "f4d5cad5681267728bc56ca238a7d485ef1f81f1dc4fedfa79e862b072f0d3c2",
+        "ep_xpress/csrc/host_sm_packet.h": "d5c5053732d7e50501665ddd6ffe6cb77a05d0e70019c9d7c57ebd1216996ba9",
+        "ep_xpress/csrc/host_sm_packet_pipeline.h": "51854f82cecd5d0eec116bd12408b765f59e8bb1a4a292abd6a542131bfafad8"
+      },
+      "change_percent_vs_current_main": {
+        "1": {
+          "ttft_mean_ms": 0.07445044283687086,
+          "steady_state_output_tokens_per_s": -0.05068617735942693,
+          "latency_ms": 0.056245099523355435
+        },
+        "32": {
+          "ttft_mean_ms": 1.5028392565944015,
+          "steady_state_output_tokens_per_s": -0.24363513471269416,
+          "latency_ms": 0.9118463964665535
+        }
+      },
+      "change_percent_vs_archived_nccl": {
+        "1": {
+          "ttft_mean_ms": -4.922169126797482,
+          "steady_state_output_tokens_per_s": 12.173416381837775,
+          "latency_ms": -8.851310457383931
+        },
+        "32": {
+          "ttft_mean_ms": -32.95382666010117,
+          "steady_state_output_tokens_per_s": 6.868190575830435,
+          "latency_ms": -25.213364763522662
+        }
+      }
+    },
+    "fused_warp": {
+      "description": "Fused kernel with warp-group contributor polling",
+      "decision": "discard",
+      "sessions": [
+        {
+          "session": 1,
+          "metrics": {
+            "1": {
+              "ttft_mean_ms": {
+                "mean": 98.22421269491315,
+                "min": 95.89018812403083,
+                "max": 102.12848614901304,
+                "sample_stddev": 2.3208580432047277,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 174.48459862697675,
+                "min": 173.98538051177977,
+                "max": 174.9736448430153,
+                "sample_stddev": 0.4179198451046269,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 275.99267177283764,
+                "min": 273.62699480727315,
+                "max": 280.40860081091523,
+                "sample_stddev": 2.6023811049082095,
+                "samples": 5
+              }
+            },
+            "32": {
+              "ttft_mean_ms": {
+                "mean": 293.0141620367067,
+                "min": 252.12633328919765,
+                "max": 339.40543807693757,
+                "sample_stddev": 36.33250841544499,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 3812.744749637238,
+                "min": 3755.6684085259344,
+                "max": 3850.332051610037,
+                "sample_stddev": 38.11488771639581,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 570.8014800213277,
+                "min": 539.9325750768185,
+                "max": 603.6265040747821,
+                "sample_stddev": 26.336308692544844,
+                "samples": 5
+              }
+            }
+          },
+          "trace_ms_per_decode_forward": {
+            "1": {
+              "forward_ms": 6.101818542480469,
+              "dispatch_transport": 0.9632568969726563,
+              "combine_packet_prepare": 0.09940478515625,
+              "combine_epoch": 0.0,
+              "combine_packet_transport": 0.9457697143554687,
+              "combine_packet_reduce": 0.0
+            },
+            "32": {
+              "forward_ms": 8.458019653320312,
+              "dispatch_transport": 1.6727125549316406,
+              "combine_packet_prepare": 0.1128233642578125,
+              "combine_epoch": 0.0,
+              "combine_packet_transport": 1.2556150512695312,
+              "combine_packet_reduce": 0.0
+            }
+          }
+        }
+      ],
+      "metrics": {
+        "1": {
+          "ttft_mean_ms": {
+            "mean": 98.22421269491315,
+            "median": 97.70974796265364,
+            "min": 95.89018812403083,
+            "max": 102.12848614901304,
+            "sample_stddev": 2.3208580432047277,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 174.48459862697675,
+            "median": 174.515850489226,
+            "min": 173.98538051177977,
+            "max": 174.9736448430153,
+            "sample_stddev": 0.4179198451046269,
+            "samples": 5
+          },
+          "latency_ms": {
+            "mean": 275.99267177283764,
+            "median": 275.0200992450118,
+            "min": 273.62699480727315,
+            "max": 280.40860081091523,
+            "sample_stddev": 2.6023811049082095,
+            "samples": 5
+          }
+        },
+        "32": {
+          "ttft_mean_ms": {
+            "mean": 293.0141620367067,
+            "median": 296.0690798499854,
+            "min": 252.12633328919765,
+            "max": 339.40543807693757,
+            "sample_stddev": 36.33250841544499,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 3812.744749637238,
+            "median": 3827.876396089706,
+            "min": 3755.6684085259344,
+            "max": 3850.332051610037,
+            "sample_stddev": 38.11488771639581,
+            "samples": 5
+          },
+          "latency_ms": {
+            "mean": 570.8014800213277,
+            "median": 573.030318133533,
+            "min": 539.9325750768185,
+            "max": 603.6265040747821,
+            "sample_stddev": 26.336308692544844,
+            "samples": 5
+          }
+        }
+      },
+      "runtime_sha256": {
+        "ep_xpress/host_sm.py": "19f574429f2e914c020867dfa1f12d33b38ad772b92ea86da7af94935d7e0f00",
+        "ep_xpress/csrc/host_sm.cu": "f4d5cad5681267728bc56ca238a7d485ef1f81f1dc4fedfa79e862b072f0d3c2",
+        "ep_xpress/csrc/host_sm_packet.h": "7592a501018a763d8f828f699f84677252b42a208a7904e272394f1d3ba715c6",
+        "ep_xpress/csrc/host_sm_packet_pipeline.h": "51854f82cecd5d0eec116bd12408b765f59e8bb1a4a292abd6a542131bfafad8"
+      },
+      "change_percent_vs_current_main": {
+        "1": {
+          "ttft_mean_ms": 1.5567180567673367,
+          "steady_state_output_tokens_per_s": 0.27042247122408547,
+          "latency_ms": 0.3751150041618745
+        },
+        "32": {
+          "ttft_mean_ms": 2.7543935473078207,
+          "steady_state_output_tokens_per_s": 0.0300034968766294,
+          "latency_ms": 0.8867727438341522
+        }
+      },
+      "change_percent_vs_archived_nccl": {
+        "1": {
+          "ttft_mean_ms": -3.5139096871255604,
+          "steady_state_output_tokens_per_s": 12.533797586708118,
+          "latency_ms": -8.560828100051122
+        },
+        "32": {
+          "ttft_mean_ms": -32.12713130326155,
+          "steady_state_output_tokens_per_s": 7.161337438881121,
+          "latency_ms": -25.2319470626325
+        }
+      }
+    },
+    "early_plan": {
+      "description": "Per-handle packet preparation on an auxiliary stream",
+      "decision": "retain",
+      "sessions": [
+        {
+          "session": 1,
+          "metrics": {
+            "1": {
+              "ttft_mean_ms": {
+                "mean": 96.44382447004318,
+                "min": 95.46281583607197,
+                "max": 98.67175901308656,
+                "sample_stddev": 1.3214015574822442,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 177.67282620833768,
+                "min": 176.9976979794846,
+                "max": 178.19851324466904,
+                "sample_stddev": 0.4601060908645727,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 271.0151268169284,
+                "min": 269.56689124926925,
+                "max": 272.99823984503746,
+                "sample_stddev": 1.243529351285463,
+                "samples": 5
+              }
+            },
+            "32": {
+              "ttft_mean_ms": {
+                "mean": 268.61344475473743,
+                "min": 249.1072624688968,
+                "max": 287.95382821408566,
+                "sample_stddev": 15.330405025439916,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 3860.4531211865647,
+                "min": 3826.287638906056,
+                "max": 3884.047347167287,
+                "sample_stddev": 22.505748129565436,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 549.8336849734187,
+                "min": 530.2517577074468,
+                "max": 565.6438213773072,
+                "sample_stddev": 13.609895089868925,
+                "samples": 5
+              }
+            }
+          },
+          "trace_ms_per_decode_forward": {
+            "1": {
+              "forward_ms": 5.951000549316406,
+              "dispatch_transport": 0.96987060546875,
+              "combine_packet_prepare": 0.10440008544921875,
+              "combine_epoch": 0.04493804931640625,
+              "combine_packet_transport": 0.8265787353515625,
+              "combine_packet_reduce": 0.13398614501953124
+            },
+            "32": {
+              "forward_ms": 8.500918823242188,
+              "dispatch_transport": 1.668892059326172,
+              "combine_packet_prepare": 0.10229562377929688,
+              "combine_epoch": 0.0492049560546875,
+              "combine_packet_transport": 1.1100302429199218,
+              "combine_packet_reduce": 0.14104943847656248
+            }
+          }
+        },
+        {
+          "session": 2,
+          "metrics": {
+            "1": {
+              "ttft_mean_ms": {
+                "mean": 99.34800257906318,
+                "min": 95.66455194726586,
+                "max": 109.6617067232728,
+                "sample_stddev": 5.825781947822555,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 177.70657885355487,
+                "min": 177.44943089990178,
+                "max": 177.84638786206773,
+                "sample_stddev": 0.15838587642622373,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 273.88817369937897,
+                "min": 270.0908100232482,
+                "max": 284.449215978384,
+                "sample_stddev": 5.9705142275349505,
+                "samples": 5
+              }
+            },
+            "32": {
+              "ttft_mean_ms": {
+                "mean": 260.80565472948365,
+                "min": 249.20541790197603,
+                "max": 295.29500292846933,
+                "sample_stddev": 19.558700680972706,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 3852.402670429224,
+                "min": 3821.734330759331,
+                "max": 3882.1275788675707,
+                "sample_stddev": 27.374264444830928,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 542.2570805996656,
+                "min": 532.2514190338552,
+                "max": 570.2372998930514,
+                "sample_stddev": 15.851790804337208,
+                "samples": 5
+              }
+            }
+          },
+          "trace_ms_per_decode_forward": {
+            "1": {
+              "forward_ms": 5.967481689453125,
+              "dispatch_transport": 0.98954345703125,
+              "combine_packet_prepare": 0.1036519775390625,
+              "combine_epoch": 0.0450059814453125,
+              "combine_packet_transport": 0.8271365356445313,
+              "combine_packet_reduce": 0.134121337890625
+            },
+            "32": {
+              "forward_ms": 8.261223937988282,
+              "dispatch_transport": 1.6663571166992188,
+              "combine_packet_prepare": 0.10244952392578124,
+              "combine_epoch": 0.049339935302734374,
+              "combine_packet_transport": 1.1095719299316407,
+              "combine_packet_reduce": 0.14090457153320313
+            }
+          }
+        },
+        {
+          "session": 3,
+          "metrics": {
+            "1": {
+              "ttft_mean_ms": {
+                "mean": 96.4145471341908,
+                "min": 95.45830683782697,
+                "max": 98.32142479717731,
+                "sample_stddev": 1.112979190319328,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 177.73481292962828,
+                "min": 177.2868182725664,
+                "max": 178.1072959267396,
+                "sample_stddev": 0.3383221240895675,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 270.9245117381215,
+                "min": 270.21248172968626,
+                "max": 272.4644970148802,
+                "sample_stddev": 0.9660099885038752,
+                "samples": 5
+              }
+            },
+            "32": {
+              "ttft_mean_ms": {
+                "mean": 282.3657067870954,
+                "min": 259.4296893803403,
+                "max": 305.1841905253241,
+                "sample_stddev": 17.95242712389214,
+                "samples": 5
+              },
+              "steady_state_output_tokens_per_s": {
+                "mean": 3866.3486111546654,
+                "min": 3829.156320178991,
+                "max": 3906.357734400081,
+                "sample_stddev": 30.42533874956528,
+                "samples": 5
+              },
+              "latency_ms": {
+                "mean": 561.5406508557498,
+                "min": 542.9408410564065,
+                "max": 580.1948979496956,
+                "sample_stddev": 14.104294330271859,
+                "samples": 5
+              }
+            }
+          },
+          "trace_ms_per_decode_forward": {
+            "1": {
+              "forward_ms": 5.94259814453125,
+              "dispatch_transport": 0.9689850463867188,
+              "combine_packet_prepare": 0.10380511474609375,
+              "combine_epoch": 0.0447867431640625,
+              "combine_packet_transport": 0.8175355834960938,
+              "combine_packet_reduce": 0.13444989013671876
+            },
+            "32": {
+              "forward_ms": 8.278478881835937,
+              "dispatch_transport": 1.6786400756835937,
+              "combine_packet_prepare": 0.10250332641601562,
+              "combine_epoch": 0.04913259887695312,
+              "combine_packet_transport": 1.1248573608398438,
+              "combine_packet_reduce": 0.14099826049804687
+            }
+          }
+        }
+      ],
+      "metrics": {
+        "1": {
+          "ttft_mean_ms": {
+            "mean": 97.40212472776572,
+            "median": 96.29122726619244,
+            "min": 95.45830683782697,
+            "max": 109.6617067232728,
+            "sample_stddev": 3.5466149628741945,
+            "samples": 15
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 177.70473933050695,
+            "median": 177.77831620091172,
+            "min": 176.9976979794846,
+            "max": 178.19851324466904,
+            "sample_stddev": 0.3178739085460237,
+            "samples": 15
+          },
+          "latency_ms": {
+            "mean": 271.9426040848096,
+            "median": 270.78474406152964,
+            "min": 269.56689124926925,
+            "max": 284.449215978384,
+            "sample_stddev": 3.5947994074393095,
+            "samples": 15
+          }
+        },
+        "32": {
+          "ttft_mean_ms": {
+            "mean": 270.59493542377214,
+            "median": 268.53407676389907,
+            "min": 249.1072624688968,
+            "max": 305.1841905253241,
+            "sample_stddev": 18.805302865711,
+            "samples": 15
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 3859.7348009234847,
+            "median": 3866.4266168707077,
+            "min": 3821.734330759331,
+            "max": 3906.357734400081,
+            "sample_stddev": 25.657544420929415,
+            "samples": 15
+          },
+          "latency_ms": {
+            "mean": 551.2104721429447,
+            "median": 550.933142658323,
+            "min": 530.2517577074468,
+            "max": 580.1948979496956,
+            "sample_stddev": 15.778863155785816,
+            "samples": 15
+          }
+        }
+      },
+      "runtime_sha256": {
+        "ep_xpress/host_sm.py": "0964e48a65861164074a67fdc190003d2eb6f0633b7262c0b92b624e9219bbc9",
+        "ep_xpress/csrc/host_sm.cu": "a5f6963a216b6466a3c47b6f914719e990f475ad41fd7aa85ddef51935c9be6c",
+        "ep_xpress/csrc/host_sm_packet.h": "6f377053682e37bd81bd4e6f1a6c2f5e6a1ad2258743d6cdedb10ba21f93591f",
+        "ep_xpress/csrc/host_sm_packet_pipeline.h": "7853cff3755a4e91415960719fd5db5440dd8c1dc796855117daaf011c222257"
+      },
+      "change_percent_vs_current_main": {
+        "1": {
+          "ttft_mean_ms": 0.7067386717783064,
+          "steady_state_output_tokens_per_s": 2.1209288844006524,
+          "latency_ms": -1.0978444311344981
+        },
+        "32": {
+          "ttft_mean_ms": -5.107595164770773,
+          "steady_state_output_tokens_per_s": 1.262820090468142,
+          "latency_ms": -2.5758559087321387
+        }
+      },
+      "change_percent_vs_archived_nccl": {
+        "1": {
+          "ttft_mean_ms": -4.321450431582163,
+          "steady_state_output_tokens_per_s": 14.610626515927795,
+          "latency_ms": -9.902656610037209
+        },
+        "32": {
+          "ttft_mean_ms": -37.32024966179163,
+          "steady_state_output_tokens_per_s": 8.482043930611226,
+          "latency_ms": -27.79813086806446
+        }
+      }
+    }
+  },
+  "verification": {
+    "model_sessions": 8,
+    "source_manifests": "verified before launch",
+    "environment": "same GPU identities/topology, framework source, model configuration, container image and actual SGLang NCCL 2.30.7+cuda13.3",
+    "outputs": "four fixed greedy cases match current main exactly, including common-prefix log probabilities",
+    "gpu_exclusivity": "no external GPU process observed in any accepted session",
+    "numa": "producer placement verified before timing and after profiling",
+    "transport": "SHM present; P2P, NET and NVLS absent; all available NVLink counters have zero delta",
+    "channels": "32 physical; active decode dispatch 2 and combine 8"
+  },
+  "focused_validation": {
+    "fused": "3 GPU cases passed",
+    "fused_warp": "1 GPU case passed",
+    "early_plan": "3 GPU cases passed, then 1 case with reverse consumption of outstanding handles",
+    "coverage": [
+      "world sizes 2 and 8",
+      "hidden sizes 128, 258 and 2048",
+      "changing routes and weights, absent routes and empty inputs",
+      "eager fallback, Graph replay and bucket switches",
+      "two outstanding handles, including reverse combine order",
+      "scalar payload tail and exact BF16 reference"
+    ],
+    "scope": "Functional cases cover live dynamic routing; they do not establish performance on other workloads or every compile-time combination."
+  },
+  "readiness_diagnostics": {
+    "1": {
+      "gap_us": {
+        "n": 768,
+        "mean": 4.922875,
+        "median": 4.992,
+        "p90": 5.344,
+        "p99": 6.016
+      },
+      "after_transport_us": {
+        "n": 768,
+        "mean": 3.2744583333333335,
+        "median": 3.264,
+        "p90": 3.488,
+        "p99": 3.68
+      },
+      "remaining_transport_us": {
+        "n": 768,
+        "mean": 1.6484166666666666,
+        "median": 1.76,
+        "p90": 1.888,
+        "p99": 2.72
+      },
+      "token_ready_spread_us": {
+        "n": 768,
+        "mean": 0.0,
+        "median": 0.0,
+        "p90": 0.0,
+        "p99": 0.0
+      },
+      "tokens_per_op": {
+        "1": 768
+      }
+    },
+    "32": {
+      "gap_us": {
+        "n": 24576,
+        "mean": 4.777541666666667,
+        "median": 4.8,
+        "p90": 5.28,
+        "p99": 8.928
+      },
+      "after_transport_us": {
+        "n": 24576,
+        "mean": 3.22953125,
+        "median": 3.2,
+        "p90": 3.424,
+        "p99": 3.648
+      },
+      "remaining_transport_us": {
+        "n": 24576,
+        "mean": 1.5480104166666666,
+        "median": 1.664,
+        "p90": 1.888,
+        "p99": 5.696
+      },
+      "token_ready_spread_us": {
+        "n": 6144,
+        "mean": 0.5166458333333334,
+        "median": 0.0,
+        "p90": 2.144,
+        "p99": 6.368
+      },
+      "tokens_per_op": {
+        "4": 6144
+      }
+    }
+  },
+  "diagnostic_scope": "Readiness uses instrumented receive-commit timestamps following existing HBM completion joins, not exact last-store timestamps. Per-token records sample the first 2*active_channels tokens; all tokens in the B1/B32 model buckets are covered. Only actual remote contributors are considered. B1 includes the active source rank; B32 includes all eight ranks. GPU timestamps are never subtracted across devices. Timing includes diagnostic overhead and is not a production speedup bound.",
+  "limitations": [
+    "Full-model performance measured on the stated eight-GPU model configuration only.",
+    "Prefill transport and expert kernels are unchanged. TTFT variation is reported without claiming a prefill optimization.",
+    "Native readiness diagnostics and separate eight-output traces are distinct from timed 32-output requests.",
+    "Preparation overlaps computation; component durations must not be added to infer a critical path.",
+    "The accepted path retains separate transport and HBM reduction kernels. A combine-time epoch node is required after early preparation.",
+    "All-three fusion was not pursued after the fused-kernel candidates failed to establish a useful gain."
+  ],
+  "references": [
+    {
+      "name": "DeepEP V1 low-latency combine roles and barriers",
+      "url": "https://github.com/deepseek-ai/DeepEP/blob/v1.2.1/csrc/kernels/internode_ll.cu"
+    },
+    {
+      "name": "DeepEP deferred epilogue and handle lifetimes",
+      "url": "https://github.com/deepseek-ai/DeepEP/blob/f6aa38fe06cd4a0489e7730365d4e0114970a2f3/deep_ep/buffers/ep.py"
+    }
+  ],
+  "paired_early_tps_change_percent": {
+    "1": [
+      2.044832014295994,
+      2.0736070432975318,
+      2.2445416478642066
+    ],
+    "32": [
+      1.3015648404619773,
+      1.0532239437650581,
+      1.4337104136282752
+    ]
+  },
+  "prepare_overlap_noncommunication_kernels": {
+    "1": {
+      "1": {
+        "median_percent_overlap_noncomm_kernels": 89.06340478358325,
+        "range_percent": [
+          88.58962418266054,
+          89.53650192630762
+        ]
+      },
+      "32": {
+        "median_percent_overlap_noncomm_kernels": 91.89823995679318,
+        "range_percent": [
+          91.71836117607707,
+          93.20709235268784
+        ]
+      }
+    },
+    "2": {
+      "1": {
+        "median_percent_overlap_noncomm_kernels": 89.16250517342995,
+        "range_percent": [
+          88.56841672724312,
+          89.43921985424382
+        ]
+      },
+      "32": {
+        "median_percent_overlap_noncomm_kernels": 91.87004216730676,
+        "range_percent": [
+          91.72559210586697,
+          93.29829721522043
+        ]
+      }
+    },
+    "3": {
+      "1": {
+        "median_percent_overlap_noncomm_kernels": 88.90521116218467,
+        "range_percent": [
+          88.52703841923645,
+          89.59333642196023
+        ]
+      },
+      "32": {
+        "median_percent_overlap_noncomm_kernels": 91.85660507852276,
+        "range_percent": [
+          91.75514146750557,
+          93.13479688947179
+        ]
+      }
+    }
+  }
+}

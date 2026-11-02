@@ -3003,11 +3003,52 @@ void PreparedHostSM::dispatch(torch::Tensor input, torch::Tensor ids, torch::Ten
   else launch_transport<false, int64_t, false, true>(a, stream);
 }
 
+#if EP_XPRESS_DECODE_PACKET_ROWS > 0
+void bind_packet_plan(TransportArgs& a, torch::Tensor plan, c10::Device device) {
+  const int n = a.world * packet_tiles(a.mailbox_tokens);
+  tensor_check(plan, at::kInt, 1, device, "combine packet plan");
+  TORCH_CHECK(plan.numel() == 4 * n + 2 * a.world, "invalid packet plan shape");
+  a.packet_tasks = plan.data_ptr<int32_t>();
+  a.packet_send_masks = reinterpret_cast<uint32_t*>(a.packet_tasks + 2 * n);
+  a.packet_recv_masks = a.packet_send_masks + n;
+  a.packet_counts = a.packet_tasks + 4 * n;
+}
+#endif
+
+void PreparedHostSM::prepare_combine_plan(torch::Tensor rows, torch::Tensor expected,
+    torch::Tensor local, int64_t input_rows, torch::Tensor plan) {
+#if EP_XPRESS_DECODE_PACKET_ROWS > 0
+  auto a = impl_->combine;
+  const auto device = impl_->device;
+  tensor_check(rows, at::kInt, 2, device, "return row index");
+  tensor_check(expected, at::kLong, 1, device, "expected ranks");
+  tensor_check(local, at::kInt, 1, device, "local rows");
+  TORCH_CHECK(rows.size(0) == a.world && rows.size(1) == a.mailbox_tokens &&
+      expected.numel() == local.numel() && expected.numel() <= a.mailbox_tokens &&
+      input_rows >= 0 && input_rows <= INT32_MAX, "invalid early packet plan");
+  bind_packet_plan(a, plan, device);
+  a.return_rows = a.packet_rows = rows.data_ptr<int32_t>();
+  a.expected_ranks = expected.data_ptr<int64_t>();
+  a.local_rows = local.data_ptr<int32_t>();
+  a.capacity = int(expected.numel()); a.input_rows = int(input_rows);
+  // Task metadata belongs to the handle. Generation belongs to submission
+  // order and must not advance until combine, including on Graph replays.
+  a.device_epoch = nullptr;
+  const c10::cuda::CUDAGuard guard(device);
+  host_sm_packet_prepare_kernel<<<a.world, kThreads, 0,
+      c10::cuda::getCurrentCUDAStream(device.index()).stream()>>>(a);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#else
+  TORCH_CHECK(false, "early packet plans require packet transport");
+#endif
+}
+
 void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch::Tensor count,
     torch::Tensor owner_rows, torch::Tensor owner_counts, int64_t epoch,
     torch::Tensor output, c10::optional<torch::Tensor> remote, int64_t active_channels, int64_t identity,
     c10::optional<torch::Tensor> profile, c10::optional<torch::Tensor> expected_ranks,
-    c10::optional<torch::Tensor> local_rows, c10::optional<torch::Tensor> return_rows) {
+    c10::optional<torch::Tensor> local_rows, c10::optional<torch::Tensor> return_rows,
+    c10::optional<torch::Tensor> packet_plan) {
   auto a = impl_->combine;
   active_channel_check(a, active_channels);
   const auto device = impl_->device;
@@ -3088,7 +3129,13 @@ void PreparedHostSM::combine(torch::Tensor partial, torch::Tensor inverse, torch
     // cooperative occupancy and allocated profile capacity.
     if (EP_XPRESS_DECODE_PACKET_CHANNELS)
       a.channels = std::min(impl_->combine.channels, EP_XPRESS_DECODE_PACKET_CHANNELS);
-    host_sm_packet_prepare_kernel<<<a.world, kThreads, 0, stream>>>(a);
+    if (packet_plan.has_value()) {
+      TORCH_CHECK(a.return_rows, "early packet plan requires a per-handle return index");
+      bind_packet_plan(a, *packet_plan, device);
+      if (a.device_epoch) advance_mailbox_epoch<<<1, 1, 0, stream>>>(a.device_epoch);
+    } else {
+      host_sm_packet_prepare_kernel<<<a.world, kThreads, 0, stream>>>(a);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     const int shared_bytes = 0;
     const auto kernel = a.decode_profile ? host_sm_packet_transport_kernel<true>

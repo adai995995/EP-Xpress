@@ -166,6 +166,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
           pybind11::arg("local_rows") = pybind11::none(),
           pybind11::arg("profile") = pybind11::none(),
           pybind11::arg("return_rows") = pybind11::none())
+      .def("prepare_combine_plan", &PreparedHostSM::prepare_combine_plan)
       .def("combine", &PreparedHostSM::combine,
           pybind11::arg("partial"), pybind11::arg("inverse"), pybind11::arg("count"),
           pybind11::arg("owner_rows"), pybind11::arg("owner_counts"),
@@ -173,7 +174,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
           pybind11::arg("active_channels") = 0, pybind11::arg("identity") = 0, pybind11::arg("profile") = pybind11::none(),
           pybind11::arg("expected_ranks") = pybind11::none(),
           pybind11::arg("local_rows") = pybind11::none(),
-          pybind11::arg("return_rows") = pybind11::none());
+          pybind11::arg("return_rows") = pybind11::none(),
+          pybind11::arg("packet_plan") = pybind11::none());
   module.def("prepare_host_sm", [](torch::Tensor expert_rank, torch::Tensor expert_local,
       torch::Tensor dispatch_pointers, torch::Tensor combine_pointers, torch::Tensor status,
       int64_t rank, int64_t hidden, int64_t topk, int64_t slots, int64_t dispatch_rows,

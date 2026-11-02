@@ -28,11 +28,14 @@ class PreparedHostSM {
       int64_t identity, c10::optional<torch::Tensor> expected_ranks,
       c10::optional<torch::Tensor> local_rows, c10::optional<torch::Tensor> profile,
       c10::optional<torch::Tensor> return_rows);
+  void prepare_combine_plan(torch::Tensor rows, torch::Tensor expected,
+      torch::Tensor local, int64_t input_rows, torch::Tensor plan);
   void combine(torch::Tensor partial, torch::Tensor inverse, torch::Tensor count,
       torch::Tensor owner_rows, torch::Tensor owner_counts, int64_t epoch,
       torch::Tensor output, c10::optional<torch::Tensor> remote, int64_t active_channels, int64_t identity,
       c10::optional<torch::Tensor> profile, c10::optional<torch::Tensor> expected_ranks,
-      c10::optional<torch::Tensor> local_rows, c10::optional<torch::Tensor> return_rows);
+      c10::optional<torch::Tensor> local_rows, c10::optional<torch::Tensor> return_rows,
+      c10::optional<torch::Tensor> packet_plan);
 
  private:
   struct Impl;

@@ -80,7 +80,8 @@ def _worker(rank, init_file, fused, single_frame=False, chunk_bytes=4096, id_bit
                     partial = (batch.hidden.float() *
                         (batch.weights * (batch.local_ids >= 0)).sum(1)[:, None]).bfloat16()
                     pending.append((data, batch, partial))
-                for data, batch, partial in pending:
+                # Reverse consumption checks independent metadata and combine-time epochs.
+                for data, batch, partial in reversed(pending):
                     output = context.combine_on_stream(partial, batch.handle)
                     results.append((output.clone(), reference(data)))
         # Five retained buckets exceed the adapter's former four-entry cache;

@@ -5136,3 +5136,122 @@ and available NVLink counters remain zero. Restored runtime provenance follows
 the preceding experiments. No performance claim is made for other hardware or
 models. Reviewed statistics and source fingerprints are in
 [`sglang_h20d_ep8_bf16_metadata_ownership.json`](../benchmarks/reports/sglang_h20d_ep8_bf16_metadata_ownership.json).
+
+## 2026-11-02: decode combine dependencies and early packet planning
+
+Retain per-handle packet planning on an auxiliary CUDA stream, overlapped with
+expert-side computation. Discard both transport/reduction fusion candidates.
+The accepted implementation retains the existing full-width TX/RX CTAs,
+separate deterministic HBM reduction, actual-publication bank credit and early
+host ACK. It does not specialize routing for a model or request batch size.
+
+### Measure the dependency before fusing it
+
+A separate full-model diagnostic records RX commit timestamps after existing
+payload-completion joins and records each token's reduction start. It considers
+only that token's actual remote contributors. The mean interval from its latest
+RX commit to reduction start is 4.923 us for B1 and 4.778 us for B32. About
+3.274/3.230 us lies after the last sampled transport CTA ends; the remaining
+1.648/1.548 us lies within the transport tail. B32's median spread between token
+readiness times in one operation is zero; the mean is 0.517 us.
+
+These instrumented intervals include record overhead and kernel boundaries;
+they are not pure PCIe latency or a production speedup bound. RX timestamps
+follow the completion handoff, rather than measuring the exact last HBM store.
+No timestamps are subtracted across GPUs. The diagnostic's bounded token
+sampling covers all tokens in the measured B1/B32 buckets; general dynamic
+routes remain a correctness requirement, not a claim that these buckets cover
+every deployment.
+
+### Independently evaluated changes
+
+The first candidate keeps preparation and replaces transport plus reduction
+with a cooperative kernel containing independent TX, RX and reducer CTAs.
+Every RX writer performs the device-scope fence required for a same-kernel
+consumer. Generation-protected GPU completion words release only the current
+token's real contributor dependencies. Host ACK remains independent of reduction.
+The entire grid is occupancy bounded, preserving communication progress.
+
+The second fusion candidate distributes completion-word reads across lanes in
+warp groups instead of traversing all contributors in one lane. Both candidates
+preserve complete receive groups and rank-order arithmetic, but neither produces
+a useful full-model gain. They are not retained as dormant runtime branches.
+
+The retained candidate instead builds current task lists immediately after
+dispatch on an auxiliary stream. Each handle/workspace owns its plan and event;
+combine joins that event and waits for expert outputs on its normal stream.
+Epoch advancement remains at combine time, so reverse-order consumption of
+outstanding handles cannot reuse stale generations. Workspace plans are
+preallocated and rebuilt on every replay. No GPU route/count readback, CPU
+planning or additional host READY/ACK is introduced.
+
+Moving preparation requires a separate combine-time epoch kernel in Graph
+mode. Total kernel count therefore increases; this experiment demonstrates
+dependency overlap, not a benefit from counting fewer launches. The existing
+just-in-time preparation remains available when there is no per-handle return
+index. All-three fusion was not pursued after the two fusion candidates failed
+to establish a worthwhile gain.
+
+### Complete-model comparison
+
+Configuration remains eight H20D GPUs, BF16 Qwen3-30B-A3B-Instruct-2507,
+SGLang v0.5.21, TP/DP/EP8, Triton experts, FlashInfer, eager prefill and decode
+Graph buckets 1/2/4/8. Requests contain 512 input and 32 output tokens. Every
+session has eight warmups and five measured repeats per workload. Current main
+and early planning each have three sessions; both rejected fusion variants
+have one. All observations, including the 109.662 ms B1 TTFT sample, are retained.
+The archived two-session default NCCL baseline is reused after environment
+verification; it was not rerun.
+
+| Implementation | Sessions | B1 TTFT (ms) | B1 Decode TPS | B32 TTFT (ms) | B32 Decode TPS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Archived default NCCL | 2 | 101.801 | 155.051 | 431.710 | 3557.948 |
+| Current main before this change | 3 | 96.719 | 174.014 | 285.160 | 3811.601 |
+| Fused transport and independent reduction | 1 | 96.791 | 173.926 | 289.445 | 3802.315 |
+| Fused transport with warp-group completion polling | 1 | 98.224 | 174.485 | 293.014 | 3812.745 |
+| Early per-handle packet planning, retained | 3 | 97.402 | 177.705 | 270.595 | 3859.735 |
+
+Early planning improves pooled B1/B32 Decode TPS by **2.12%/1.26%** over current
+main and **14.61%/8.48%** over archived NCCL. Paired gains across the three
+sessions are B1 +2.04%/+2.07%/+2.24%, and B32 +1.30%/+1.05%/+1.43%. B32 pooled
+TPS sample deviations are 26.022 for control and 25.658 for early planning;
+these describe observed variation, not confidence intervals.
+
+Pooled B1 TTFT increases by 0.684 ms, while B32 decreases by 14.565 ms. Neither
+is presented as a prefill optimization: prefill is unchanged. B1 early-planning
+session means are 96.444, 99.348 and 96.415 ms; only the middle session has the
+large sample. The additional control/candidate repeat does not reproduce that
+TTFT increase. All samples remain in the reported means and ranges. End-to-end
+batch completion latency improves by 1.10%/2.58% for B1/B32.
+
+### What overlaps, and what remains
+
+Separate eight-output traces show roughly 89%–92% of preparation duration
+overlapping other noncommunication GPU kernels. This overlap statistic spans
+each local GPU trace; it is not an eight-GPU sum or a claim that all overlap is
+GEMM. Preparation duration itself remains about 0.10 ms across a 48-layer decode
+forward, and the new epoch nodes cost about 0.045 ms for B1 and 0.049 ms for B32.
+These component durations cannot be added to infer the critical path.
+
+The original fusion candidate's B32 transport/reduction kernel takes about
+1.277 ms per forward, versus 1.098 ms transport plus 0.137 ms reduction in the
+first control trace. Removing a launch did not remove the work or control cost.
+The traces do not isolate register pressure or individual stalls as the cause.
+The accepted path leaves B32 dispatch around 1.67 ms and packet transport around
+1.11 ms; it does not claim to solve the remaining communication bottlenecks.
+
+The two fusion candidates pass three and one focused GPU cases respectively.
+Early planning passes three cases, plus one repeat that combines two outstanding
+handles in reverse order. Coverage includes changing routes/weights, empty
+inputs, missing routes, Graph replay and bucket switches, eager fallback,
+eight-rank stage reuse, hidden widths 128/258/2048 and exact BF16 references.
+All eight model sessions pass output/log-probability, source/runtime, GPU
+exclusivity, producer-NUMA, channel and transport verification. SHM is present;
+P2P/NET/NVLS are absent and all available NVLink counters remain unchanged.
+
+The design uses explicit dependency and lifetime separation, consistent with
+the lessons from DeepEP's role-based combine and separately scheduled epilogue;
+it does not assume that fusion removes synchronization or require its NVLink,
+RDMA or TMA paths. Full statistics, diagnostic limits, source hashes and source
+references are in
+[`sglang_h20d_ep8_bf16_combine_planning.json`](../benchmarks/reports/sglang_h20d_ep8_bf16_combine_planning.json).

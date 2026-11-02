@@ -1120,8 +1120,9 @@ owner lists. Each peer compacts its nonempty send/receive tasks on the GPU.
 Transport CTAs partition the concatenated live task lists, including empty and
 skewed peers. The lists are rebuilt for every invocation, including Graph
 replays; task completion order may vary without changing reduction arithmetic.
-No Python route inspection, per-call allocation, CPU planning, or host barrier
-is added. Preparation still scans the configured bounded token index, so its
+No Python route inspection, CPU planning, or host barrier is added. Explicit
+workspaces preallocate their plans; non-workspace calls own independent plan
+storage. Preparation still scans the configured bounded token index, so its
 cost is part of the end-to-end comparison rather than assumed negligible.
 
 The transport launches one full 256-thread TX CTA and one full 256-thread RX
@@ -1236,6 +1237,34 @@ a later dispatch could then silently replace an earlier uncombined handle's
 routes. Local rows remain excluded from remote sends, and reduction keeps the
 existing rank order and weight application.
 
+### Prepare packet tasks alongside expert computation
+
+With packet combine and `EP_XPRESS_REUSE_RETURN_INDEX=1`, dispatch enqueues
+packet-plan preparation on a context-owned auxiliary CUDA stream after the
+dispatch completion dependency. Expert computation can proceed on the caller's
+stream while this kernel reads the current return-row index and contributor
+masks. Combine waits on this handle's preparation event before reading its plan.
+The payload still waits for expert outputs, and transport and deterministic HBM
+reduction remain separate kernels. No CPU route/count readback is introduced.
+
+Each handle or borrowed workspace owns its tasks, masks, counts and event.
+Plan storage contains `4 * world * ceil(decode_max_tokens / packet_rows) +
+2 * world` int32 values. A later dispatch cannot overwrite an outstanding
+handle's plan, including when handles are combined in reverse dispatch order.
+Every invocation and Graph replay rebuilds the plan from live routing tensors.
+Existing workspace reuse and serialized Graph replay contracts still apply.
+Tensor allocator lifetimes cover the planning and consumer streams; context
+shutdown drains the planning stream before releasing native state.
+
+The preparation event joins only this handle's metadata. It does not replace
+the expert-output dependency, READY/ACK ordering, generation-specific bank
+credit or final output completion. Epochs advance at combine submission, not
+at early preparation: Graph mode uses the separate epoch kernel before
+transport. Thus this path has an additional epoch node; its benefit comes from
+overlap and a shorter dependent preparation step, not eliminating all launches.
+Without a per-handle return index, the existing just-in-time preparation path
+remains in use. There is no model, batch-size or cached-route specialization.
+
 ### Dispatch stores and interpretation of counters
 
 `EP_XPRESS_DISPATCH_WRITE_UNROLL=1/2/4` uses aligned 128-bit payload stores and
@@ -1278,11 +1307,12 @@ There is still no outgoing final ACK drain in packet combine: a bank is reclaime
 when a later producer actually needs to reuse it. Empty tasks do not manufacture
 READY or ACK traffic.
 
-Packet preparation now advances the device epoch once, in block zero/thread zero.
-No other preparation block consumes that epoch. Stream/Graph ordering of the
-complete preparation grid before transport supplies the dependency; a separate
-epoch kernel is unnecessary. The non-packet mailbox path retains its original
-epoch kernel.
+Just-in-time packet preparation advances the device epoch once, in block
+zero/thread zero. No other preparation block consumes that epoch. Stream/Graph
+ordering of that complete grid before transport supplies the dependency. Early
+per-handle preparation disables this update and retains a combine-time epoch
+kernel instead, preserving generation order independently of dispatch order.
+The non-packet mailbox path also retains its original epoch kernel.
 
 `prepare_decode_profile(stage="combine")` supports the actual packet pipeline
 with schema 4. It records separate concurrent control and payload-leader

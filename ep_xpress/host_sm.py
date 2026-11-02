@@ -122,6 +122,8 @@ class _DeviceRoute:
     local_rows: object = None
     workspace: object = None
     return_rows: object = None
+    packet_plan: object = None
+    packet_event: object = None
 
 
 class HostSMWorkspace:
@@ -165,6 +167,8 @@ class HostSMWorkspace:
                                       dtype=torch.int32, **options)
                             if fused_combine and context._reuse_return_index else None)
 
+        self.packet_plan, self.packet_event = context._new_packet_plan() if self.return_rows is not None else (None, None)
+
     def _record_stream(self, stream, *, capturing=False):
         if capturing:
             # Graph callers retain storage for the entire graph lifetime.
@@ -174,7 +178,7 @@ class HostSMWorkspace:
                 stream.wait_stream(self._allocation_stream)
             for tensor in (self.hidden, self.local_ids, self.weights, self.inverse, self.count,
                            self.owner_rows, self.owner_counts, self.output, self.remote,
-                           self.expected_ranks, self.local_rows, self.return_rows):
+                           self.expected_ranks, self.local_rows, self.return_rows, self.packet_plan):
                 if tensor is not None:
                     tensor.record_stream(stream)
             self._recorded_streams.append(stream)
@@ -331,6 +335,7 @@ class HostSMContext(Context):
         self._prepared = None
         self._root = None
         self._work_stream = None
+        self._packet_plan_stream = None
         self._last_stream = None
         self._cuda_graph_enabled = False
         self._capture_ready = False
@@ -420,6 +425,7 @@ class HostSMContext(Context):
         try:
             with torch.cuda.device(self.device):
                 self._work_stream = torch.cuda.Stream(device=self.device)
+                self._packet_plan_stream = torch.cuda.Stream(device=self.device)
                 with torch.cuda.stream(self._work_stream):
                     for phase, size in self._arena_sizes.items():
                         pointers = []
@@ -1042,12 +1048,16 @@ class HostSMContext(Context):
                         owner_rows, owner_counts = workspace.owner_rows, workspace.owner_counts
                         expected_ranks, local_rows = workspace.expected_ranks, workspace.local_rows
                         return_rows = workspace.return_rows
+                    packet_plan, packet_event = (None, None)
+                    if return_rows is not None and self._decode_packet_rows:
+                        packet_plan, packet_event = ((workspace.packet_plan, workspace.packet_event)
+                            if workspace is not None else self._new_packet_plan())
                     decode_options = ({"expected_ranks": expected_ranks, "local_rows": local_rows,
                                        "return_rows": return_rows}
                                       if fused_combine else {})
                     handle = RouteHandle(self._id, self._counter,
                                          _DeviceRoute(inverse, count, owner_rows, owner_counts, channels,
-                                                      expected_ranks, local_rows, workspace, return_rows),
+                                                      expected_ranks, local_rows, workspace, return_rows, packet_plan, packet_event),
                                          x.shape[0], capacity, tag)
                     dispatch_profile, dispatch_record = ((None, None) if fused_combine else
                                                          self._combine_profile_slice(handle, tag, epoch))
@@ -1059,6 +1069,19 @@ class HostSMContext(Context):
                     self._prepared.dispatch(x, ids, weights, epoch, hidden, local_ids,
                                             weights_out, inverse, count, owner_rows, owner_counts,
                                             active_channels=channels, identity=identity, profile=dispatch_profile, **decode_options)
+                    if packet_plan is not None:
+                        # Fork after current dispatch; expert kernels remain on
+                        # execution. The combine below rejoins this exact handle.
+                        planning = self._packet_plan_stream
+                        planning.wait_stream(execution if same_stream else self._work_stream)
+                        with torch.cuda.stream(planning):
+                            if workspace is not None:
+                                workspace._record_stream(planning, capturing=getattr(self, "_capturing_submission", False))
+                            else:
+                                for tensor in (return_rows, expected_ranks, local_rows, packet_plan):
+                                    tensor.record_stream(planning)
+                            self._prepared.prepare_combine_plan(return_rows, expected_ranks, local_rows, capacity, packet_plan)
+                            packet_event.record(planning)
                     if dispatch_record is not None:
                         dispatch_record["submitted"] = True
                     batch = DispatchBatch(hidden, local_ids, weights_out, handle, count)
@@ -1066,6 +1089,11 @@ class HostSMContext(Context):
             except BaseException as error:
                 self._abort(error)
                 raise
+
+    def _new_packet_plan(self):
+        tiles = (self.config.decode_max_tokens + self._decode_packet_rows - 1) // self._decode_packet_rows
+        plan = torch.empty(self.world_size * (4 * tiles + 2), dtype=torch.int32, device=self.device)
+        return plan, torch.cuda.Event()
 
     def combine_on_stream(self, partial, handle, tag=None, stream=None, weights_applied=True):
         """Enqueue combine directly on its consumer stream and return the tensor.
@@ -1105,7 +1133,7 @@ class HostSMContext(Context):
                 inputs = ((partial,) if same_stream and workspace is not None else
                           (partial, handle._plan.inverse, handle._plan.count,
                            handle._plan.owner_rows, handle._plan.owner_counts,
-                           handle._plan.expected_ranks, handle._plan.local_rows, handle._plan.return_rows))
+                           handle._plan.expected_ranks, handle._plan.local_rows, handle._plan.return_rows, handle._plan.packet_plan))
                 for tensor in inputs:
                     if tensor is not None:
                         tensor.record_stream(execution)
@@ -1123,6 +1151,9 @@ class HostSMContext(Context):
                     decode_options = ({"expected_ranks": handle._plan.expected_ranks,
                                        "local_rows": handle._plan.local_rows,
                                        "return_rows": handle._plan.return_rows} if fused_combine else {})
+                    if handle._plan.packet_plan is not None:
+                        execution.wait_event(handle._plan.packet_event)
+                        decode_options["packet_plan"] = handle._plan.packet_plan
                     self._prepared.combine(partial, handle._plan.inverse, handle._plan.count,
                                            handle._plan.owner_rows, handle._plan.owner_counts,
                                            epoch, output, remote, active_channels=handle.active_channels,
@@ -1151,6 +1182,8 @@ class HostSMContext(Context):
                     last.synchronize()
                 if self._work_stream is not None:
                     self._work_stream.synchronize()
+                if self._packet_plan_stream is not None:
+                    self._packet_plan_stream.synchronize()
                 # An unfinished session is intentionally not read implicitly at
                 # shutdown. Stop it explicitly to retain its diagnostic report.
                 self._combine_profile = None
