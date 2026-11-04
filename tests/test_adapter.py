@@ -109,7 +109,8 @@ def fake_adapter(rows=3, scheduler_counts=(2, 1), is_extend=False):
         modules[name] = value
         return value
 
-    dist = module("torch.distributed", get_backend=lambda group: "gloo",
+    cpu_group, device_group = object(), object()
+    dist = module("torch.distributed", get_backend=lambda group: "nccl" if group is device_group else "gloo",
                   get_world_size=lambda group: 2, get_rank=lambda group: 0)
     cuda = SimpleNamespace(
         current_device=lambda: 0, current_stream=lambda device=None: "stream",
@@ -130,7 +131,7 @@ def fake_adapter(rows=3, scheduler_counts=(2, 1), is_extend=False):
            get_global_dp_buffer_len=lambda: None if scheduler_counts is None else sum(scheduler_counts),
            get_is_extend_in_batch=lambda: is_extend)
     parallel = SimpleNamespace(tp_size=2, attn_dp_size=2, moe_ep_size=2, moe_ep_rank=0,
-                               moe_ep_group=SimpleNamespace(cpu_group=object()))
+                               moe_ep_group=SimpleNamespace(cpu_group=cpu_group, device_group=device_group))
     module("sglang.srt.runtime_context", get_parallel=lambda: parallel)
     name = "_ep_xpress_sglang_test"
     spec = importlib.util.spec_from_file_location(name, ROOT / "ep_xpress/adapters/sglang.py")
@@ -138,8 +139,10 @@ def fake_adapter(rows=3, scheduler_counts=(2, 1), is_extend=False):
     modules[name] = adapter
     with patch.dict(sys.modules, modules), patch.dict(ep_xpress.__dict__, {"Context": Context}):
         spec.loader.exec_module(adapter)
+        handle = object()
+        adapter._get_ep_nccl_comm = lambda group, device: handle
         yield SimpleNamespace(module=adapter, calls=calls, batch=batch, cuda=cuda,
-                              topk=topk_type, combine=combine_type)
+                              topk=topk_type, combine=combine_type, parallel=parallel, nccl_comm=handle)
 
 
 class AdapterValidationTest(unittest.TestCase):
@@ -189,6 +192,19 @@ class AdapterValidationTest(unittest.TestCase):
 
 
 class AdapterContractTest(unittest.TestCase):
+    def test_host_sm_borrows_upper_layer_ep_communicator_once(self):
+        with patch.dict(os.environ, {"EP_XPRESS_TRANSPORT": "host_sm"}):
+            with fake_adapter() as fixture:
+                first = fixture.module.HostEPDispatcher(runner_config())
+                second = fixture.module.HostEPDispatcher(runner_config(layer_id=4))
+                first._context()
+                second._context()
+                inits = [args for name, args in fixture.calls if name == "init"]
+                self.assertEqual(len(inits), 1)
+                self.assertIs(inits[0]["group"], fixture.parallel.moe_ep_group.device_group)
+                self.assertIs(inits[0]["nccl_comm"], fixture.nccl_comm)
+                self.assertIs(inits[0]["bootstrap_group"], fixture.parallel.moe_ep_group.cpu_group)
+
     def test_decode_workspace_reuse_and_prefill_fallback(self):
         with patch.dict(os.environ, {"EP_XPRESS_TRANSPORT": "host_sm"}):
             with fake_adapter(scheduler_counts=(2, 1)) as fixture:

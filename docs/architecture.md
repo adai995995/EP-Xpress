@@ -70,8 +70,22 @@ cross-layer or multi-batch overlap.
 Initialization creates separate shared host arenas for every producer and
 phase. Every process registers all mappings with `cudaHostRegisterMapped` and
 obtains its own device addresses. These addresses refer to CPU memory, not
-peer GPU allocations. Expert placement is uploaded once. Gloo is used for
-bootstrap and collective healthy teardown, not for dispatch/combine metadata.
+peer GPU allocations. Expert placement is uploaded once. An upper-layer NCCL
+communicator, a borrowed matching CPU group, or a legacy isolated Gloo group carries bootstrap and collective
+healthy teardown only. Dispatch/combine metadata stays on the host-SM protocol.
+
+The SGLang adapter obtains the existing EP NCCL communicator during eager
+setup and passes an `NCCLCommHandle` to the context. It also supplies the EP
+coordinator's existing Gloo group for CPU bootstrap metadata. Both resources
+are borrowed; obtaining a device communicator does not require CUDA tensor
+traffic for CPU initialization records. A handle retains its owner,
+rank, size and CUDA device, and exposes the raw pointer through `.get()`. It
+never destroys or aborts the borrowed communicator. Compatible model layers
+share the context, so communicator resolution is outside the per-layer path.
+PyNccl handles must use their owner's NCCL DSO; PyTorch handles use its linked
+NCCL DSO. No additional NCCL communicator or Gloo group is created for this
+injected path. A process group's lazy communicator may be initialized once by
+the upper-layer helper. The application closes contexts before their owners.
 
 Each rank partitions its input among independent communication channels, with
 one CUDA CTA per channel. Within a batch, threads validate GPU top-k IDs and
@@ -468,8 +482,14 @@ The host budget counts shared arenas and, for `host_ce`, reusable private packs
 for all ranks. Device staging and Python route metadata are outside that budget.
 Freed pinned allocator caches may outlive a context.
 
-Each context creates a dedicated Gloo control group with the configured
-timeout. Stream events order GPU work; metadata operations are host blocking.
+Legacy Gloo contexts create a dedicated control group with the configured
+timeout. NCCL-backed host-SM contexts borrow the upper-layer communicator.
+When no matching CPU bootstrap group is supplied, their raw NCCL bootstrap
+collectives do not create PyTorch Work objects, so the
+process-group watchdog timeout does not bound startup/teardown. The application
+must provide a worker deadline and restart failed workers; EP-Xpress never
+aborts a borrowed communicator. Stream events order GPU work; bootstrap
+metadata operations are host blocking.
 Per-operation Gloo metadata exchange applies only to `host_ce`.
 Ranks must construct overlapping contexts and submit operations consistently.
 Local invalid submission can cause peers to time out; a failed communicator is

@@ -96,6 +96,8 @@ def test_bootstrap_negotiates_group_min_then_checks_actual_budget(capacities, ex
     context.expert_to_rank = tuple(range(context.world_size))
     context.device = torch.device("cuda", 0)
     context.group = object()
+    context.nccl_comm_handle = None
+    context._bootstrap_group = context.group
     context._channel_capacity = capacities[0]
     context._dispatch_banks = 0
 
@@ -130,6 +132,8 @@ def test_pair_grid_rejects_missing_cooperative_support_before_allocation():
     context.expert_to_rank = (0, 1)
     context.device = torch.device("cuda", 0)
     context.group = object()
+    context.nccl_comm_handle = None
+    context._bootstrap_group = context.group
     context._channel_capacity = 8
 
     def gather(result, signature, group):
@@ -534,6 +538,8 @@ def test_single_frame_protocol_mismatch_is_rejected_before_storage():
     context.expert_to_rank = (0, 1)
     context.device = torch.device("cuda", 0)
     context.group, context._channel_capacity = object(), 4
+    context.nccl_comm_handle = None
+    context._bootstrap_group = context.group
 
     def gather(result, signature, group):
         other_config = dict(signature[1], decode_single_frame=False)

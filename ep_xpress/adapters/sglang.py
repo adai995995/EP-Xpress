@@ -34,6 +34,27 @@ _contexts = {}
 _logger = logging.getLogger(__name__)
 
 
+def _get_ep_nccl_comm(coordinator, device):
+    """Resolve once in eager setup; the EP coordinator owns the communicator."""
+    from ep_xpress.comm import NCCLCommHandle, get_nccl_comm_handle
+
+    group = coordinator.device_group
+    owner = getattr(coordinator, "pynccl_comm", None)
+    if owner is not None and owner.available:
+        if dist.get_process_group_ranks(owner.group) != dist.get_process_group_ranks(group):
+            raise ValueError("SGLang PyNccl communicator must match the ordered EP group")
+        handle = NCCLCommHandle.borrow(owner.comm, owner=owner,
+                                       library_path=owner.nccl.lib._name, group=group)
+        if handle.device != device:
+            raise ValueError("SGLang PyNccl communicator belongs to another CUDA device")
+        source = "SGLang PyNccl"
+    else:
+        handle = get_nccl_comm_handle(group, device=device)
+        source = "PyTorch ProcessGroupNCCL"
+    _logger.info("EP-Xpress communicator: borrowed %s; bootstrap=borrowed EP Gloo; token transport=host_sm", source)
+    return handle
+
+
 def prepare_graph_capture():
     """Called by the full-graph backend after warmup, outside capture."""
     for context in _contexts.values():
@@ -95,16 +116,19 @@ class HostEPDispatcher(BaseDispatcher):
         if not (parallel.tp_size == parallel.attn_dp_size == size):
             raise ValueError("EP-Xpress requires attention DP = TP = EP")
         validate_runner_config(moe_runner_config, world_size=size, bf16=torch.bfloat16)
-        self._group = parallel.moe_ep_group.cpu_group
-        if str(dist.get_backend(self._group)) != "gloo":
-            raise ValueError("EP-Xpress requires a Gloo metadata group")
+        transport = os.environ.get("EP_XPRESS_TRANSPORT", "host_ce")
+        self._ep_group = parallel.moe_ep_group
+        self._group = (self._ep_group.device_group if transport == "host_sm"
+                       else self._ep_group.cpu_group)
+        backend = "nccl" if transport == "host_sm" else "gloo"
+        if str(dist.get_backend(self._group)) != backend:
+            raise ValueError(f"EP-Xpress {transport} requires the EP {backend} group")
         if dist.get_world_size(self._group) != size:
             raise ValueError("EP-Xpress metadata group does not match the EP group")
         if dist.get_rank(self._group) != parallel.moe_ep_rank:
             raise ValueError("EP-Xpress requires matching framework and metadata rank ordering")
         self._device = torch.device("cuda", torch.cuda.current_device())
         self._world_size = size
-        transport = os.environ.get("EP_XPRESS_TRANSPORT", "host_ce")
         diagnostics = os.environ.get("EP_XPRESS_DIAGNOSTICS", "0")
         if diagnostics not in ("0", "1"):
             raise ValueError("EP_XPRESS_DIAGNOSTICS must be 0 or 1")
@@ -184,11 +208,16 @@ class HostEPDispatcher(BaseDispatcher):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("initialize the EP context during eager warmup before capture")
         if self._context_key not in _contexts:
+            comm_options = {}
+            if self._config.transport == "host_sm":
+                comm_options["nccl_comm"] = _get_ep_nccl_comm(self._ep_group, self._device)
+                comm_options["bootstrap_group"] = self._ep_group.cpu_group
             _contexts[self._context_key] = Context(
                 group=self._group,
                 expert_to_rank=list(self._expert_map),
                 config=self._config,
                 device=self._device,
+                **comm_options,
             )
             if self._cuda_graph:
                 _contexts[self._context_key].enable_cuda_graph()

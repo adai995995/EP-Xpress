@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "purpose": "Communicator ownership and bootstrap integration validation, not transport tuning",
+  "hardware": "8 x NVIDIA H20D",
+  "framework": "SGLang v0.5.21",
+  "model": "Qwen3-30B-A3B-Instruct-2507",
+  "dtype": "BF16",
+  "tp_dp_ep": [
+    8,
+    8,
+    8
+  ],
+  "input_tokens": 512,
+  "output_tokens": 32,
+  "warmup_repeats": 8,
+  "timed_repeats_per_session": 5,
+  "decode_cuda_graph": true,
+  "nvlink_p2p_disabled": true,
+  "source_base": "5899e159a8bd9d42fe3d973f75242894c73f6fc4",
+  "sessions": [
+    {
+      "configuration": "previous_ep_xpress_isolated_gloo",
+      "metrics": {
+        "1": {
+          "ttft_mean_ms": {
+            "mean": 96.41998121514916,
+            "min": 95.56913003325462,
+            "max": 97.02805010601878,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 177.60559208759165,
+            "min": 177.33173059940333,
+            "max": 177.78830505139112,
+            "samples": 5
+          }
+        },
+        "32": {
+          "ttft_mean_ms": {
+            "mean": 258.9348350826185,
+            "min": 250.15336769865826,
+            "max": 278.6433162546018,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 3841.5401107346206,
+            "min": 3796.1253204689015,
+            "max": 3892.8317762005045,
+            "samples": 5
+          }
+        }
+      }
+    },
+    {
+      "configuration": "borrowed_nccl_bootstrap_1",
+      "metrics": {
+        "1": {
+          "ttft_mean_ms": {
+            "mean": 97.18788405880332,
+            "min": 96.70975198969245,
+            "max": 97.59631706401706,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 177.38062088615152,
+            "min": 177.11875085282574,
+            "max": 177.64258648379936,
+            "samples": 5
+          }
+        },
+        "32": {
+          "ttft_mean_ms": {
+            "mean": 296.34580976562575,
+            "min": 278.794918951462,
+            "max": 327.74880780198146,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 3868.4230259719097,
+            "min": 3832.9033905434767,
+            "max": 3896.820195703613,
+            "samples": 5
+          }
+        }
+      }
+    },
+    {
+      "configuration": "borrowed_nccl_bootstrap_2",
+      "metrics": {
+        "1": {
+          "ttft_mean_ms": {
+            "mean": 96.96227144449949,
+            "min": 96.29542054608464,
+            "max": 97.35692199319601,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 177.796251923134,
+            "min": 177.43895796293083,
+            "max": 178.33247956591836,
+            "samples": 5
+          }
+        },
+        "32": {
+          "ttft_mean_ms": {
+            "mean": 297.9592211981071,
+            "min": 264.0608933143085,
+            "max": 316.96885464771185,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 3878.407091826348,
+            "min": 3855.5898902268177,
+            "max": 3913.215887968433,
+            "samples": 5
+          }
+        }
+      }
+    },
+    {
+      "configuration": "borrowed_nccl_handle_and_cpu_bootstrap",
+      "metrics": {
+        "1": {
+          "ttft_mean_ms": {
+            "mean": 97.58890848606825,
+            "min": 95.88259924203157,
+            "max": 100.0378429889679,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 177.5402991297538,
+            "min": 176.96676625881935,
+            "max": 177.73862589883473,
+            "samples": 5
+          }
+        },
+        "32": {
+          "ttft_mean_ms": {
+            "mean": 268.07026567694265,
+            "min": 251.40461992123164,
+            "max": 279.23890767851844,
+            "samples": 5
+          },
+          "steady_state_output_tokens_per_s": {
+            "mean": 3857.998996956421,
+            "min": 3822.4002581503523,
+            "max": 3896.21266741539,
+            "samples": 5
+          }
+        }
+      }
+    }
+  ],
+  "checks": {
+    "subgroup_dynamic_routes_owner_lifetime_and_reacquisition": "passed",
+    "legacy_gloo_graph": "passed",
+    "exact_greedy_output_cases_per_session": 4,
+    "max_common_prefix_logprob_delta": 0,
+    "exclusive_gpu_telemetry": "passed",
+    "producer_numa_placement": "passed",
+    "nvlink_counters": "available and zero",
+    "nccl_transports": "SHM only; P2P/NET/NVLS absent"
+  },
+  "interpretation": [
+    "SGLang borrows its existing EP NCCL handle and CPU bootstrap group; no additional group is created on the retained adapter path.",
+    "Dispatch/combine kernels, per-layer routing and CUDA Graph execution are unchanged.",
+    "Pure NCCL bootstrap was not selected as the SGLang default. Its higher B32 TTFT coincided with different prefill batching; an initialization-to-scheduling causal mechanism has not been established.",
+    "The retained session TTFT range overlaps the control range and decode throughput is similar. These sessions do not demonstrate a throughput improvement.",
+    "NCCL remains the archived performance baseline; the control session here is the previous EP-Xpress implementation, not an NCCL payload backend rerun."
+  ],
+  "batching_observations": {
+    "method": "Two first-token return cohorts separated at the largest per-request TTFT gap; scheduler logs confirm differing nonempty prefill batch splits.",
+    "examples": [
+      {
+        "session": "previous_ep_xpress_isolated_gloo",
+        "repeat": 0,
+        "mean_ttft_ms": 278.6433162546018,
+        "first_token_cohorts": [
+          7,
+          25
+        ],
+        "cohort_mean_ttft_ms": [
+          193.395440533225,
+          302.5127214565873
+        ]
+      },
+      {
+        "session": "borrowed_nccl_bootstrap_1",
+        "repeat": 3,
+        "mean_ttft_ms": 278.794918951462,
+        "first_token_cohorts": [
+          7,
+          25
+        ],
+        "cohort_mean_ttft_ms": [
+          193.43893442835127,
+          302.69459461793303
+        ]
+      },
+      {
+        "session": "borrowed_nccl_bootstrap_1",
+        "repeat": 4,
+        "mean_ttft_ms": 327.74880780198146,
+        "first_token_cohorts": [
+          2,
+          30
+        ],
+        "cohort_mean_ttft_ms": [
+          193.8873054459691,
+          336.6729079590489
+        ]
+      }
+    ],
+    "limitations": "These are HTTP timings, not kernel times. The matching cohort example also has matching per-rank sequence splits, but prompt seeds and exact routing differ across repeat indices. Association is not proof of the initialization-to-scheduling mechanism."
+  }
+}

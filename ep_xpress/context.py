@@ -105,18 +105,21 @@ class Context:
     """One long-lived EP group, one device per process, shared host arenas.
 
     All ranks must construct contexts and submit dispatch/combine in the same
-    order. group must be Gloo: it carries bootstrap and route metadata only.
+    order. host_ce requires Gloo for bootstrap and route metadata. host_sm
+    accepts an upper-layer NCCL group/handle or a legacy Gloo control group.
     Activation and expert-result payloads use the configured host transport.
-    host_sm uses Gloo only during setup and shutdown; its routing stays on GPU.
+    host_sm uses its communicator only during setup/shutdown; routing stays on GPU.
     """
 
-    def __new__(cls, group, expert_to_rank, config, device=None, shared_directory=None):
+    def __new__(cls, group, expert_to_rank, config, device=None, shared_directory=None, *, nccl_comm=None, bootstrap_group=None):
         if cls is Context and config.transport == "host_sm":
             from .host_sm import HostSMContext
             return object.__new__(HostSMContext)
         return object.__new__(cls)
 
-    def __init__(self, group, expert_to_rank, config: Config, device=None, shared_directory=None):
+    def __init__(self, group, expert_to_rank, config: Config, device=None, shared_directory=None, *, nccl_comm=None, bootstrap_group=None):
+        if nccl_comm is not None or bootstrap_group is not None:
+            raise ValueError("NCCL communicator injection requires transport='host_sm'")
         if not dist.is_initialized():
             raise RuntimeError("initialize a Gloo process group before constructing Context")
         if str(dist.get_backend(group)) != "gloo":
