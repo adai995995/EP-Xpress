@@ -14,7 +14,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from ep_xpress import Config, Context
+from ep_xpress import get_nccl_comm_handle, Config, Context
 
 
 TRANSPORT_OPTIONS = (
@@ -102,19 +102,19 @@ def main():
     rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(rank)
     producer_node = bind_producer_numa(rank) if args.cpu_numa == "auto" else None
-    dist.init_process_group("gloo")
+    dist.init_process_group("nccl")
     world = dist.get_world_size()
     if dist.get_rank() != rank or int(os.environ.get("LOCAL_WORLD_SIZE", world)) != world:
         raise ValueError("this benchmark requires one host and one process per local GPU")
     if args.experts % world:
         raise ValueError("experts must divide evenly across ranks")
-    nccl = dist.new_group(backend="nccl") if args.nccl_reference else None
+    nccl = dist.group.WORLD if args.nccl_reference else None
     results = []
     config = Config(args.hidden, args.topk, max(args.tokens), transport="host_sm",
                     channels=args.channels, chunk_bytes=4 << 20, combine_frame_rows=16,
                     decode_max_tokens=min(256, max(args.tokens)), decode_single_frame=True,
                     host_pool_budget_bytes=1 << 30, fatal_errors=True)
-    context = Context(None, [i // (args.experts // world) for i in range(args.experts)], config, device=rank)
+    context = Context(get_nccl_comm_handle(dist.group.WORLD), [i // (args.experts // world) for i in range(args.experts)], config, device=rank)
     placement = {"rank": rank, "requested_node": producer_node,
                  "arenas": verify_producer_pages(context, producer_node)}
     placements = [None] * world
@@ -269,7 +269,6 @@ def main():
         with open(args.output, "w") as target:
             json.dump(report, target, indent=2)
         print(json.dumps({"status": "passed", "shapes": len(results)}))
-    if nccl is not None: dist.destroy_process_group(nccl)
     dist.destroy_process_group()
 
 

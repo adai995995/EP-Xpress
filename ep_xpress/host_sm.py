@@ -7,7 +7,6 @@ execution is opt-in. GPU stream dependencies and queue credits remain necessary.
 """
 
 from dataclasses import asdict, dataclass
-from datetime import timedelta
 import copy
 import ctypes
 import hashlib
@@ -24,10 +23,9 @@ import threading
 import uuid
 
 import torch
-import torch.distributed as dist
 
 from . import native
-from .comm import NCCLCommHandle, get_nccl_comm_handle
+from .comm import NCCLCommHandle
 from .context import Context, DispatchBatch, Pending, RouteHandle
 
 
@@ -278,31 +276,19 @@ class HostSMContext(Context):
 
     Setup validates the group and placement once, maps all producer queues on
     each GPU, and creates device expert-placement tables. Dispatch and combine
-    enqueue GPU work without a Gloo exchange or CPU routing/count readback.
+    enqueue GPU work without a host collective or CPU routing/count readback.
     Protocol diagnostics and tag fingerprints are opt-in at construction;
     dynamic tensor bounds, queue credits and stream ordering remain required.
     Call check_errors() at an experiment or application completion boundary.
     """
 
-    def __init__(self, group, expert_to_rank, config, device=None, shared_directory=None, *, nccl_comm=None, bootstrap_group=None):
-        if nccl_comm is not None and not isinstance(nccl_comm, NCCLCommHandle):
-            raise TypeError("nccl_comm must be an NCCLCommHandle, not a bare pointer")
-        if nccl_comm is None:
-            if not dist.is_initialized() or str(dist.get_backend(group)) not in ("gloo", "nccl"):
-                raise ValueError("host_sm requires an initialized Gloo/NCCL group or NCCLCommHandle")
-            if str(dist.get_backend(group)) == "nccl":
-                nccl_comm = get_nccl_comm_handle(group, device=device)
-        elif group is not None:
-            nccl_comm.validate_group(group)
-        if bootstrap_group is not None:
-            if nccl_comm is None or str(dist.get_backend(bootstrap_group)) != "gloo":
-                raise ValueError("bootstrap_group requires an NCCL handle and matching Gloo group")
-            nccl_comm.validate_group(bootstrap_group)
+    def __init__(self, nccl_comm, expert_to_rank, config, device=None, shared_directory=None):
+        if not isinstance(nccl_comm, NCCLCommHandle):
+            raise TypeError("Context requires an upper-layer NCCLCommHandle")
         if not torch.cuda.is_available():
             raise RuntimeError("host_sm requires CUDA")
         self.nccl_comm_handle = nccl_comm
-        self.rank, self.world_size = ((nccl_comm.rank, nccl_comm.world_size) if nccl_comm is not None
-                                     else (dist.get_rank(group), dist.get_world_size(group)))
+        self.rank, self.world_size = nccl_comm.rank, nccl_comm.world_size
         if not 1 <= self.world_size <= 63:
             raise ValueError("supported EP group size is 1 through 63")
         self.config = config
@@ -313,12 +299,12 @@ class HostSMContext(Context):
             raise ValueError("expert_to_rank must contain valid EP group ranks")
         if config.topk > len(self.expert_to_rank):
             raise ValueError("topk cannot exceed the number of experts")
-        chosen = (nccl_comm.device if nccl_comm is not None else torch.cuda.current_device()) if device is None else device
+        chosen = nccl_comm.device if device is None else device
         chosen = torch.device("cuda", chosen) if isinstance(chosen, int) else torch.device(chosen)
         if chosen.type != "cuda":
             raise ValueError("device must be CUDA")
         self.device = torch.device("cuda", torch.cuda.current_device() if chosen.index is None else chosen.index)
-        if nccl_comm is not None and nccl_comm.device != self.device:
+        if nccl_comm.device != self.device:
             raise ValueError("NCCL communicator and Context must use the same CUDA device")
         self._max_receive_capacity = self.world_size * config.max_tokens_per_rank
         if self._max_receive_capacity > (1 << 31) - 1:
@@ -330,15 +316,6 @@ class HostSMContext(Context):
             self._dispatch_roles = native.load().host_sm_dispatch_roles()
             self._reuse_return_index = native.load().host_sm_reuse_return_index()
             self._channel_capacity = native.host_sm_max_channels(self.world_size)
-        self._owns_group = nccl_comm is None
-        self.group = group
-        self._bootstrap_group = bootstrap_group
-        if self._owns_group:
-            members = dist.get_process_group_ranks(group) if group is not None else list(range(dist.get_world_size()))
-            self.group = dist.new_group(ranks=members, backend="gloo",
-                                        timeout=timedelta(seconds=config.timeout_seconds),
-                                        use_local_synchronization=True)
-            self._bootstrap_group = self.group
         self._id = uuid.uuid4().hex
         self._closed = False
         self._healthy = False
@@ -369,29 +346,15 @@ class HostSMContext(Context):
             try:
                 self._release_resources()
             finally:
-                self._release_bootstrap()
+                self.nccl_comm_handle = None
                 self._closed = True
             raise
 
     def _gather_bootstrap(self, result, value):
-        if self._bootstrap_group is not None:
-            dist.all_gather_object(result, value, group=self._bootstrap_group)
-        else:
-            result[:] = self.nccl_comm_handle.all_gather_object(value)
+        result[:] = self.nccl_comm_handle.all_gather_object(value)
 
     def _broadcast_bootstrap(self, value):
-        if self._bootstrap_group is not None:
-            dist.broadcast_object_list(value, src=dist.get_global_rank(self._bootstrap_group, 0),
-                                       group=self._bootstrap_group)
-        else:
-            value[:] = self.nccl_comm_handle.all_gather_object(value if self.rank == 0 else None)[0]
-
-    def _release_bootstrap(self):
-        if self._owns_group:
-            dist.destroy_process_group(self.group)
-        # Retain caller ownership. Never destroy/abort the borrowed communicator.
-        self.nccl_comm_handle = None
-        self._bootstrap_group = None
+        value[:] = self.nccl_comm_handle.all_gather_object(value if self.rank == 0 else None)[0]
 
     def _bootstrap(self, shared_directory):
         signature = (socket.gethostname(), asdict(self.config), self.expert_to_rank,
@@ -1262,12 +1225,10 @@ class HostSMContext(Context):
                 self._closed = True
                 try:
                     if self._healthy and self._failure is None:
-                        if self._bootstrap_group is not None:
-                            dist.barrier(group=self._bootstrap_group)
-                        else:
-                            self.nccl_comm_handle.barrier()
+                        self.nccl_comm_handle.barrier()
                 finally:
                     try:
                         self._release_resources()
                     finally:
-                        self._release_bootstrap()
+                        # The caller retains ownership of the communicator.
+                        self.nccl_comm_handle = None

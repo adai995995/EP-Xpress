@@ -5,7 +5,7 @@ import tempfile
 import pytest
 
 torch = pytest.importorskip("torch")
-from ep_xpress import Config, Context, native
+from ep_xpress import get_nccl_comm_handle, Config, Context, native
 
 pytestmark = [pytest.mark.cuda, pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 3,
@@ -16,12 +16,12 @@ def _reclaim_worker(rank, init_file, tokens):
     import torch.distributed as dist
     world, hidden = 3, 258
     torch.cuda.set_device(rank)
-    dist.init_process_group("gloo", init_method="file://" + init_file,
+    dist.init_process_group("nccl", init_method="file://" + init_file,
                             rank=rank, world_size=world)
     # Force more than 32 live packet tasks per CTA even when the build requests
     # extra packet channels (the native override clamps to prepared capacity).
     channels = 1 if tokens > 128 else 4
-    context = Context(None, list(range(world)), Config(
+    context = Context(get_nccl_comm_handle(dist.group.WORLD), list(range(world)), Config(
         hidden, 1, world * tokens, transport="host_sm", channels=channels,
         decode_max_tokens=tokens, fatal_errors=True), device=rank)
     stream = torch.cuda.current_stream()

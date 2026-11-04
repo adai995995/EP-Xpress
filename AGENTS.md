@@ -10,8 +10,11 @@
 - Develop source locally and validate CUDA changes on an operator-provided
   development machine. Keep its address, access configuration, deployment paths,
   model paths, and raw logs outside this repository. Do not embed credentials.
-- Use generic public Git author and committer metadata:
-  `EP-Xpress Contributors <contributors@users.noreply.github.com>`.
+- Use the repository owner's public GitHub identity for new author/committer
+  metadata: `adai995995 <219398220+adai995995@users.noreply.github.com>`.
+  Keep private names and corporate/personal email addresses out of commits.
+  Historical `EP-Xpress Contributors` commits remain accepted by the privacy
+  checker; changing attribution does not authorize rewriting published history.
 - Enable `.githooks` and run `python tools/check_public_content.py --worktree
   --staged --history` before every push. Review the staged diff as well. Never
   bypass the checks to publish sensitive information, including deleted content

@@ -5,7 +5,7 @@ import tempfile
 import pytest
 
 torch = pytest.importorskip("torch")
-from ep_xpress import Config, Context, native
+from ep_xpress import get_nccl_comm_handle, Config, Context, native
 
 pytestmark = [pytest.mark.cuda, pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 2,
@@ -15,10 +15,10 @@ pytestmark = [pytest.mark.cuda, pytest.mark.skipif(
 def _worker(rank, init_file, fused):
     import torch.distributed as dist
     torch.cuda.set_device(rank)
-    dist.init_process_group("gloo", init_method="file://" + init_file, rank=rank, world_size=2)
+    dist.init_process_group("nccl", init_method="file://" + init_file, rank=rank, world_size=2)
     context = None
     try:
-        context = Context(None, [0, 0, 1, 1], Config(
+        context = Context(get_nccl_comm_handle(dist.group.WORLD), [0, 0, 1, 1], Config(
             128, 2, 8, transport="host_sm", channels=2, chunk_bytes=4096,
             decode_max_tokens=8, timeout_seconds=30), device=rank)
         streams = [torch.cuda.Stream(), torch.cuda.Stream()]

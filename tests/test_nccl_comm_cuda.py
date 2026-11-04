@@ -19,10 +19,9 @@ def _worker(global_rank, init_file):
     import torch.distributed as dist
 
     torch.cuda.set_device(global_rank)
-    # Gloo here belongs to the test coordinator, not the tested Context.
-    dist.init_process_group("gloo", init_method="file://" + init_file, rank=global_rank, world_size=3)
+    # The application owns the only communicator backend: NCCL.
+    dist.init_process_group("nccl", init_method="file://" + init_file, rank=global_rank, world_size=3)
     group = dist.new_group(ranks=[0, 2], backend="nccl")
-    control = dist.new_group(ranks=[0, 2], backend="gloo")
     if global_rank in (0, 2):
         rank = dist.get_rank(group)
         handle = get_nccl_comm_handle(group)
@@ -43,11 +42,10 @@ def _worker(global_rank, init_file):
         assert gathered == [dict(message, rank=r) for r in range(2)]
         config = Config(128, 2, 8, transport="host_sm", channels=2,
                         chunk_bytes=4096, decode_max_tokens=8, fatal_errors=True)
-        # Validate both explicit group + handle and standalone handle injection.
-        for supplied_group, bootstrap_group in ((group, None), (None, None), (group, control)):
+        # Repeated contexts reuse the same upper-layer handle without new groups.
+        for _ in range(2):
             with patch.object(dist, "new_group", side_effect=AssertionError("unexpected internal group")):
-                context = Context(supplied_group, [0, 0, 1, 1], config,
-                                  nccl_comm=handle, bootstrap_group=bootstrap_group)
+                context = Context(handle, [0, 0, 1, 1], config)
             assert context.nccl_comm_handle is handle
             try:
                 for step in range(3):
@@ -73,13 +71,11 @@ def _worker(global_rank, init_file):
             dist.all_reduce(value, group=group)
             assert value.item() == 3
             assert handle.all_gather_object(rank) == [0, 1]
-            dist.barrier(group=control)
         # Same device and membership guards happen before allocating/compiling.
         with pytest.raises(ValueError, match="same CUDA device"):
-            Context(group, [0, 1], config, device=1, nccl_comm=handle)
+            Context(handle, [0, 1], config, device=1)
         handle.barrier()
         del handle
-        dist.destroy_process_group(control)
         dist.destroy_process_group(group)
     dist.barrier()
     dist.destroy_process_group()

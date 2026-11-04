@@ -27,8 +27,10 @@ import unicodedata
 
 
 MAX_FILE_BYTES = 2 * 1024 * 1024
-PUBLIC_NAME = "EP-Xpress Contributors"
-PUBLIC_EMAIL = "contributors@users.noreply.github.com"
+PUBLIC_NAME = "adai995995"
+PUBLIC_EMAIL = "219398220+adai995995@users.noreply.github.com"
+PUBLIC_IDENTITIES = {(PUBLIC_NAME, PUBLIC_EMAIL),
+                     ("EP-Xpress Contributors", "contributors@users.noreply.github.com")}
 _IPV4 = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
 _PATHS = re.compile(r"/(?:Users|home)/[^\s/\"'<>]+|/(?:mnt/ufs[^\s/]*|nfs)(?:/|\b)")
 _PRIVATE_KEY = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----")
@@ -199,8 +201,9 @@ class Scanner:
         for rule in self._blob_rules[cache_key]:
             self.add(path, rule)
 
-    def inspect_identity(self, name: str, email: str, label: str):
-        if (name, email) != (PUBLIC_NAME, PUBLIC_EMAIL):
+    def inspect_identity(self, name: str, email: str, label: str, *, historical=False):
+        allowed = PUBLIC_IDENTITIES if historical else {(PUBLIC_NAME, PUBLIC_EMAIL)}
+        if (name, email) not in allowed:
             self.add(label, "nonpublic-git-identity")
         for rule in _text_rules(name + "\n" + email, self.private_patterns):
             self.add(label, rule)
@@ -231,8 +234,8 @@ class Scanner:
             fields = raw.decode("utf-8", errors="replace").split("\x00", 4)
             if len(fields) != 5:
                 raise ScanError("commit-metadata-unreadable")
-            self.inspect_identity(fields[0], fields[1], label + ":author")
-            self.inspect_identity(fields[2], fields[3], label + ":committer")
+            self.inspect_identity(fields[0], fields[1], label + ":author", historical=True)
+            self.inspect_identity(fields[2], fields[3], label + ":committer", historical=True)
             for rule in _text_rules(fields[4], self.private_patterns):
                 self.add(label + ":message", rule)
             for record in _git(self.root, "ls-tree", "-r", "-z", oid).split(b"\x00"):

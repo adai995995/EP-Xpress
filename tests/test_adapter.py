@@ -201,9 +201,9 @@ class AdapterContractTest(unittest.TestCase):
                 second._context()
                 inits = [args for name, args in fixture.calls if name == "init"]
                 self.assertEqual(len(inits), 1)
-                self.assertIs(inits[0]["group"], fixture.parallel.moe_ep_group.device_group)
+                self.assertNotIn("group", inits[0])
                 self.assertIs(inits[0]["nccl_comm"], fixture.nccl_comm)
-                self.assertIs(inits[0]["bootstrap_group"], fixture.parallel.moe_ep_group.cpu_group)
+                self.assertNotIn("bootstrap_group", inits[0])
 
     def test_decode_workspace_reuse_and_prefill_fallback(self):
         with patch.dict(os.environ, {"EP_XPRESS_TRANSPORT": "host_sm"}):

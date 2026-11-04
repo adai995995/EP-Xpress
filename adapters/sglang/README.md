@@ -81,20 +81,17 @@ there is no rank-number-to-node assumption or per-layer NUMA operation. Verify
 resident page placement separately from CPU binding, especially when using a
 custom shared directory or tmpfs mount policy.
 
-For `host_sm`, the adapter obtains the communicator from SGLang's EP group
-during eager initialization. It borrows the group's existing PyNccl communicator
-when available, otherwise the EP `device_group` communicator through PyTorch's
-`_comm_ptr()` API. The ordered membership and device must match; a TP or WORLD
-communicator is not substituted. The matching upper-layer EP `cpu_group` is
-also borrowed for CPU bootstrap metadata, so obtaining a device communicator
-does not force CPU initialization traffic through CUDA tensors. No extra Gloo
-group is created on this path.
+The adapter obtains the existing EP `device_group` NCCL communicator during
+eager initialization, through PyTorch's `_comm_ptr()` API. This is its single
+communicator source: no PyNccl fallback, EP `cpu_group`, or new Gloo group.
+The ordered membership and device must match; a TP or WORLD communicator is
+not substituted. Context receives only the resulting `NCCLCommHandle`.
 The handle is shared by compatible layers through the existing context cache.
-`host_ce` keeps its Gloo metadata path. The NCCL handle is retained for the
-device communicator interface; SGLang bootstrap uses the borrowed Gloo group.
+Bootstrap metadata and healthy shutdown use this borrowed NCCL communicator.
 Token payloads still use EP-Xpress's host buffers. Call `close_contexts()` before
-destroying SGLang's communicators. Older PyTorch versions without `_comm_ptr()`
-need the EP coordinator to expose an existing PyNccl communicator.
+destroying SGLang's communicators. This adapter requires `_comm_ptr()`; an
+upstream adapter for another framework may explicitly construct a borrowed
+raw handle, but Context never chooses another communication backend.
 
 `EP_XPRESS_CHANNELS` requests parallel host-SM channels. The group negotiates
 the common cooperative-launch capacity once at initialization. Multi-rank

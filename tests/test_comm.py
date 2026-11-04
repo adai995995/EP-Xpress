@@ -34,9 +34,14 @@ def test_owner_retained_and_nccl_rank_and_device_queried():
 
 def test_raw_pointer_is_not_accepted_as_context_handle():
     with pytest.raises(TypeError, match="NCCLCommHandle"):
-        Context(None, [0], Config(128, 1, 8, transport="host_sm"), nccl_comm=42)
+        Context(42, [0], Config(128, 1, 8, transport="host_sm"))
 
 
-def test_host_ce_does_not_silently_switch_its_control_plane():
-    with pytest.raises(ValueError, match="host_sm"):
-        Context(None, [0], Config(128, 1, 8), nccl_comm=object())
+def test_reference_transport_also_requires_upper_layer_nccl():
+    with pytest.raises(TypeError, match="NCCLCommHandle"):
+        Context(object(), [0], Config(128, 1, 8))
+
+
+def test_removed_bootstrap_selector_is_rejected():
+    with pytest.raises(TypeError, match="bootstrap_group"):
+        Context(None, [0], Config(128, 1, 8, transport="host_sm"), bootstrap_group=object())

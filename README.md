@@ -38,12 +38,9 @@ End-to-end performance must be measured against the intended inference framework
   calls without a workspace retain operation-owned outputs and route storage.
 - Operation-scoped inverse-route handles, already-weighted rank partials,
   deterministic rank-order FP32 remote accumulation, and BF16 results.
-- An upper-layer NCCL communicator can be borrowed for `host_sm` setup and
-  shutdown, without creating another process group. Legacy Gloo bootstrap is
-  also supported. When the application supplies `bootstrap_group`, its existing
-  Gloo EP group carries CPU metadata while the context retains the NCCL handle.
-  `host_ce` retains its dedicated Gloo metadata group with a
-  bounded timeout. GPUs in `host_sm` process routing IDs and weights and transfer
+- A single upper-layer NCCL communicator handle is required for setup and
+  shutdown. Contexts never create process groups or depend on Gloo. GPUs in
+  `host_sm` process routing IDs and weights and transfer
   them through host queues without CPU route planning; receive counts remain
   device-resident. The caller preserves operation order and supplies capacity bounds.
 - An experimental adapter patch for SGLang v0.5.21, kept separate from the core.
@@ -74,15 +71,17 @@ use `python -m pip install --no-deps --no-build-isolation -e .`.
 
 ## API
 
-Initialize an EP process group and set the current CUDA device before creating
-a context (`host_ce` requires Gloo). Every EP rank must submit operations in the same order. Compatible
+Initialize the application's NCCL EP group, set the current CUDA device, and
+obtain its communicator handle before creating a context. Every EP rank must
+submit operations in the same order. Compatible
 model layers should share a long-lived context and its memory budget.
 
 ```python
-from ep_xpress import Config, Context
+from ep_xpress import Config, Context, get_nccl_comm_handle
 
+comm = get_nccl_comm_handle(ep_group)  # collective initialization, outside Graph capture
 config = Config(hidden_size=2048, topk=4, max_tokens_per_rank=4096)
-with Context(group=ep_group, expert_to_rank=expert_owners, config=config) as ep:
+with Context(nccl_comm=comm, expert_to_rank=expert_owners, config=config) as ep:
     batch = ep.dispatch_async(x, topk_ids, topk_weights, tag="layer-0").wait()
     # Runner applies each routing weight exactly once and sums experts on this
     # rank. partial has shape [batch.valid_count, hidden_size], dtype BF16.
@@ -98,49 +97,56 @@ from ep_xpress import Config, Context, get_nccl_comm_handle
 # ep_group is the application's NCCL EP group, with one CUDA device per process.
 comm = get_nccl_comm_handle(ep_group)  # collective setup; call before Graph capture
 config = Config(hidden_size=2048, topk=4, max_tokens_per_rank=4096, transport="host_sm")
-with Context(group=ep_group, nccl_comm=comm,
-             bootstrap_group=ep_cpu_group,  # optional matching, upper-layer Gloo group
+with Context(nccl_comm=comm,
              expert_to_rank=expert_owners, config=config) as ep:
     # Submit dispatch, expert computation, and combine through the usual API.
     pass
 # The application still owns ep_group and may use it after ep.close().
 ```
 
-Omit `bootstrap_group` for pure NCCL bootstrap. If supplied, it must have the
-same ordered EP membership; it is borrowed and never destroyed by the context.
-SGLang supplies both handles: NCCL is the exposed device communicator, and its
-existing Gloo group exchanges CPU initialization metadata without creating an
-additional group. This follows DeepEP's communicator reuse boundary: the handle retains its
-owner and exposes `.get()`, while EP-Xpress never destroys or aborts borrowed
-NCCL resources. A framework that already exposes a raw communicator can use
+`Context` accepts only an `NCCLCommHandle`; the old `group` and
+`bootstrap_group` arguments have been removed. The SGLang adapter always obtains
+the handle from its existing EP `device_group`. EP-Xpress does not select an
+alternative PyNccl/CPU group or create another communicator. SGLang may still
+use CPU groups for its own framework operations outside EP-Xpress.
+
+The borrowed handle retains its owner and exposes `.get()`; EP-Xpress never
+destroys or aborts the communicator. A framework exposing a raw communicator can use
 `NCCLCommHandle.borrow(pointer, owner=owner, library_path=owner_nccl_dso,
 group=ep_group)`. Always use the owner's exact NCCL library and ordered EP
-membership. `group=None` with an explicit handle also supports standalone
-communicators. Close all EP contexts before explicitly destroying their owner.
+membership. The handle's optional `group` is ownership metadata, not a second
+Context communication path. Close all EP contexts before destroying their owner.
 
 The PyTorch helper requires `ProcessGroupNCCL._comm_ptr()` and initializes its
 lazy communicator once. Older builds without that method must provide a raw
-framework handle or use the existing Gloo bootstrap; no extra NCCL communicator
-is silently created. NCCL bootstrap sends only trusted-rank initialization
-metadata and performs a shutdown rendezvous when no CPU group is supplied.
+framework handle; no alternative group is silently created. On `host_sm`, NCCL
+sends only trusted-rank initialization metadata and a shutdown rendezvous.
 Bootstrap is collective and must
 not overlap other calls on the same communicator. Raw NCCL bootstrap calls do
 not create PyTorch Work objects, so the process group's watchdog timeout does
 not bound them; the application must bound worker startup/shutdown and restart
-failed workers. `Config.timeout_seconds` still bounds the GPU queue protocol and
-legacy Gloo group, but does not reconfigure borrowed NCCL/Gloo communicators.
+failed workers. `Config.timeout_seconds` still bounds the GPU queue protocol;
+it does not reconfigure the borrowed NCCL communicator. The slower `host_ce`
+reference also exchanges per-operation CPU route metadata via that same handle.
 Dispatch/combine payloads, routing, READY/ACK and CUDA Graph execution continue
 to use the host-SM transport. Changing the bootstrap communicator is not a
 throughput optimization and does not enable GPU P2P/NVLink.
 
 Communicator validation covers a non-contiguous EP subgroup, dynamic routes,
-empty ranks, raw-handle and process-group entry points, borrowed CPU bootstrap,
+empty ranks, upstream handle acquisition,
 handle reacquisition after garbage collection, and upstream communicator use
 after context shutdown. Full-model validation used eight GPUs with NVLink/P2P
 disabled. See the [integration measurements](benchmarks/reports/sglang_h20d_ep8_bf16_nccl_handle.json).
-The selected SGLang path borrows both device and CPU communicators. Pure NCCL
-bootstrap showed higher B32 TTFT alongside different dynamic prefill batching;
-the measurements do not establish that communicator lookup made kernels slower.
+That historical report includes the now-removed CPU bootstrap path. The
+[NCCL-only follow-up](benchmarks/reports/sglang_h20d_ep8_bf16_nccl_only.json)
+compares two sessions per variant and aligns actual per-rank prefill request
+membership. Whole-batch B32 release-to-first-token was 260.24 ms with the old
+CPU bootstrap and 260.26 ms with NCCL-only setup. Splitting the same candidate
+work into 2+30 requests raised it to 326.24 ms. These controlled-admission
+numbers are diagnostic, not normal HTTP TTFT. A single extra CPU submission
+pause is retained in the report and remains unexplained; no stable large
+communicator regression was reproduced. Normal decode TPS changed by less
+than 0.5% between setup variants. Token routing and native kernels are unchanged.
 
 `x` is contiguous BF16 `[T, H]`; IDs are integer `[T, K]`; weights are FP32
 `[T, K]`, all on the local device. `local_ids` uses `-1` for experts on other
@@ -163,7 +169,7 @@ CPU-known bound for the number of received rows:
 ```python
 config = Config(hidden_size=2048, topk=4, max_tokens_per_rank=4096,
                 transport="host_sm", channels=4)
-with Context(group=ep_group, expert_to_rank=expert_owners, config=config) as ep:
+with Context(nccl_comm=comm, expert_to_rank=expert_owners, config=config) as ep:
     batch = ep.dispatch_async(x, topk_ids, topk_weights,
                               recv_capacity=global_token_bound).wait()
     partial = expert_runner(batch.hidden, batch.local_ids, batch.weights)

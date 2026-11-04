@@ -13,7 +13,7 @@ import time
 import torch
 import torch.distributed as dist
 
-from ep_xpress import Config, Context, native
+from ep_xpress import get_nccl_comm_handle, Config, Context, native
 
 
 def input_count(rank, world, tokens, case, iteration):
@@ -274,7 +274,7 @@ def run(args):
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    dist.init_process_group("gloo", timeout=timedelta(seconds=args.timeout))
+    dist.init_process_group("nccl", timeout=timedelta(seconds=args.timeout))
     config = Config(hidden_size=args.hidden, topk=4, max_tokens_per_rank=args.tokens,
                     chunk_bytes=args.chunk_bytes, slots=args.slots,
                     timeout_seconds=args.timeout, transport=args.transport, channels=args.channels,
@@ -283,7 +283,7 @@ def run(args):
     profile_summaries = None
     cases = args.cases.split(",")
     if args.expect_error:
-        with Context(dist.group.WORLD, [owner for owner in range(world) for _ in range(4)],
+        with Context(get_nccl_comm_handle(dist.group.WORLD), [owner for owner in range(world) for _ in range(4)],
                      config, device=device) as context:
             channel_info = channel_configuration(context, world, args)
             check_expected_error(context, rank, world, args, device)
@@ -293,7 +293,7 @@ def run(args):
                               "routing_id_dtype": args.id_dtype, **channel_info}), flush=True)
         dist.destroy_process_group()
         return
-    with Context(dist.group.WORLD, [owner for owner in range(world) for _ in range(4)],
+    with Context(get_nccl_comm_handle(dist.group.WORLD), [owner for owner in range(world) for _ in range(4)],
                  config, device=device) as context:
         channel_info = channel_configuration(context, world, args)
         if args.profile_combine:

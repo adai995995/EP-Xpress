@@ -5,7 +5,7 @@ import tempfile
 import pytest
 
 torch = pytest.importorskip("torch")
-from ep_xpress import Config, Context, native
+from ep_xpress import get_nccl_comm_handle, Config, Context, native
 
 pytestmark = [pytest.mark.cuda, pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 5,
@@ -17,13 +17,13 @@ def _worker(rank, rendezvous, topk):
     from datetime import timedelta
     world, hidden, rows = 5, 258, 64
     torch.cuda.set_device(rank)
-    dist.init_process_group("gloo", init_method="file://" + rendezvous,
+    dist.init_process_group("nccl", init_method="file://" + rendezvous,
                             rank=rank, world_size=world, timeout=timedelta(seconds=90))
     # Noncontiguous ownership; the transport must consult the live expert map.
     owners = [(i * 3) % world for i in range(world * 40)]
     experts = [[i for i, owner in enumerate(owners) if owner == r] for r in range(world)]
     try:
-        ctx = Context(None, owners, Config(
+        ctx = Context(get_nccl_comm_handle(dist.group.WORLD), owners, Config(
             hidden, topk, rows, transport="host_sm", channels=2,
             chunk_bytes=262144, decode_max_tokens=rows,
             decode_single_frame=True, combine_warp_specialization=True,

@@ -19,10 +19,10 @@ from ep_xpress.host_sm import HostSMContext, _DevicePending, _DeviceRoute, _Mapp
 def test_context_factory_runs_selected_initializer_once():
     config = Config(128, 2, 32, transport="host_sm")
     with patch.object(HostSMContext, "__init__", return_value=None) as initialize:
-        context = Context(group=None, expert_to_rank=(0, 1), config=config)
+        context = Context(nccl_comm=None, expert_to_rank=(0, 1), config=config)
     assert isinstance(context, HostSMContext)
     assert isinstance(context, Context)
-    initialize.assert_called_once_with(group=None, expert_to_rank=(0, 1), config=config)
+    initialize.assert_called_once_with(nccl_comm=None, expert_to_rank=(0, 1), config=config)
 
 
 def test_abort_flags_have_distinct_writers_and_remain_sticky(tmp_path):
@@ -95,14 +95,12 @@ def test_bootstrap_negotiates_group_min_then_checks_actual_budget(capacities, ex
                             host_pool_budget_bytes=1)
     context.expert_to_rank = tuple(range(context.world_size))
     context.device = torch.device("cuda", 0)
-    context.group = object()
     context.nccl_comm_handle = None
-    context._bootstrap_group = context.group
     context._channel_capacity = capacities[0]
     context._dispatch_banks = 0
 
-    def gather(result, signature, group):
-        result[:] = [(*signature[:3], f"gpu-{rank}", cap) for rank, cap in enumerate(capacities)]
+    def gather(result, signature):
+        result[:] = [(*signature[:3], f"gpu-{rank}", cap, *signature[5:]) for rank, cap in enumerate(capacities)]
 
     def arena_size(hidden, topk, slots, chunk_rows, channels, queue_peers):
         assert queue_peers == (1 if topk else context.world_size)
@@ -110,11 +108,12 @@ def test_bootstrap_negotiates_group_min_then_checks_actual_budget(capacities, ex
         assert channels == expected
         return context.config.mapped_arena_bytes(topk, channels, queue_peers=queue_peers)
 
-    with patch("ep_xpress.host_sm.dist.all_gather_object", side_effect=gather), \
+    with patch("ep_xpress.host_sm.native.load", return_value=SimpleNamespace(__name__="test-native")), \
+            patch.object(context, "_gather_bootstrap", side_effect=gather), \
             patch("ep_xpress.host_sm.torch.cuda.get_device_properties", return_value=SimpleNamespace(uuid="gpu-0")), \
             patch("ep_xpress.host_sm.torch.cuda.device", side_effect=lambda _: nullcontext()), \
             patch("ep_xpress.host_sm.native.host_sm_arena_bytes", side_effect=arena_size), \
-            patch("ep_xpress.host_sm.dist.broadcast_object_list") as broadcast:
+            patch.object(context, "_broadcast_bootstrap") as broadcast:
         with pytest.raises(ValueError, match="negotiated mapped host queues exceed"):
             context._bootstrap(None)
     assert context.effective_channels == expected
@@ -131,15 +130,14 @@ def test_pair_grid_rejects_missing_cooperative_support_before_allocation():
     context.config = Config(128, 2, 32, transport="host_sm")
     context.expert_to_rank = (0, 1)
     context.device = torch.device("cuda", 0)
-    context.group = object()
     context.nccl_comm_handle = None
-    context._bootstrap_group = context.group
     context._channel_capacity = 8
 
-    def gather(result, signature, group):
-        result[:] = [(*signature[:3], f"gpu-{rank}", cap) for rank, cap in enumerate((8, 0))]
+    def gather(result, signature):
+        result[:] = [(*signature[:3], f"gpu-{rank}", cap, *signature[5:]) for rank, cap in enumerate((8, 0))]
 
-    with patch("ep_xpress.host_sm.dist.all_gather_object", side_effect=gather), \
+    with patch("ep_xpress.host_sm.native.load", return_value=SimpleNamespace(__name__="test-native")), \
+            patch.object(context, "_gather_bootstrap", side_effect=gather), \
             patch("ep_xpress.host_sm.torch.cuda.get_device_properties", return_value=SimpleNamespace(uuid="gpu-0")), \
             patch("ep_xpress.host_sm.native.host_sm_arena_bytes") as allocate:
         with pytest.raises(ValueError, match="cooperative all-resident"):
@@ -537,17 +535,17 @@ def test_single_frame_protocol_mismatch_is_rejected_before_storage():
                             decode_single_frame=True)
     context.expert_to_rank = (0, 1)
     context.device = torch.device("cuda", 0)
-    context.group, context._channel_capacity = object(), 4
+    context._channel_capacity = 4
     context.nccl_comm_handle = None
-    context._bootstrap_group = context.group
 
-    def gather(result, signature, group):
+    def gather(result, signature):
         other_config = dict(signature[1], decode_single_frame=False)
-        result[:] = [signature, (signature[0], other_config, signature[2], "gpu-1", 4)]
+        result[:] = [signature, (signature[0], other_config, signature[2], "gpu-1", 4, *signature[5:])]
 
-    with patch("ep_xpress.host_sm.dist.all_gather_object", side_effect=gather), \
+    with patch("ep_xpress.host_sm.native.load", return_value=SimpleNamespace(__name__="test-native")), \
+            patch.object(context, "_gather_bootstrap", side_effect=gather), \
             patch("ep_xpress.host_sm.torch.cuda.get_device_properties", return_value=SimpleNamespace(uuid="gpu-0")), \
-            patch("ep_xpress.host_sm.dist.broadcast_object_list") as broadcast:
+            patch.object(context, "_broadcast_bootstrap") as broadcast:
         with pytest.raises(ValueError, match="configuration"):
             context._bootstrap(None)
     broadcast.assert_not_called()

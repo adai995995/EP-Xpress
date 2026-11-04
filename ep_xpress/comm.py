@@ -1,7 +1,7 @@
-"""Upper-layer NCCL handles for host-SM bootstrap, never token transport.
+"""Upper-layer NCCL handles for control metadata, never token payloads.
 
 Handles borrow a communicator and retain its owner. Close EP contexts before
-explicitly destroying the owner's communicator/process group. Bootstrap calls
+explicitly destroying the owner's communicator/process group. Metadata calls
 are collective, synchronous, and must not overlap other uses of that comm.
 """
 
@@ -96,7 +96,7 @@ class NCCLCommHandle:
                 raise ValueError("NCCL communicator and process group membership do not match")
 
     def _all_gather(self, tensor):
-        # Initialization/shutdown only. Allocate and enqueue on one current
+        # Host-SM uses this only at initialization/shutdown. Allocate on one current
         # stream so tensor uploads precede the raw NCCL call. The caller's
         # subsequent CPU copy provides the completion fence.
         output = torch.empty((self.world_size, tensor.numel()), dtype=tensor.dtype, device=self.device)
@@ -107,13 +107,16 @@ class NCCLCommHandle:
         return output
 
     def all_gather_object(self, value):
-        """Trusted-rank bootstrap metadata only; never use in dispatch/combine.
+        """Exchange trusted-rank control metadata on the borrowed communicator.
+
+        Host-SM uses this only for setup/teardown, never dispatch/combine.
+        The host-CE reference also uses it for its CPU route plans.
 
         As with torch.distributed object collectives, peers must be trusted
         because deserialization uses pickle. Aggregate padding is capped at
         16 MiB. These raw calls do not create PyTorch Work objects: the process
         group watchdog timeout does not bound them. The application must bound
-        worker startup/shutdown and restart failed workers; this handle never
+        worker execution and restart failed workers; this handle never
         aborts a borrowed communicator.
         """
         payload = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
@@ -147,11 +150,11 @@ _initialized_groups = weakref.WeakKeyDictionary()
 def get_nccl_comm_handle(group, device=None):
     """Borrow PyTorch's NCCL communicator, as in DeepEP's reuse path.
 
-    This setup-time call is collective on first use per group/device. It initializes the
+    This upper-layer call is collective on first use per group/device. It initializes the
     process group's lazy communicator before querying ``_comm_ptr()``. Older
     PyTorch builds without this API must pass an explicitly borrowed handle
-    (for example their framework's PyNccl communicator) or use legacy Gloo
-    bootstrap. EP-Xpress does not silently create another NCCL communicator.
+    (for example their framework's PyNccl communicator). Context accepts only
+    the resulting handle and never creates or switches communication groups.
     """
     if not dist.is_initialized():
         raise RuntimeError("initialize the NCCL process group first")
@@ -168,8 +171,8 @@ def get_nccl_comm_handle(group, device=None):
         return _handles[key]
     backend = group._get_backend(device)
     if not callable(getattr(backend, "_comm_ptr", None)):
-        raise RuntimeError("PyTorch does not expose _comm_ptr(); pass NCCLCommHandle.borrow() "
-                           "from the framework or use legacy Gloo bootstrap")
+        raise RuntimeError("PyTorch does not expose _comm_ptr(); obtain an NCCLCommHandle.borrow() "
+                           "from the framework before constructing Context")
     with torch.cuda.device(device):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("obtain the NCCL communicator before CUDA Graph capture")

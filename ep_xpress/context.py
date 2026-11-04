@@ -2,7 +2,6 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
-from datetime import timedelta
 import hashlib
 import json
 import os
@@ -15,9 +14,9 @@ import time
 import uuid
 
 import torch
-import torch.distributed as dist
 
 from .config import Config
+from .comm import NCCLCommHandle
 from . import native
 from .ring import SharedRing
 from .routing import build_routes
@@ -105,29 +104,25 @@ class Context:
     """One long-lived EP group, one device per process, shared host arenas.
 
     All ranks must construct contexts and submit dispatch/combine in the same
-    order. host_ce requires Gloo for bootstrap and route metadata. host_sm
-    accepts an upper-layer NCCL group/handle or a legacy Gloo control group.
+    order. The caller supplies one initialized NCCLCommHandle. Context never
+    creates a process group or selects a different bootstrap backend.
     Activation and expert-result payloads use the configured host transport.
     host_sm uses its communicator only during setup/shutdown; routing stays on GPU.
     """
 
-    def __new__(cls, group, expert_to_rank, config, device=None, shared_directory=None, *, nccl_comm=None, bootstrap_group=None):
+    def __new__(cls, nccl_comm, expert_to_rank, config, device=None, shared_directory=None):
         if cls is Context and config.transport == "host_sm":
             from .host_sm import HostSMContext
             return object.__new__(HostSMContext)
         return object.__new__(cls)
 
-    def __init__(self, group, expert_to_rank, config: Config, device=None, shared_directory=None, *, nccl_comm=None, bootstrap_group=None):
-        if nccl_comm is not None or bootstrap_group is not None:
-            raise ValueError("NCCL communicator injection requires transport='host_sm'")
-        if not dist.is_initialized():
-            raise RuntimeError("initialize a Gloo process group before constructing Context")
-        if str(dist.get_backend(group)) != "gloo":
-            raise ValueError("Context requires a Gloo control group")
+    def __init__(self, nccl_comm, expert_to_rank, config: Config, device=None, shared_directory=None):
+        if not isinstance(nccl_comm, NCCLCommHandle):
+            raise TypeError("Context requires an upper-layer NCCLCommHandle")
         if not torch.cuda.is_available():
             raise RuntimeError("Context requires CUDA; routing and ring tests are CPU-only")
-        self.rank = dist.get_rank(group)
-        self.world_size = dist.get_world_size(group)
+        self.nccl_comm_handle = nccl_comm
+        self.rank, self.world_size = nccl_comm.rank, nccl_comm.world_size
         if not 1 <= self.world_size <= 63:
             raise ValueError("supported EP group size is 1 through 63")
         self.config = config
@@ -137,27 +132,20 @@ class Context:
             raise ValueError("expert_to_rank must contain valid EP group ranks")
         if config.topk > len(self.expert_to_rank):
             raise ValueError("topk cannot exceed the number of experts")
-        chosen = torch.cuda.current_device() if device is None else device
+        chosen = nccl_comm.device if device is None else device
         if isinstance(chosen, int):
             chosen = torch.device("cuda", chosen)
         chosen = torch.device(chosen)
         if chosen.type != "cuda":
             raise ValueError("device must be CUDA")
         self.device = torch.device("cuda", torch.cuda.current_device() if chosen.index is None else chosen.index)
+        if self.device != nccl_comm.device:
+            raise ValueError("NCCL communicator and Context must use the same CUDA device")
         if config.pinned_working_set_bytes(self.world_size) > config.host_pool_budget_bytes:
             raise ValueError("shared rings and receive packs exceed host_pool_budget_bytes")
-        # JIT compilation is a one-time setup step and may exceed the operation
-        # timeout. PyTorch serializes concurrent builds through its cache lock.
-        # Compile before creating the timeout-bounded communication group.
+        # JIT compilation is a one-time setup step outside collective metadata.
         with torch.cuda.device(self.device):
             native.load()
-        # Isolate metadata ordering from framework collectives and bound failed
-        # peer waits independently of the caller's potentially long timeout.
-        members = dist.get_process_group_ranks(group) if group is not None else list(range(dist.get_world_size()))
-        self.group = dist.new_group(ranks=members, backend="gloo",
-                                    timeout=timedelta(seconds=config.timeout_seconds),
-                                    use_local_synchronization=True)
-        group = self.group
         self._id = uuid.uuid4().hex
         self._closed = False
         self._failure = None
@@ -174,14 +162,12 @@ class Context:
         # Host identity is compared in memory only and never stored in reports.
         signature = (socket.gethostname(), asdict(config), self.expert_to_rank,
                      str(torch.cuda.get_device_properties(self.device).uuid))
-        signatures = [None] * self.world_size
-        dist.all_gather_object(signatures, signature, group=group)
+        signatures = nccl_comm.all_gather_object(signature)
         if any(item[:3] != signature[:3] for item in signatures):
             raise ValueError("all EP ranks must be on one host with matching configuration and expert placement")
         if len({str(item[3]) for item in signatures}) != self.world_size:
             raise ValueError("each EP rank must use a distinct CUDA device")
 
-        leader = dist.get_global_rank(group, 0) if group is not None else 0
         with torch.cuda.device(self.device):
             self._work_stream = torch.cuda.Stream(device=self.device)
             self._export_stream = torch.cuda.Stream(device=self.device)
@@ -205,7 +191,7 @@ class Context:
                 root_message[0] = str(root)
             except Exception:
                 root_message[1] = "shared ring initialization failed; check shared-memory capacity and permissions"
-        dist.broadcast_object_list(root_message, src=leader, group=group)
+        root_message = nccl_comm.all_gather_object(root_message if self.rank == 0 else None)[0]
         if root_message[1]:
             if self.rank == 0 and self._root:
                 shutil.rmtree(self._root, ignore_errors=True)
@@ -227,8 +213,7 @@ class Context:
                                              for _ in range(config.slots)]
         except Exception:
             init_error = "ring mapping or CUDA host registration failed"
-        errors = [None] * self.world_size
-        dist.all_gather_object(errors, init_error, group=group)
+        errors = nccl_comm.all_gather_object(init_error)
         if any(errors):
             self._release_resources()
             raise RuntimeError(next(error for error in errors if error))
@@ -259,8 +244,7 @@ class Context:
             tag_hash = None
         item = {"operation": operation, "phase": phase, "tag": tag_hash,
                 "error": error, "payload": payload}
-        gathered = [None] * self.world_size
-        dist.all_gather_object(gathered, item, group=self.group)
+        gathered = self.nccl_comm_handle.all_gather_object(item)
         if any(entry["error"] for entry in gathered):
             raise ValueError(next(entry["error"] for entry in gathered if entry["error"]))
         if any((entry["operation"], entry["phase"], entry["tag"]) !=
@@ -449,12 +433,12 @@ class Context:
             ring.aborted() for rings in self._rings.values() for ring in rings)
         try:
             if self._healthy and not aborted:
-                dist.barrier(group=self.group)
+                self.nccl_comm_handle.barrier()
         finally:
             try:
                 self._release_resources()
             finally:
-                dist.destroy_process_group(self.group)
+                self.nccl_comm_handle = None
 
     def __enter__(self):
         return self

@@ -10,8 +10,8 @@ import unittest
 
 
 SCANNER = Path(__file__).resolve().parents[1] / "tools" / "check_public_content.py"
-PUBLIC_NAME = "EP-Xpress Contributors"
-PUBLIC_EMAIL = "contributors@users.noreply.github.com"
+PUBLIC_NAME = "adai995995"
+PUBLIC_EMAIL = "219398220+adai995995@users.noreply.github.com"
 
 
 class PublicContentTests(unittest.TestCase):
@@ -67,6 +67,18 @@ class PublicContentTests(unittest.TestCase):
         result = self.scan("--staged", "--history", "--worktree")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_historical_public_identity_and_owner_commits_both_pass(self):
+        self.git("config", "user.name", "EP-Xpress Contributors")
+        self.git("config", "user.email", "contributors@users.noreply.github.com")
+        self.write("README.md", "Public project\n")
+        self.commit()
+        self.git("config", "user.name", PUBLIC_NAME)
+        self.git("config", "user.email", PUBLIC_EMAIL)
+        self.write("README.md", "Public project with owner attribution\n")
+        self.commit()
+        result = self.scan("--staged", "--history")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_staged_reads_index_even_when_worktree_is_cleaned(self):
         address = ".".join(["198", "51", "100", "25"])
         self.write("settings.txt", "server=" + address)
@@ -77,6 +89,13 @@ class PublicContentTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("nonlocal-ipv4", result.stdout)
         self.assertNotIn(address, result.stdout + result.stderr)
+
+    def test_new_commits_require_owner_identity(self):
+        self.git("config", "user.name", "EP-Xpress Contributors")
+        self.git("config", "user.email", "contributors@users.noreply.github.com")
+        result = self.scan("--staged")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("nonpublic-git-identity", result.stdout)
 
     def test_deleted_historical_secret_still_blocks_publication(self):
         credential = "ghp_" + "a" * 36
