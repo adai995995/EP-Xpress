@@ -20,6 +20,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--hidden", type=int, default=2048)
     parser.add_argument("--graph", action="store_true")
+    parser.add_argument("--large-tokens", type=int, default=0,
+                        help="Also check sparse large sends and an unaligned token capacity")
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     device = torch.device("cuda", torch.cuda.current_device())
@@ -29,7 +31,7 @@ def main():
     # Multiplication by 5 permutes the tested 4/16 rank groups. Arbitrary maps
     # including ranks with no experts are legal; no contiguous partition assumption.
     local_globals = torch.tensor([e for e, owner in enumerate(mapping) if owner == rank], device=device)
-    config = Config(hidden_size=args.hidden, topk=4, max_tokens_per_rank=64,
+    config = Config(hidden_size=args.hidden, topk=4, max_tokens_per_rank=max(64, args.large_tokens),
                     transport="host_sm", internode_transport="gin", timeout_seconds=60)
     ctx = Context(get_nccl_comm_handle(dist.group.WORLD), mapping, config)
     if args.graph:
@@ -45,6 +47,8 @@ def main():
             ids[:, :3] = torch.tensor([e for e, owner in enumerate(mapping) if owner == 0][:3], device=device)
         if n:
             ids[-1, -1] = -1
+        if epoch in (4, 24):
+            ids.fill_(-1)  # Nonempty inputs may have no readers, including after prior payloads.
         w = torch.rand((n, 4), generator=gen, device=device)
         w = torch.where(ids >= 0, w, 0)
         return x, ids, w
@@ -90,7 +94,7 @@ def main():
 
     # Empty ranks, all empty, balanced and skewed changing routes, mixed async/direct.
     for epoch in range(7):
-        n = 0 if epoch == 0 or (epoch == 1 and rank % 3 == 0) else 1 + (rank * 3 + epoch) % 11
+        n = 0 if epoch in (0, 6) or (epoch == 1 and rank % 3 == 0) else 1 + (rank * 3 + epoch) % 11
         x, ids, weights = inputs(n, epoch, skew=epoch == 3)
         if args.graph or epoch % 2 == 0:
             batch = ctx.dispatch_on_stream(x, ids, weights, recv_capacity=world * 16, stream=stream)
@@ -101,6 +105,17 @@ def main():
         check(x, ids, weights, batch, result)
         if rank == 0:
             print(json.dumps({"stage": "eager", "epoch": epoch, "correct": True}), flush=True)
+
+    if args.large_tokens:
+        x, ids, weights = inputs(args.large_tokens, 41)
+        ids[::3] = -1
+        weights = torch.where(ids >= 0, weights, 0)
+        batch = ctx.dispatch_on_stream(x, ids, weights, recv_capacity=world * args.large_tokens)
+        result = ctx.combine_on_stream(expert(batch), batch.handle)
+        check(x, ids, weights, batch, result)
+        if rank == 0:
+            print(json.dumps({"stage": "large_sparse", "tokens": args.large_tokens,
+                              "correct": True}), flush=True)
 
     # Operation-scoped inverse maps must survive another dispatch's staging reuse.
     first, second = inputs(3, 31), inputs(6, 32, skew=True)

@@ -337,7 +337,9 @@ public:
             throw std::runtime_error("invalid GIN dispatch capacity or closed runtime");
         auto s = reinterpret_cast<cudaStream_t>(stream_ptr);
         phase_barrier<<<1,256,0,s>>>(dc, timeout_cycles); // prior readers finished; safe to recycle
-        cu(cudaMemsetAsync(a.base, 0, a.world * 2 * sizeof(int), s));
+        // Every remote producer overwrites its count, including zero. Clearing
+        // receive slots here could erase a faster peer's new publication.
+        cu(cudaMemsetAsync(a.base, 0, a.world * sizeof(int), s));
         cu(cudaMemsetAsync(reinterpret_cast<void*>(count), 0, sizeof(int), s));
         if (capacity) {
             cu(cudaMemsetAsync(reinterpret_cast<void*>(out), 0, size_t(capacity) * a.hidden * 2, s));

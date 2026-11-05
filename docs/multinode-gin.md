@@ -8,6 +8,9 @@ kernels. The single-node transport remains the default.
 
 The initial [two-node EP16 validation and model results](multinode-performance.md)
 cover dynamic routing, CUDA Graph replay and a matched default-NCCL comparison.
+The subsequent [control-path experiments](multinode-control-optimization.md)
+record the profiling results, rejected performance candidates and retained count
+ownership fix. The original four-barrier protocol remains in use.
 
 The caller supplies its initialized `NCCLCommHandle`. EP-Xpress creates a device
 communication resource on that handle; it does not create another NCCL or Gloo
@@ -42,6 +45,11 @@ and counts are visible before receiving/reducing. The barriers cover every GIN
 context; a signal on context 0 alone cannot order puts on another context/QP.
 Host writers execute system-scope fences before publication. Receivers use
 volatile loads from mapped host storage.
+
+Remote receive-count slots are owned by their producers. Local initialization
+clears only send counts: clearing receive slots after the entry barrier could
+erase a faster peer's new publication. Every producer sends a count, including
+zero, before the publication barrier.
 
 These are full-batch barriers across the EP group. This implementation does not
 yet overlap expert computation with remote receives, use per-peer credits, or

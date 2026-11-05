@@ -1,5 +1,9 @@
 # Two-node SGLang EP16 validation — 2026-11-05
 
+For a later matched allocation and control-path tuning experiments, see the
+[subsequent optimization report](multinode-control-optimization.md). The results
+below describe the initial allocation and are preserved as that experiment's record.
+
 The initial direct-GIN implementation completed full Qwen3-30B-A3B-Instruct-2507
 inference on two hosts with eight NVIDIA H20D GPUs each. Intra-node EP-Xpress
 payloads used mapped host memory; inter-node payloads used GPU-resident GDAKI/GDR

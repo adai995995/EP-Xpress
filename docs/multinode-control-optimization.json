@@ -1,0 +1,3421 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-05",
+  "model": "Qwen3-30B-A3B-Instruct-2507",
+  "hardware": {
+    "nodes": 2,
+    "gpus_per_node": 8,
+    "gpu": "NVIDIA H20D"
+  },
+  "software": {
+    "sglang_revision": "e00930c5489053f26d86b179cee0d087f846acbb",
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "nccl_runtime": 23007,
+    "triton": "3.7.1",
+    "flashinfer": "0.6.18"
+  },
+  "configuration": {
+    "tp": 16,
+    "ep": 16,
+    "dp": 16,
+    "dtype": "bfloat16",
+    "expert_runner": "triton",
+    "attention_backend": "flashinfer",
+    "decode_graph": "full",
+    "local_graph_buckets": [
+      1,
+      2,
+      4
+    ],
+    "prefill_graph": "disabled",
+    "nvlink_payload": false,
+    "gpu_p2p_payload": false,
+    "gdr": true,
+    "nccl_cumem_enable": 1,
+    "gin_contexts": 4,
+    "max_tokens_per_source": 4096,
+    "gpu_registered_bytes_per_rank": 832569344,
+    "host_bytes_per_producer": 151523328
+  },
+  "workload": {
+    "batch_sizes": [
+      1,
+      32
+    ],
+    "input_tokens": 512,
+    "output_tokens": 32,
+    "repeats": 3,
+    "warmups_per_case": 16,
+    "warmup_output_tokens": 16,
+    "seed": 20261017,
+    "radix_cache": false,
+    "load_balance": "round_robin"
+  },
+  "metrics": {
+    "ttft_mean_ms": "Mean request first-token latency, then arithmetic mean over completed batches. Includes admission, scheduling, prefill and first-token production.",
+    "steady_state_output_tokens_per_s": "Aggregate output rate from last request first-token arrival to first request completion, using token-count interpolation."
+  },
+  "baseline_revision": "4c8c35695e1afdab97e933601a140cd6365aee8a",
+  "comparison_note": "New matched two-node allocation; use this NCCL baseline, not the earlier allocation.",
+  "results": {
+    "default_nccl": {
+      "source_sha256": "db88bcca3848f00c5536223f7971870f7ea9c37d7c6759af1e61f707022c0eb2",
+      "batches": {
+        "1": {
+          "sample_count": 3,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 140.29269168774286,
+              "min": 124.951908364892,
+              "max": 152.92875282466412,
+              "samples": [
+                142.99741387367249,
+                124.951908364892,
+                152.92875282466412
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 52.497087012119415,
+              "min": 52.415345533619615,
+              "max": 52.56475168273548,
+              "samples": [
+                52.415345533619615,
+                52.51116382000315,
+                52.56475168273548
+              ]
+            },
+            "latency_ms": {
+              "mean": 730.9615577881535,
+              "min": 715.4067270457745,
+              "max": 742.9147064685822,
+              "samples": [
+                734.5632398501039,
+                715.4067270457745,
+                742.9147064685822
+              ]
+            }
+          }
+        },
+        "32": {
+          "sample_count": 3,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 748.7916129951676,
+              "min": 742.946096957894,
+              "max": 760.2526537084486,
+              "samples": [
+                760.2526537084486,
+                743.17608831916,
+                742.946096957894
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 1512.7516611617318,
+              "min": 1507.6457691825622,
+              "max": 1516.2998530453872,
+              "samples": [
+                1507.6457691825622,
+                1516.2998530453872,
+                1514.309361257246
+              ]
+            },
+            "latency_ms": {
+              "mean": 1439.365101667742,
+              "min": 1398.851938545704,
+              "max": 1519.75120883435,
+              "samples": [
+                1519.75120883435,
+                1398.851938545704,
+                1399.4921576231718
+              ]
+            }
+          }
+        }
+      }
+    },
+    "original_ep_xpress": {
+      "source_sha256": "db88bcca3848f00c5536223f7971870f7ea9c37d7c6759af1e61f707022c0eb2",
+      "batches": {
+        "1": {
+          "sample_count": 6,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 103.31890126690269,
+              "min": 100.52441153675318,
+              "max": 111.472656019032,
+              "samples": [
+                100.72407219558954,
+                100.52441153675318,
+                111.472656019032,
+                100.96671339124441,
+                103.68180181831121,
+                102.54375264048576
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 68.07856424669131,
+              "min": 67.64505580801006,
+              "max": 68.40806627078862,
+              "samples": [
+                67.64505580801006,
+                68.22973381349121,
+                68.27491461086339,
+                67.86924668354014,
+                68.04436829345444,
+                68.40806627078862
+              ]
+            },
+            "latency_ms": {
+              "mean": 558.8544667698443,
+              "min": 555.1152462139726,
+              "max": 565.7773166894913,
+              "samples": [
+                559.0997654944658,
+                555.1152462139726,
+                565.7773166894913,
+                557.8265869989991,
+                559.3664804473519,
+                555.941404774785
+              ]
+            }
+          }
+        },
+        "32": {
+          "sample_count": 6,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 457.6189874739309,
+              "min": 434.8117970803287,
+              "max": 487.03139208373614,
+              "samples": [
+                468.0212501261849,
+                434.8117970803287,
+                462.4140431697015,
+                445.91334293363616,
+                447.52209944999777,
+                487.03139208373614
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 2001.1024613203758,
+              "min": 1985.885661429485,
+              "max": 2019.1768883326997,
+              "samples": [
+                2007.539477180432,
+                1990.7229036952704,
+                2006.4666737803998,
+                1996.8231635039685,
+                1985.885661429485,
+                2019.1768883326997
+              ]
+            },
+            "latency_ms": {
+              "mean": 1002.8601858454446,
+              "min": 979.697328992188,
+              "max": 1016.4525611326098,
+              "samples": [
+                1009.3381758779287,
+                1001.1735055595636,
+                997.7317191660404,
+                1012.767824344337,
+                1016.4525611326098,
+                979.697328992188
+              ]
+            }
+          }
+        }
+      }
+    },
+    "peer_partition": {
+      "source_sha256": "f380aad859c0f6f97b6289537016830798091e48ed808ce1e6d73b2c8da0a77d",
+      "batches": {
+        "1": {
+          "sample_count": 3,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 258.9831342920661,
+              "min": 257.44662526994944,
+              "max": 261.5069756284356,
+              "samples": [
+                257.99580197781324,
+                257.44662526994944,
+                261.5069756284356
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 83.69219820259562,
+              "min": 83.20649888869093,
+              "max": 83.98371848057174,
+              "samples": [
+                83.98371848057174,
+                83.20649888869093,
+                83.88637723852419
+              ]
+            },
+            "latency_ms": {
+              "mean": 629.5485639323791,
+              "min": 627.2242395207286,
+              "max": 631.3043665140867,
+              "samples": [
+                627.2242395207286,
+                630.117085762322,
+                631.3043665140867
+              ]
+            }
+          }
+        },
+        "32": {
+          "sample_count": 3,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 951.5236338581113,
+              "min": 862.18547532917,
+              "max": 1009.6660510753281,
+              "samples": [
+                1009.6660510753281,
+                982.719375169836,
+                862.18547532917
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 2247.5586920626824,
+              "min": 2232.74277858421,
+              "max": 2275.3746231498776,
+              "samples": [
+                2275.3746231498776,
+                2234.558674453959,
+                2232.74277858421
+              ]
+            },
+            "latency_ms": {
+              "mean": 1464.0063696230452,
+              "min": 1429.1059570387006,
+              "max": 1500.8498970419168,
+              "samples": [
+                1462.063254788518,
+                1500.8498970419168,
+                1429.1059570387006
+              ]
+            }
+          }
+        }
+      }
+    },
+    "bounded_batch": {
+      "source_sha256": "bdec4feea582bf7c43969d0d1b02638d76b96f7783d8387b16da64e341b14d39",
+      "batches": {
+        "1": {
+          "sample_count": 3,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 170.42253321657577,
+              "min": 169.61029544472694,
+              "max": 171.2968312203884,
+              "samples": [
+                171.2968312203884,
+                170.360472984612,
+                169.61029544472694
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 78.52556884415131,
+              "min": 78.37918401242308,
+              "max": 78.67327485687765,
+              "samples": [
+                78.5242476631532,
+                78.37918401242308,
+                78.67327485687765
+              ]
+            },
+            "latency_ms": {
+              "mean": 565.3634431461493,
+              "min": 563.8910569250584,
+              "max": 566.2138117477298,
+              "samples": [
+                566.2138117477298,
+                565.9854607656598,
+                563.8910569250584
+              ]
+            }
+          }
+        },
+        "32": {
+          "sample_count": 3,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 745.0851145840716,
+              "min": 737.8581931116059,
+              "max": 755.5468129867222,
+              "samples": [
+                741.8503376538865,
+                737.8581931116059,
+                755.5468129867222
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 2122.751556730839,
+              "min": 2113.8385471780157,
+              "max": 2134.3850747976207,
+              "samples": [
+                2134.3850747976207,
+                2120.031048216881,
+                2113.8385471780157
+              ]
+            },
+            "latency_ms": {
+              "mean": 1274.1665697346132,
+              "min": 1268.2804800570011,
+              "max": 1277.303209528327,
+              "samples": [
+                1268.2804800570011,
+                1276.9160196185112,
+                1277.303209528327
+              ]
+            }
+          }
+        }
+      }
+    },
+    "single_qp_pooled": {
+      "source_sha256": "16ddffc4c8a9c691cc97e7b4c5b2f3988dd65b6d687a76fdddee95a1cc7187ce",
+      "batches": {
+        "1": {
+          "sample_count": 3,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 113.41161218782266,
+              "min": 111.80619429796934,
+              "max": 114.37921412289143,
+              "samples": [
+                111.80619429796934,
+                114.04942814260721,
+                114.37921412289143
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 78.96126139876111,
+              "min": 78.57698983871657,
+              "max": 79.3123169729777,
+              "samples": [
+                78.99447738458908,
+                78.57698983871657,
+                79.3123169729777
+              ]
+            },
+            "latency_ms": {
+              "mean": 506.1643701046705,
+              "min": 504.33041248470545,
+              "max": 508.6728800088167,
+              "samples": [
+                504.33041248470545,
+                508.6728800088167,
+                505.4898178204894
+              ]
+            }
+          }
+        },
+        "32": {
+          "sample_count": 3,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 715.7560580623491,
+              "min": 698.5337242949754,
+              "max": 748.7032985955011,
+              "samples": [
+                700.0311512965709,
+                698.5337242949754,
+                748.7032985955011
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 2308.8248636386566,
+              "min": 2286.5492290278858,
+              "max": 2331.2771379405926,
+              "samples": [
+                2331.2771379405926,
+                2286.5492290278858,
+                2308.6482239474913
+              ]
+            },
+            "latency_ms": {
+              "mean": 1190.4868766044576,
+              "min": 1126.9621346145868,
+              "max": 1224.2085551843047,
+              "samples": [
+                1126.9621346145868,
+                1220.2899400144815,
+                1224.2085551843047
+              ]
+            }
+          }
+        }
+      }
+    },
+    "active_qp_both": {
+      "source_sha256": "76fc8934221d680c34ab85c11d59a644ae600f6b44e161801e43959f59e2c459",
+      "batches": {
+        "1": {
+          "sample_count": 6,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 101.77442105486989,
+              "min": 99.96811114251614,
+              "max": 106.25431966036558,
+              "samples": [
+                99.96811114251614,
+                101.52641404420137,
+                100.99843330681324,
+                101.08570754528046,
+                100.81354063004255,
+                106.25431966036558
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 76.97882983391915,
+              "min": 76.49543622264734,
+              "max": 77.24349848395404,
+              "samples": [
+                76.83394615409739,
+                77.0360626268585,
+                77.09111058990315,
+                77.24349848395404,
+                77.17292492605445,
+                76.49543622264734
+              ]
+            },
+            "latency_ms": {
+              "mean": 504.62048733606935,
+              "min": 502.4878717958927,
+              "max": 511.7091489955783,
+              "samples": [
+                503.5482868552208,
+                504.0328372269869,
+                503.36127169430256,
+                502.4878717958927,
+                502.58350744843483,
+                511.7091489955783
+              ]
+            }
+          }
+        },
+        "32": {
+          "sample_count": 6,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 484.85075899710256,
+              "min": 441.79032498504966,
+              "max": 546.8129146029241,
+              "samples": [
+                441.79032498504966,
+                546.8129146029241,
+                486.81033522007056,
+                499.3227663799189,
+                478.5346004064195,
+                455.8336123882327
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 2217.9446034027806,
+              "min": 2200.000677520263,
+              "max": 2232.9806262667157,
+              "samples": [
+                2210.089054901037,
+                2228.8755809941267,
+                2232.9806262667157,
+                2229.5715001374183,
+                2200.000677520263,
+                2206.1501805971234
+              ]
+            },
+            "latency_ms": {
+              "mean": 961.7221509106457,
+              "min": 932.4034592136741,
+              "max": 1004.8709185793996,
+              "samples": [
+                956.4811680465937,
+                1004.8709185793996,
+                932.4034592136741,
+                945.668020285666,
+                972.5976074114442,
+                958.3117319270968
+              ]
+            }
+          }
+        }
+      }
+    },
+    "combine_only": {
+      "source_sha256": "23980b1b19936ac1744874639ceb2c87c288007e08031ac1d52b41d8e708e1e3",
+      "batches": {
+        "1": {
+          "sample_count": 3,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 101.91114557286103,
+              "min": 99.74425379186869,
+              "max": 105.08051235228777,
+              "samples": [
+                100.90867057442665,
+                105.08051235228777,
+                99.74425379186869
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 71.94837395657969,
+              "min": 71.57246243824703,
+              "max": 72.6897814168299,
+              "samples": [
+                71.57246243824703,
+                72.6897814168299,
+                71.58287801466211
+              ]
+            },
+            "latency_ms": {
+              "mean": 532.945716753602,
+              "min": 531.642397865653,
+              "max": 534.1269867494702,
+              "samples": [
+                534.1269867494702,
+                531.642397865653,
+                533.0677656456828
+              ]
+            }
+          }
+        },
+        "32": {
+          "sample_count": 3,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 517.4833036823353,
+              "min": 490.1900480326731,
+              "max": 549.4542076485232,
+              "samples": [
+                490.1900480326731,
+                549.4542076485232,
+                512.8056553658098
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 2121.5694388128036,
+              "min": 2109.807131019622,
+              "max": 2133.212119770312,
+              "samples": [
+                2133.212119770312,
+                2121.6890656484775,
+                2109.807131019622
+              ]
+            },
+            "latency_ms": {
+              "mean": 998.1321465844909,
+              "min": 956.6187867894769,
+              "max": 1023.4704120084643,
+              "samples": [
+                956.6187867894769,
+                1023.4704120084643,
+                1014.3072409555316
+              ]
+            }
+          }
+        }
+      }
+    },
+    "dispatch_only": {
+      "source_sha256": "3ade53411ecd18211fe6dd60d67f2f41169185b6d007cfb6f7d2e02dcae8f555",
+      "batches": {
+        "1": {
+          "sample_count": 3,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 102.42263662318389,
+              "min": 99.99795444309711,
+              "max": 103.7009097635746,
+              "samples": [
+                103.56904566287994,
+                99.99795444309711,
+                103.7009097635746
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 74.80639454129451,
+              "min": 74.68550489318226,
+              "max": 74.87373074408941,
+              "samples": [
+                74.85994798661184,
+                74.87373074408941,
+                74.68550489318226
+              ]
+            },
+            "latency_ms": {
+              "mean": 516.9490606834491,
+              "min": 514.1004463657737,
+              "max": 518.9965395256877,
+              "samples": [
+                517.750196158886,
+                514.1004463657737,
+                518.9965395256877
+              ]
+            }
+          }
+        },
+        "32": {
+          "sample_count": 3,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 482.1568465461799,
+              "min": 437.9733052337542,
+              "max": 512.5760241935495,
+              "samples": [
+                512.5760241935495,
+                495.92121021123603,
+                437.9733052337542
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 2161.99850415356,
+              "min": 2144.961252538493,
+              "max": 2182.8843877798686,
+              "samples": [
+                2182.8843877798686,
+                2158.149872142318,
+                2144.961252538493
+              ]
+            },
+            "latency_ms": {
+              "mean": 965.4404933874806,
+              "min": 956.9621961563826,
+              "max": 970.872251316905,
+              "samples": [
+                968.4870326891541,
+                956.9621961563826,
+                970.872251316905
+              ]
+            }
+          }
+        }
+      }
+    },
+    "parallel_metadata": {
+      "source_sha256": "d4f422778ca6b09190869688c78c49fd1cf223727d848f6875a9c9d1bb77ab2e",
+      "batches": {
+        "1": {
+          "sample_count": 3,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 101.41891396294038,
+              "min": 98.28480239957571,
+              "max": 103.89817971736193,
+              "samples": [
+                98.28480239957571,
+                103.89817971736193,
+                102.07375977188349
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 69.97859152785078,
+              "min": 69.80832197327875,
+              "max": 70.1140985933199,
+              "samples": [
+                70.01335401695371,
+                69.80832197327875,
+                70.1140985933199
+              ]
+            },
+            "latency_ms": {
+              "mean": 544.5529945815603,
+              "min": 541.1574514582753,
+              "max": 548.0630211532116,
+              "samples": [
+                541.1574514582753,
+                548.0630211532116,
+                544.438511133194
+              ]
+            }
+          }
+        },
+        "32": {
+          "sample_count": 3,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 481.68024368351325,
+              "min": 473.76136665116064,
+              "max": 485.692916350672,
+              "samples": [
+                485.692916350672,
+                485.5864480487071,
+                473.76136665116064
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 2068.9311739309182,
+              "min": 2063.3384252352316,
+              "max": 2078.2205206253025,
+              "samples": [
+                2078.2205206253025,
+                2065.2345759322207,
+                2063.3384252352316
+              ]
+            },
+            "latency_ms": {
+              "mean": 976.430463604629,
+              "min": 964.848954230547,
+              "max": 997.112880460918,
+              "samples": [
+                964.848954230547,
+                967.3295561224222,
+                997.112880460918
+              ]
+            }
+          }
+        }
+      }
+    },
+    "retained_count_fix": {
+      "source_sha256": "ebbc3d5eeb5ea5015d09210fe4c5f8cf3b79f70bc823ac3807a4cc25a397888f",
+      "batches": {
+        "1": {
+          "sample_count": 3,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 100.56397567192714,
+              "min": 99.83068518340588,
+              "max": 101.38797294348478,
+              "samples": [
+                99.83068518340588,
+                100.47326888889074,
+                101.38797294348478
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 68.07063815640593,
+              "min": 67.89161199087555,
+              "max": 68.30015264611708,
+              "samples": [
+                68.02014983222516,
+                67.89161199087555,
+                68.30015264611708
+              ]
+            },
+            "latency_ms": {
+              "mean": 556.1491881186763,
+              "min": 555.5603057146072,
+              "max": 557.2089534252882,
+              "samples": [
+                555.6783052161336,
+                557.2089534252882,
+                555.5603057146072
+              ]
+            }
+          }
+        },
+        "32": {
+          "sample_count": 3,
+          "metrics": {
+            "ttft_mean_ms": {
+              "mean": 453.9647158623363,
+              "min": 422.62114252662286,
+              "max": 484.01438078144565,
+              "samples": [
+                455.25862427894026,
+                484.01438078144565,
+                422.62114252662286
+              ]
+            },
+            "steady_state_output_tokens_per_s": {
+              "mean": 1999.3848057734042,
+              "min": 1986.9661769157483,
+              "max": 2007.758216391473,
+              "samples": [
+                2003.430024012991,
+                2007.758216391473,
+                1986.9661769157483
+              ]
+            },
+            "latency_ms": {
+              "mean": 992.2052376593152,
+              "min": 979.4858871027827,
+              "max": 1008.1787006929517,
+              "samples": [
+                1008.1787006929517,
+                979.4858871027827,
+                988.9511251822114
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "selected": "retained_count_fix",
+  "decision": "All performance candidates reverted: no candidate established ordinary 32-request TTFT non-regression alongside the Decode gain. Retained code only fixes receive-count ownership.",
+  "prompt_sha256": [
+    "759c6d4a24448ea672c2e2ce687e7daafa9fd8a9b21ec8070c8669b69cd75836",
+    "63d494b0759f61767638c611fc042f6635a76b9af4ce465b9f4699f3f11f8029",
+    "61b434a8a0f7c55149fa7086a306659d380ece87dd080a72afdbd96219d88009",
+    "4bb451ecb23853c0adcda0b54c37b1473185746882831cc3ca21f40c374bdb1b",
+    "ced2527915210938eb42df6f623f64215af81da2beb6496a1e2c8450816502b4",
+    "d07bd57c0716c9832f0ea0fa400bf018e5d64368c1a20d887642ea1abca318c9"
+  ],
+  "profile_scope": "Separate diagnostic runs. Values are per-kernel means per rank, then averaged across ranks; not summed across GPUs or equated with HTTP latency. Prefill batch shapes can differ.",
+  "profiles": {
+    "original": {
+      "1/prefill": {
+        "combine_publish": {
+          "mean_rank_us": 167.13821744791667,
+          "min_rank_us": 116.03839583333334,
+          "max_rank_us": 253.55233333333334
+        },
+        "combine_reuse": {
+          "mean_rank_us": 173.62072395833334,
+          "min_rank_us": 28.063229166666666,
+          "max_rank_us": 230.17452083333333
+        },
+        "dispatch_publish": {
+          "mean_rank_us": 253.51348697916666,
+          "min_rank_us": 24.966020833333335,
+          "max_rank_us": 279.7654375
+        },
+        "dispatch_reuse": {
+          "mean_rank_us": 1298.0842942708334,
+          "min_rank_us": 25.44075,
+          "max_rank_us": 1399.1661875
+        },
+        "pack_combine": {
+          "mean_rank_us": 14.937803385416666,
+          "min_rank_us": 7.31325,
+          "max_rank_us": 26.3731875
+        },
+        "pack_dispatch": {
+          "mean_rank_us": 5.708059895833333,
+          "min_rank_us": 2.5140625,
+          "max_rank_us": 49.074645833333335
+        },
+        "receive_dispatch": {
+          "mean_rank_us": 51.19813411458333,
+          "min_rank_us": 11.102583333333333,
+          "max_rank_us": 110.15422916666667
+        },
+        "receive_prefix": {
+          "mean_rank_us": 10.747451822916666,
+          "min_rank_us": 10.497333333333334,
+          "max_rank_us": 10.9526875
+        },
+        "reduce_combine": {
+          "mean_rank_us": 13.467911458333333,
+          "min_rank_us": 0.6959375,
+          "max_rank_us": 204.66570833333333
+        },
+        "send_combine": {
+          "mean_rank_us": 41.08931380208333,
+          "min_rank_us": 1.6726666666666667,
+          "max_rank_us": 93.13783333333333
+        },
+        "send_counts": {
+          "mean_rank_us": 6.625067708333333,
+          "min_rank_us": 5.916666666666667,
+          "max_rank_us": 7.0939375
+        },
+        "send_dispatch": {
+          "mean_rank_us": 13.049825520833334,
+          "min_rank_us": 0.7253541666666666,
+          "max_rank_us": 197.67452083333333
+        }
+      },
+      "1/decode": {
+        "combine_publish": {
+          "mean_rank_us": 39.02924861653646,
+          "min_rank_us": 38.064094401041665,
+          "max_rank_us": 39.67904427083333
+        },
+        "combine_reuse": {
+          "mean_rank_us": 64.00396362304687,
+          "min_rank_us": 51.8961953125,
+          "max_rank_us": 71.50591927083333
+        },
+        "dispatch_publish": {
+          "mean_rank_us": 36.657731282552085,
+          "min_rank_us": 35.83870572916667,
+          "max_rank_us": 40.32971354166666
+        },
+        "dispatch_reuse": {
+          "mean_rank_us": 41.92606473795573,
+          "min_rank_us": 30.691866536458335,
+          "max_rank_us": 43.409818359375
+        },
+        "pack_combine": {
+          "mean_rank_us": 3.1573416341145832,
+          "min_rank_us": 2.6786569010416668,
+          "max_rank_us": 3.908429036458333
+        },
+        "pack_dispatch": {
+          "mean_rank_us": 4.960462320963542,
+          "min_rank_us": 4.82394140625,
+          "max_rank_us": 5.407580078125
+        },
+        "receive_dispatch": {
+          "mean_rank_us": 6.735966796875,
+          "min_rank_us": 3.8975462239583334,
+          "max_rank_us": 12.313751953125001
+        },
+        "receive_prefix": {
+          "mean_rank_us": 11.003260660807292,
+          "min_rank_us": 10.823973958333333,
+          "max_rank_us": 11.190711588541667
+        },
+        "reduce_combine": {
+          "mean_rank_us": 2.314197062174479,
+          "min_rank_us": 1.956994140625,
+          "max_rank_us": 7.530590494791666
+        },
+        "send_combine": {
+          "mean_rank_us": 1.8577218831380207,
+          "min_rank_us": 1.0595930989583333,
+          "max_rank_us": 2.894418619791667
+        },
+        "send_counts": {
+          "mean_rank_us": 5.682732218424479,
+          "min_rank_us": 4.988779296875,
+          "max_rank_us": 5.933654296875
+        },
+        "send_dispatch": {
+          "mean_rank_us": 1.9268526204427083,
+          "min_rank_us": 1.596591796875,
+          "max_rank_us": 6.163169270833333
+        }
+      },
+      "32/prefill": {
+        "combine_publish": {
+          "mean_rank_us": 1403.7920501302083,
+          "min_rank_us": 1124.7972708333334,
+          "max_rank_us": 1719.1250520833335
+        },
+        "combine_reuse": {
+          "mean_rank_us": 945.1999453125,
+          "min_rank_us": 744.7521666666667,
+          "max_rank_us": 1161.66759375
+        },
+        "dispatch_publish": {
+          "mean_rank_us": 262.80093619791666,
+          "min_rank_us": 242.66468749999999,
+          "max_rank_us": 281.3410416666667
+        },
+        "dispatch_reuse": {
+          "mean_rank_us": 265.7949446614583,
+          "min_rank_us": 201.9848125,
+          "max_rank_us": 311.53580208333335
+        },
+        "pack_combine": {
+          "mean_rank_us": 202.276505859375,
+          "min_rank_us": 116.49197916666667,
+          "max_rank_us": 276.27940625
+        },
+        "pack_dispatch": {
+          "mean_rank_us": 59.71039713541667,
+          "min_rank_us": 54.246229166666666,
+          "max_rank_us": 69.47791666666667
+        },
+        "receive_dispatch": {
+          "mean_rank_us": 676.933939453125,
+          "min_rank_us": 514.43703125,
+          "max_rank_us": 806.3049791666666
+        },
+        "receive_prefix": {
+          "mean_rank_us": 11.183215494791666,
+          "min_rank_us": 10.715,
+          "max_rank_us": 11.594583333333333
+        },
+        "reduce_combine": {
+          "mean_rank_us": 207.80954752604165,
+          "min_rank_us": 191.53301041666666,
+          "max_rank_us": 226.61059375
+        },
+        "send_combine": {
+          "mean_rank_us": 638.5829661458333,
+          "min_rank_us": 399.5256875,
+          "max_rank_us": 842.4545520833333
+        },
+        "send_counts": {
+          "mean_rank_us": 6.543561848958333,
+          "min_rank_us": 6.014020833333333,
+          "max_rank_us": 6.83746875
+        },
+        "send_dispatch": {
+          "mean_rank_us": 223.786947265625,
+          "min_rank_us": 205.47219791666666,
+          "max_rank_us": 243.73130208333333
+        }
+      },
+      "32/decode": {
+        "combine_publish": {
+          "mean_rank_us": 38.62145454915365,
+          "min_rank_us": 37.85710677083333,
+          "max_rank_us": 39.91306315104167
+        },
+        "combine_reuse": {
+          "mean_rank_us": 46.88204846191406,
+          "min_rank_us": 42.87169401041667,
+          "max_rank_us": 51.795208984375
+        },
+        "dispatch_publish": {
+          "mean_rank_us": 36.57258715820313,
+          "min_rank_us": 35.736426432291665,
+          "max_rank_us": 37.19460872395833
+        },
+        "dispatch_reuse": {
+          "mean_rank_us": 38.94933964029948,
+          "min_rank_us": 38.49781315104167,
+          "max_rank_us": 39.361960286458334
+        },
+        "pack_combine": {
+          "mean_rank_us": 4.859487060546875,
+          "min_rank_us": 4.504509114583334,
+          "max_rank_us": 5.082164713541666
+        },
+        "pack_dispatch": {
+          "mean_rank_us": 5.602234415690104,
+          "min_rank_us": 5.389509765625,
+          "max_rank_us": 6.698598307291666
+        },
+        "receive_dispatch": {
+          "mean_rank_us": 14.446041259765625,
+          "min_rank_us": 12.510234375000001,
+          "max_rank_us": 15.565857421875
+        },
+        "receive_prefix": {
+          "mean_rank_us": 11.010080810546874,
+          "min_rank_us": 10.804030598958333,
+          "max_rank_us": 11.300082682291666
+        },
+        "reduce_combine": {
+          "mean_rank_us": 7.661971435546875,
+          "min_rank_us": 7.37333984375,
+          "max_rank_us": 7.95621875
+        },
+        "send_combine": {
+          "mean_rank_us": 5.370788818359375,
+          "min_rank_us": 4.2351484375,
+          "max_rank_us": 6.1635227864583335
+        },
+        "send_counts": {
+          "mean_rank_us": 5.476064900716146,
+          "min_rank_us": 4.865801432291667,
+          "max_rank_us": 5.712344401041666
+        },
+        "send_dispatch": {
+          "mean_rank_us": 6.110196695963542,
+          "min_rank_us": 5.809693359375,
+          "max_rank_us": 6.356819010416666
+        }
+      }
+    },
+    "active_qp_both": {
+      "1/prefill": {
+        "combine_reuse": {
+          "mean_rank_us": 197.40044270833334,
+          "min_rank_us": 25.888020833333332,
+          "max_rank_us": 245.07777083333335
+        },
+        "dispatch_reuse": {
+          "mean_rank_us": 1417.1141302083333,
+          "min_rank_us": 25.175979166666668,
+          "max_rank_us": 1582.0083541666665
+        },
+        "pack_combine": {
+          "mean_rank_us": 15.006678385416667,
+          "min_rank_us": 7.406,
+          "max_rank_us": 26.529354166666668
+        },
+        "pack_dispatch": {
+          "mean_rank_us": 6.164196614583333,
+          "min_rank_us": 2.64925,
+          "max_rank_us": 49.08
+        },
+        "publish_combine": {
+          "mean_rank_us": 10.771696614583334,
+          "min_rank_us": 9.334,
+          "max_rank_us": 12.213354166666667
+        },
+        "publish_dispatch": {
+          "mean_rank_us": 9.261231770833334,
+          "min_rank_us": 8.5026875,
+          "max_rank_us": 12.973958333333334
+        },
+        "receive_dispatch": {
+          "mean_rank_us": 51.1568125,
+          "min_rank_us": 11.011354166666667,
+          "max_rank_us": 110.09964583333333
+        },
+        "receive_prefix": {
+          "mean_rank_us": 230.07836848958334,
+          "min_rank_us": 5.988666666666667,
+          "max_rank_us": 271.31547916666665
+        },
+        "reduce_combine": {
+          "mean_rank_us": 13.42798046875,
+          "min_rank_us": 0.7267291666666666,
+          "max_rank_us": 203.62347916666667
+        },
+        "send_combine": {
+          "mean_rank_us": 46.54856119791666,
+          "min_rank_us": 1.5679791666666667,
+          "max_rank_us": 147.942375
+        },
+        "send_dispatch": {
+          "mean_rank_us": 13.102583333333333,
+          "min_rank_us": 0.7246666666666667,
+          "max_rank_us": 198.61402083333334
+        },
+        "wait_combine": {
+          "mean_rank_us": 17.874428385416667,
+          "min_rank_us": 0.7753333333333333,
+          "max_rank_us": 274.02795833333334
+        }
+      },
+      "1/decode": {
+        "combine_reuse": {
+          "mean_rank_us": 65.70503275553385,
+          "min_rank_us": 53.945971354166666,
+          "max_rank_us": 74.13531640625
+        },
+        "dispatch_reuse": {
+          "mean_rank_us": 59.57899275716146,
+          "min_rank_us": 26.312872395833335,
+          "max_rank_us": 63.46198372395833
+        },
+        "pack_combine": {
+          "mean_rank_us": 3.6248167317708333,
+          "min_rank_us": 3.2355045572916667,
+          "max_rank_us": 4.2924856770833335
+        },
+        "pack_dispatch": {
+          "mean_rank_us": 4.827511922200521,
+          "min_rank_us": 4.706770833333334,
+          "max_rank_us": 5.397598958333333
+        },
+        "publish_combine": {
+          "mean_rank_us": 7.304822998046875,
+          "min_rank_us": 6.79795703125,
+          "max_rank_us": 7.703677083333334
+        },
+        "publish_dispatch": {
+          "mean_rank_us": 7.318647420247396,
+          "min_rank_us": 6.6928483072916665,
+          "max_rank_us": 7.963742838541667
+        },
+        "receive_dispatch": {
+          "mean_rank_us": 6.639610473632812,
+          "min_rank_us": 3.9363235677083335,
+          "max_rank_us": 12.022664713541667
+        },
+        "receive_prefix": {
+          "mean_rank_us": 17.51427575683594,
+          "min_rank_us": 15.57841015625,
+          "max_rank_us": 23.338064453125
+        },
+        "reduce_combine": {
+          "mean_rank_us": 2.305987508138021,
+          "min_rank_us": 1.9647526041666667,
+          "max_rank_us": 7.380994140625
+        },
+        "send_combine": {
+          "mean_rank_us": 1.869945556640625,
+          "min_rank_us": 1.070271484375,
+          "max_rank_us": 2.9496197916666667
+        },
+        "send_dispatch": {
+          "mean_rank_us": 1.956186767578125,
+          "min_rank_us": 1.6494680989583332,
+          "max_rank_us": 6.142599609375
+        },
+        "wait_combine": {
+          "mean_rank_us": 2.4030464274088543,
+          "min_rank_us": 1.121873046875,
+          "max_rank_us": 21.544629557291668
+        }
+      },
+      "32/prefill": {
+        "combine_reuse": {
+          "mean_rank_us": 1948.3107994791667,
+          "min_rank_us": 1526.2001666666667,
+          "max_rank_us": 2420.4737291666665
+        },
+        "dispatch_reuse": {
+          "mean_rank_us": 131.54414713541667,
+          "min_rank_us": 99.5673125,
+          "max_rank_us": 223.03935416666667
+        },
+        "pack_combine": {
+          "mean_rank_us": 425.7450078125,
+          "min_rank_us": 238.377875,
+          "max_rank_us": 588.50025
+        },
+        "pack_dispatch": {
+          "mean_rank_us": 128.38305859375,
+          "min_rank_us": 120.48425,
+          "max_rank_us": 136.23270833333333
+        },
+        "publish_combine": {
+          "mean_rank_us": 12.825798177083334,
+          "min_rank_us": 12.461208333333333,
+          "max_rank_us": 13.296020833333333
+        },
+        "publish_dispatch": {
+          "mean_rank_us": 13.2326953125,
+          "min_rank_us": 12.7713125,
+          "max_rank_us": 14.986729166666667
+        },
+        "receive_dispatch": {
+          "mean_rank_us": 1342.78603125,
+          "min_rank_us": 1014.0505208333333,
+          "max_rank_us": 1603.6971666666666
+        },
+        "receive_prefix": {
+          "mean_rank_us": 220.20580859375,
+          "min_rank_us": 193.24393750000002,
+          "max_rank_us": 294.0042291666667
+        },
+        "reduce_combine": {
+          "mean_rank_us": 418.99160416666666,
+          "min_rank_us": 383.3042291666667,
+          "max_rank_us": 454.89177083333334
+        },
+        "send_combine": {
+          "mean_rank_us": 1233.5921875,
+          "min_rank_us": 787.7775208333334,
+          "max_rank_us": 1605.1605416666666
+        },
+        "send_dispatch": {
+          "mean_rank_us": 483.59245182291664,
+          "min_rank_us": 423.53235416666666,
+          "max_rank_us": 552.0382291666666
+        },
+        "wait_combine": {
+          "mean_rank_us": 2731.537690104167,
+          "min_rank_us": 2216.6281458333333,
+          "max_rank_us": 3347.5155416666666
+        }
+      },
+      "32/decode": {
+        "combine_reuse": {
+          "mean_rank_us": 48.16730643717448,
+          "min_rank_us": 45.227322916666665,
+          "max_rank_us": 53.18734309895833
+        },
+        "dispatch_reuse": {
+          "mean_rank_us": 39.568289103190104,
+          "min_rank_us": 37.80692643229167,
+          "max_rank_us": 40.899876302083335
+        },
+        "pack_combine": {
+          "mean_rank_us": 5.152778930664063,
+          "min_rank_us": 4.816409505208333,
+          "max_rank_us": 5.400227213541667
+        },
+        "pack_dispatch": {
+          "mean_rank_us": 5.551575480143229,
+          "min_rank_us": 5.311735026041667,
+          "max_rank_us": 6.4051972656250005
+        },
+        "publish_combine": {
+          "mean_rank_us": 7.800035115559896,
+          "min_rank_us": 7.08684765625,
+          "max_rank_us": 8.0600625
+        },
+        "publish_dispatch": {
+          "mean_rank_us": 11.577756388346353,
+          "min_rank_us": 11.266306640625,
+          "max_rank_us": 11.885429036458333
+        },
+        "receive_dispatch": {
+          "mean_rank_us": 14.60060400390625,
+          "min_rank_us": 12.783522135416668,
+          "max_rank_us": 15.649833333333333
+        },
+        "receive_prefix": {
+          "mean_rank_us": 17.198932088216146,
+          "min_rank_us": 15.766505859375,
+          "max_rank_us": 18.694627604166666
+        },
+        "reduce_combine": {
+          "mean_rank_us": 7.561582682291666,
+          "min_rank_us": 7.226875,
+          "max_rank_us": 7.816309244791666
+        },
+        "send_combine": {
+          "mean_rank_us": 5.170005859375,
+          "min_rank_us": 3.9951399739583335,
+          "max_rank_us": 6.125780598958333
+        },
+        "send_dispatch": {
+          "mean_rank_us": 6.186806722005208,
+          "min_rank_us": 5.946396484375,
+          "max_rank_us": 6.322638020833334
+        },
+        "wait_combine": {
+          "mean_rank_us": 18.005814453125,
+          "min_rank_us": 16.17020963541667,
+          "max_rank_us": 19.500987630208332
+        }
+      }
+    },
+    "parallel_metadata": {
+      "1/prefill": {
+        "combine_publish": {
+          "mean_rank_us": 185.89364583333332,
+          "min_rank_us": 116.328375,
+          "max_rank_us": 254.53220833333333
+        },
+        "combine_reuse": {
+          "mean_rank_us": 165.42374869791666,
+          "min_rank_us": 34.665979166666666,
+          "max_rank_us": 220.81397916666666
+        },
+        "dispatch_publish": {
+          "mean_rank_us": 264.2208515625,
+          "min_rank_us": 25.387208333333334,
+          "max_rank_us": 292.7435208333333
+        },
+        "dispatch_reuse": {
+          "mean_rank_us": 1231.4196809895834,
+          "min_rank_us": 26.258645833333333,
+          "max_rank_us": 1316.4331041666667
+        },
+        "pack_combine": {
+          "mean_rank_us": 14.980578125000001,
+          "min_rank_us": 7.360604166666667,
+          "max_rank_us": 26.5100625
+        },
+        "pack_dispatch": {
+          "mean_rank_us": 5.643787760416667,
+          "min_rank_us": 2.4846666666666666,
+          "max_rank_us": 48.96072916666667
+        },
+        "receive_dispatch": {
+          "mean_rank_us": 51.309329427083334,
+          "min_rank_us": 11.033916666666666,
+          "max_rank_us": 110.23510416666666
+        },
+        "receive_prefix": {
+          "mean_rank_us": 2.854078125,
+          "min_rank_us": 2.792,
+          "max_rank_us": 2.910625
+        },
+        "reduce_combine": {
+          "mean_rank_us": 13.439942708333334,
+          "min_rank_us": 0.691375,
+          "max_rank_us": 204.28277083333333
+        },
+        "send_combine": {
+          "mean_rank_us": 43.73520442708333,
+          "min_rank_us": 1.5866666666666667,
+          "max_rank_us": 114.93316666666666
+        },
+        "send_counts": {
+          "mean_rank_us": 6.506009114583334,
+          "min_rank_us": 5.7898958333333335,
+          "max_rank_us": 6.995291666666667
+        },
+        "send_dispatch": {
+          "mean_rank_us": 13.760466145833332,
+          "min_rank_us": 0.73,
+          "max_rank_us": 209.03816666666665
+        }
+      },
+      "1/decode": {
+        "combine_publish": {
+          "mean_rank_us": 38.88223673502604,
+          "min_rank_us": 37.93624674479167,
+          "max_rank_us": 40.016174479166665
+        },
+        "combine_reuse": {
+          "mean_rank_us": 64.05454890950521,
+          "min_rank_us": 51.744858072916664,
+          "max_rank_us": 71.48974479166667
+        },
+        "dispatch_publish": {
+          "mean_rank_us": 36.64252807617188,
+          "min_rank_us": 35.583213541666666,
+          "max_rank_us": 40.97137760416667
+        },
+        "dispatch_reuse": {
+          "mean_rank_us": 42.29062813313802,
+          "min_rank_us": 30.376840494791665,
+          "max_rank_us": 44.02081770833333
+        },
+        "pack_combine": {
+          "mean_rank_us": 3.1607032470703125,
+          "min_rank_us": 2.6823268229166666,
+          "max_rank_us": 3.9030631510416667
+        },
+        "pack_dispatch": {
+          "mean_rank_us": 4.958590779622396,
+          "min_rank_us": 4.82433984375,
+          "max_rank_us": 5.4296360677083335
+        },
+        "receive_dispatch": {
+          "mean_rank_us": 6.865941162109375,
+          "min_rank_us": 3.96335546875,
+          "max_rank_us": 12.478568359375
+        },
+        "receive_prefix": {
+          "mean_rank_us": 2.8722574055989583,
+          "min_rank_us": 2.8214563802083332,
+          "max_rank_us": 2.918139973958333
+        },
+        "reduce_combine": {
+          "mean_rank_us": 2.310225016276042,
+          "min_rank_us": 1.9572259114583332,
+          "max_rank_us": 7.459031901041667
+        },
+        "send_combine": {
+          "mean_rank_us": 1.868841796875,
+          "min_rank_us": 1.0677037760416666,
+          "max_rank_us": 2.896389973958333
+        },
+        "send_counts": {
+          "mean_rank_us": 5.5566296386718745,
+          "min_rank_us": 4.911232421875,
+          "max_rank_us": 5.823149739583333
+        },
+        "send_dispatch": {
+          "mean_rank_us": 1.9233090413411458,
+          "min_rank_us": 1.597130859375,
+          "max_rank_us": 6.120927083333333
+        }
+      },
+      "32/prefill": {
+        "combine_publish": {
+          "mean_rank_us": 2768.36721875,
+          "min_rank_us": 2221.1326875,
+          "max_rank_us": 3338.3059375
+        },
+        "combine_reuse": {
+          "mean_rank_us": 2019.8486471354167,
+          "min_rank_us": 1592.9499166666667,
+          "max_rank_us": 2536.754354166667
+        },
+        "dispatch_publish": {
+          "mean_rank_us": 283.3146888020833,
+          "min_rank_us": 212.46789583333333,
+          "max_rank_us": 370.4826458333333
+        },
+        "dispatch_reuse": {
+          "mean_rank_us": 129.15579166666666,
+          "min_rank_us": 83.64802083333333,
+          "max_rank_us": 169.6309375
+        },
+        "pack_combine": {
+          "mean_rank_us": 425.3390013020833,
+          "min_rank_us": 238.22933333333333,
+          "max_rank_us": 582.2005416666667
+        },
+        "pack_dispatch": {
+          "mean_rank_us": 129.49550390625,
+          "min_rank_us": 121.69060416666667,
+          "max_rank_us": 136.12747916666666
+        },
+        "receive_dispatch": {
+          "mean_rank_us": 1341.3485130208333,
+          "min_rank_us": 1013.6350833333333,
+          "max_rank_us": 1605.9562083333333
+        },
+        "receive_prefix": {
+          "mean_rank_us": 2.9683606770833335,
+          "min_rank_us": 2.8933125,
+          "max_rank_us": 3.111270833333333
+        },
+        "reduce_combine": {
+          "mean_rank_us": 419.31732421875,
+          "min_rank_us": 383.80108333333334,
+          "max_rank_us": 454.9456875
+        },
+        "send_combine": {
+          "mean_rank_us": 1237.6159609375,
+          "min_rank_us": 840.2584583333334,
+          "max_rank_us": 1681.6760208333333
+        },
+        "send_counts": {
+          "mean_rank_us": 6.439154947916666,
+          "min_rank_us": 5.951979166666667,
+          "max_rank_us": 6.6739375
+        },
+        "send_dispatch": {
+          "mean_rank_us": 454.0272994791667,
+          "min_rank_us": 409.64070833333335,
+          "max_rank_us": 565.4429166666666
+        }
+      },
+      "32/decode": {
+        "combine_publish": {
+          "mean_rank_us": 38.58507169596354,
+          "min_rank_us": 37.63369401041667,
+          "max_rank_us": 40.093421875
+        },
+        "combine_reuse": {
+          "mean_rank_us": 47.07862459309896,
+          "min_rank_us": 43.205522135416665,
+          "max_rank_us": 51.63047526041667
+        },
+        "dispatch_publish": {
+          "mean_rank_us": 36.66168680826823,
+          "min_rank_us": 35.89711328125,
+          "max_rank_us": 37.211150390625
+        },
+        "dispatch_reuse": {
+          "mean_rank_us": 39.3203750406901,
+          "min_rank_us": 38.832800130208334,
+          "max_rank_us": 39.90888216145834
+        },
+        "pack_combine": {
+          "mean_rank_us": 4.864310343424479,
+          "min_rank_us": 4.498170572916667,
+          "max_rank_us": 5.1162799479166665
+        },
+        "pack_dispatch": {
+          "mean_rank_us": 5.663411580403646,
+          "min_rank_us": 5.40616015625,
+          "max_rank_us": 6.6700579427083335
+        },
+        "receive_dispatch": {
+          "mean_rank_us": 14.591441975911458,
+          "min_rank_us": 12.790491536458333,
+          "max_rank_us": 15.685665364583333
+        },
+        "receive_prefix": {
+          "mean_rank_us": 2.8730567626953123,
+          "min_rank_us": 2.826359375,
+          "max_rank_us": 2.9100078125
+        },
+        "reduce_combine": {
+          "mean_rank_us": 7.669350667317708,
+          "min_rank_us": 7.376546875,
+          "max_rank_us": 7.8935104166666665
+        },
+        "send_combine": {
+          "mean_rank_us": 5.359239379882813,
+          "min_rank_us": 4.059473958333333,
+          "max_rank_us": 6.3697649739583335
+        },
+        "send_counts": {
+          "mean_rank_us": 5.354866902669271,
+          "min_rank_us": 4.741622395833333,
+          "max_rank_us": 5.603383463541666
+        },
+        "send_dispatch": {
+          "mean_rank_us": 6.106568481445312,
+          "min_rank_us": 5.892302083333333,
+          "max_rank_us": 6.290108723958333
+        }
+      }
+    }
+  },
+  "matched_admission_scope": "Private diagnostic with matched request membership and actual local token shapes; warm repeat zero excluded. Release-to-first-token is not normal HTTP TTFT. Real model routing is used.",
+  "matched_admission": {
+    "original": {
+      "cases": [
+        {
+          "kind": "skew32",
+          "repeat": 0,
+          "input_sha256": "60ece78f90e8c5e6310d9bd0742f6f4aaa53bcfaf7e618fef1c732daae1e92b9",
+          "membership_sha256": "2f235228888e1a8244b23bdfd79ec696d3127342984ebfa4316e8043d414d241",
+          "release_ttft_mean_ms": 566.5439950244036,
+          "max_rank_prefill_gpu_ms": 596.8088531494141,
+          "mean_rank_prefill_gpu_ms": 595.6207780838013,
+          "local_token_shapes": [
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              1536,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              1024
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              1536,
+              0
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              512
+            ],
+            [
+              1024,
+              0
+            ]
+          ]
+        },
+        {
+          "kind": "skew32",
+          "repeat": 1,
+          "input_sha256": "b16c4b719006459a158801621f74e1ca44cd560fa04dff6a11e04d0b3cd102e9",
+          "membership_sha256": "c3265457d128606346a2caf9da6b195d7ffc53b5e2b1e1f0664e717f684a556b",
+          "release_ttft_mean_ms": 546.6736695962027,
+          "max_rank_prefill_gpu_ms": 584.9080200195312,
+          "mean_rank_prefill_gpu_ms": 583.5800251960754,
+          "local_token_shapes": [
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              1536,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              1024
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              1536,
+              0
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              512
+            ],
+            [
+              1024,
+              0
+            ]
+          ]
+        },
+        {
+          "kind": "skew32",
+          "repeat": 2,
+          "input_sha256": "150948e761c86745bb1d92a60921263953e48ff81d843daa93cd5518f48ce3f6",
+          "membership_sha256": "ce9aaf05fef3494ad97d7901deedac064509a948fec064935b30e0438cfb6601",
+          "release_ttft_mean_ms": 551.0473820322659,
+          "max_rank_prefill_gpu_ms": 589.2335586547852,
+          "mean_rank_prefill_gpu_ms": 587.476574420929,
+          "local_token_shapes": [
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              1536,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              1024
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              1536,
+              0
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              512
+            ],
+            [
+              1024,
+              0
+            ]
+          ]
+        },
+        {
+          "kind": "skew32",
+          "repeat": 3,
+          "input_sha256": "67057c4287cb9b874c510d5efa3a07f79988cc26cbc224fb29622a2f630b25f8",
+          "membership_sha256": "26876368a351f1eb72013d74e91afcc4eb041ff288828f3aca0a112d3f48817c",
+          "release_ttft_mean_ms": 551.4839148963802,
+          "max_rank_prefill_gpu_ms": 590.7272491455078,
+          "mean_rank_prefill_gpu_ms": 589.6783728599548,
+          "local_token_shapes": [
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              1536,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              1024
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              1536,
+              0
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              512
+            ],
+            [
+              1024,
+              0
+            ]
+          ]
+        },
+        {
+          "kind": "split32",
+          "repeat": 0,
+          "input_sha256": "60ece78f90e8c5e6310d9bd0742f6f4aaa53bcfaf7e618fef1c732daae1e92b9",
+          "membership_sha256": "6354f55f1cdbedd117399d9a276a364136977ff2911e826824afb9c81e9e541e",
+          "release_ttft_mean_ms": 512.4515191128012,
+          "max_rank_prefill_gpu_ms": 577.4459228515625,
+          "mean_rank_prefill_gpu_ms": 576.9042959213257,
+          "local_token_shapes": [
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ]
+          ]
+        },
+        {
+          "kind": "split32",
+          "repeat": 1,
+          "input_sha256": "b16c4b719006459a158801621f74e1ca44cd560fa04dff6a11e04d0b3cd102e9",
+          "membership_sha256": "621e8d8da772a14ddaaeaa19e68c8e5b00e25b22a50bef099b6c581fa796b887",
+          "release_ttft_mean_ms": 413.5321601643227,
+          "max_rank_prefill_gpu_ms": 477.3999328613281,
+          "mean_rank_prefill_gpu_ms": 477.3171911239624,
+          "local_token_shapes": [
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ]
+          ]
+        },
+        {
+          "kind": "split32",
+          "repeat": 2,
+          "input_sha256": "150948e761c86745bb1d92a60921263953e48ff81d843daa93cd5518f48ce3f6",
+          "membership_sha256": "5aee21096652ebe34372b7a7fc85fc5e7652f4e9afe2fb496f89faba0748383a",
+          "release_ttft_mean_ms": 422.4460576369893,
+          "max_rank_prefill_gpu_ms": 489.39488220214844,
+          "mean_rank_prefill_gpu_ms": 489.2810277938843,
+          "local_token_shapes": [
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ]
+          ]
+        },
+        {
+          "kind": "split32",
+          "repeat": 3,
+          "input_sha256": "67057c4287cb9b874c510d5efa3a07f79988cc26cbc224fb29622a2f630b25f8",
+          "membership_sha256": "09feed962db4bf95498d5891d966061289ead8c2a208b643d81a41788ab3729d",
+          "release_ttft_mean_ms": 411.40485703363083,
+          "max_rank_prefill_gpu_ms": 475.34669494628906,
+          "mean_rank_prefill_gpu_ms": 475.06298065185547,
+          "local_token_shapes": [
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ]
+          ]
+        },
+        {
+          "kind": "whole32",
+          "repeat": 0,
+          "input_sha256": "60ece78f90e8c5e6310d9bd0742f6f4aaa53bcfaf7e618fef1c732daae1e92b9",
+          "membership_sha256": "d53b938fc8ffda590ed004f1cf95fbaa0890f68927359c62892c04e32eb850b0",
+          "release_ttft_mean_ms": 2803.7343352334574,
+          "max_rank_prefill_gpu_ms": 2793.329345703125,
+          "mean_rank_prefill_gpu_ms": 2792.804489135742,
+          "local_token_shapes": [
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ]
+          ]
+        },
+        {
+          "kind": "whole32",
+          "repeat": 1,
+          "input_sha256": "b16c4b719006459a158801621f74e1ca44cd560fa04dff6a11e04d0b3cd102e9",
+          "membership_sha256": "4d8a71b5a4f1dcfdfec9e751479dd920b81d0892dfbd3c0a1d697d5cda71a4d1",
+          "release_ttft_mean_ms": 481.18047625757754,
+          "max_rank_prefill_gpu_ms": 474.3929138183594,
+          "mean_rank_prefill_gpu_ms": 473.89228439331055,
+          "local_token_shapes": [
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ]
+          ]
+        },
+        {
+          "kind": "whole32",
+          "repeat": 2,
+          "input_sha256": "150948e761c86745bb1d92a60921263953e48ff81d843daa93cd5518f48ce3f6",
+          "membership_sha256": "93ee1383d0187589d8cda13b91cc389c5a7a3cd73678d33fc53ba3c04ee5bb0a",
+          "release_ttft_mean_ms": 518.1426671042573,
+          "max_rank_prefill_gpu_ms": 511.7746887207031,
+          "mean_rank_prefill_gpu_ms": 511.51221466064453,
+          "local_token_shapes": [
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ]
+          ]
+        },
+        {
+          "kind": "whole32",
+          "repeat": 3,
+          "input_sha256": "67057c4287cb9b874c510d5efa3a07f79988cc26cbc224fb29622a2f630b25f8",
+          "membership_sha256": "4270c404d2420b7c63a47788f38c53c4b98c0e6028dcd633ea26f1aed7e6518c",
+          "release_ttft_mean_ms": 481.8960902339313,
+          "max_rank_prefill_gpu_ms": 475.93621826171875,
+          "mean_rank_prefill_gpu_ms": 475.77385902404785,
+          "local_token_shapes": [
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ]
+          ]
+        }
+      ],
+      "summary": {
+        "skew32": {
+          "release_ttft_mean_ms": {
+            "mean": 549.7349888416162,
+            "min": 546.6736695962027,
+            "max": 551.4839148963802
+          },
+          "max_rank_prefill_gpu_ms": {
+            "mean": 588.2896092732748,
+            "min": 584.9080200195312,
+            "max": 590.7272491455078
+          },
+          "mean_rank_prefill_gpu_ms": {
+            "mean": 586.9116574923197,
+            "min": 583.5800251960754,
+            "max": 589.6783728599548
+          }
+        },
+        "split32": {
+          "release_ttft_mean_ms": {
+            "mean": 415.7943582783143,
+            "min": 411.40485703363083,
+            "max": 422.4460576369893
+          },
+          "max_rank_prefill_gpu_ms": {
+            "mean": 480.7138366699219,
+            "min": 475.34669494628906,
+            "max": 489.39488220214844
+          },
+          "mean_rank_prefill_gpu_ms": {
+            "mean": 480.5537331899007,
+            "min": 475.06298065185547,
+            "max": 489.2810277938843
+          }
+        },
+        "whole32": {
+          "release_ttft_mean_ms": {
+            "mean": 493.73974453192204,
+            "min": 481.18047625757754,
+            "max": 518.1426671042573
+          },
+          "max_rank_prefill_gpu_ms": {
+            "mean": 487.36794026692706,
+            "min": 474.3929138183594,
+            "max": 511.7746887207031
+          },
+          "mean_rank_prefill_gpu_ms": {
+            "mean": 487.05945269266766,
+            "min": 473.89228439331055,
+            "max": 511.51221466064453
+          }
+        }
+      }
+    },
+    "active_qp_both": {
+      "cases": [
+        {
+          "kind": "skew32",
+          "repeat": 0,
+          "input_sha256": "60ece78f90e8c5e6310d9bd0742f6f4aaa53bcfaf7e618fef1c732daae1e92b9",
+          "membership_sha256": "2f235228888e1a8244b23bdfd79ec696d3127342984ebfa4316e8043d414d241",
+          "release_ttft_mean_ms": 553.176969755441,
+          "max_rank_prefill_gpu_ms": 586.2361602783203,
+          "mean_rank_prefill_gpu_ms": 584.0864543914795,
+          "local_token_shapes": [
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              1536,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              1024
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              1536,
+              0
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              512
+            ],
+            [
+              1024,
+              0
+            ]
+          ]
+        },
+        {
+          "kind": "skew32",
+          "repeat": 1,
+          "input_sha256": "b16c4b719006459a158801621f74e1ca44cd560fa04dff6a11e04d0b3cd102e9",
+          "membership_sha256": "c3265457d128606346a2caf9da6b195d7ffc53b5e2b1e1f0664e717f684a556b",
+          "release_ttft_mean_ms": 550.5442408029921,
+          "max_rank_prefill_gpu_ms": 592.6458740234375,
+          "mean_rank_prefill_gpu_ms": 590.5503525733948,
+          "local_token_shapes": [
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              1536,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              1024
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              1536,
+              0
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              512
+            ],
+            [
+              1024,
+              0
+            ]
+          ]
+        },
+        {
+          "kind": "skew32",
+          "repeat": 2,
+          "input_sha256": "150948e761c86745bb1d92a60921263953e48ff81d843daa93cd5518f48ce3f6",
+          "membership_sha256": "ce9aaf05fef3494ad97d7901deedac064509a948fec064935b30e0438cfb6601",
+          "release_ttft_mean_ms": 543.0464129603934,
+          "max_rank_prefill_gpu_ms": 584.3445205688477,
+          "mean_rank_prefill_gpu_ms": 581.6599631309509,
+          "local_token_shapes": [
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              1536,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              1024
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              1536,
+              0
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              512
+            ],
+            [
+              1024,
+              0
+            ]
+          ]
+        },
+        {
+          "kind": "skew32",
+          "repeat": 3,
+          "input_sha256": "67057c4287cb9b874c510d5efa3a07f79988cc26cbc224fb29622a2f630b25f8",
+          "membership_sha256": "26876368a351f1eb72013d74e91afcc4eb041ff288828f3aca0a112d3f48817c",
+          "release_ttft_mean_ms": 542.7898996276781,
+          "max_rank_prefill_gpu_ms": 583.3318710327148,
+          "mean_rank_prefill_gpu_ms": 581.2374501228333,
+          "local_token_shapes": [
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              1536,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              1024
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              512,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              1024,
+              0
+            ],
+            [
+              1536,
+              0
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              2048,
+              512
+            ],
+            [
+              1024,
+              0
+            ]
+          ]
+        },
+        {
+          "kind": "split32",
+          "repeat": 0,
+          "input_sha256": "60ece78f90e8c5e6310d9bd0742f6f4aaa53bcfaf7e618fef1c732daae1e92b9",
+          "membership_sha256": "6354f55f1cdbedd117399d9a276a364136977ff2911e826824afb9c81e9e541e",
+          "release_ttft_mean_ms": 503.4101993078366,
+          "max_rank_prefill_gpu_ms": 569.4333038330078,
+          "mean_rank_prefill_gpu_ms": 569.3019618988037,
+          "local_token_shapes": [
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ]
+          ]
+        },
+        {
+          "kind": "split32",
+          "repeat": 1,
+          "input_sha256": "b16c4b719006459a158801621f74e1ca44cd560fa04dff6a11e04d0b3cd102e9",
+          "membership_sha256": "621e8d8da772a14ddaaeaa19e68c8e5b00e25b22a50bef099b6c581fa796b887",
+          "release_ttft_mean_ms": 419.54940897994675,
+          "max_rank_prefill_gpu_ms": 482.62071228027344,
+          "mean_rank_prefill_gpu_ms": 482.3095874786377,
+          "local_token_shapes": [
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ]
+          ]
+        },
+        {
+          "kind": "split32",
+          "repeat": 2,
+          "input_sha256": "150948e761c86745bb1d92a60921263953e48ff81d843daa93cd5518f48ce3f6",
+          "membership_sha256": "5aee21096652ebe34372b7a7fc85fc5e7652f4e9afe2fb496f89faba0748383a",
+          "release_ttft_mean_ms": 428.801311616553,
+          "max_rank_prefill_gpu_ms": 492.1142120361328,
+          "mean_rank_prefill_gpu_ms": 491.9921884536743,
+          "local_token_shapes": [
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ]
+          ]
+        },
+        {
+          "kind": "split32",
+          "repeat": 3,
+          "input_sha256": "67057c4287cb9b874c510d5efa3a07f79988cc26cbc224fb29622a2f630b25f8",
+          "membership_sha256": "09feed962db4bf95498d5891d966061289ead8c2a208b643d81a41788ab3729d",
+          "release_ttft_mean_ms": 410.9208584704902,
+          "max_rank_prefill_gpu_ms": 473.2667236328125,
+          "mean_rank_prefill_gpu_ms": 472.62305641174316,
+          "local_token_shapes": [
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ]
+          ]
+        },
+        {
+          "kind": "whole32",
+          "repeat": 0,
+          "input_sha256": "60ece78f90e8c5e6310d9bd0742f6f4aaa53bcfaf7e618fef1c732daae1e92b9",
+          "membership_sha256": "d53b938fc8ffda590ed004f1cf95fbaa0890f68927359c62892c04e32eb850b0",
+          "release_ttft_mean_ms": 2726.757406897377,
+          "max_rank_prefill_gpu_ms": 2716.55859375,
+          "mean_rank_prefill_gpu_ms": 2716.420669555664,
+          "local_token_shapes": [
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ]
+          ]
+        },
+        {
+          "kind": "whole32",
+          "repeat": 1,
+          "input_sha256": "b16c4b719006459a158801621f74e1ca44cd560fa04dff6a11e04d0b3cd102e9",
+          "membership_sha256": "4d8a71b5a4f1dcfdfec9e751479dd920b81d0892dfbd3c0a1d697d5cda71a4d1",
+          "release_ttft_mean_ms": 479.67792287818156,
+          "max_rank_prefill_gpu_ms": 473.26416015625,
+          "mean_rank_prefill_gpu_ms": 472.8473300933838,
+          "local_token_shapes": [
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ]
+          ]
+        },
+        {
+          "kind": "whole32",
+          "repeat": 2,
+          "input_sha256": "150948e761c86745bb1d92a60921263953e48ff81d843daa93cd5518f48ce3f6",
+          "membership_sha256": "93ee1383d0187589d8cda13b91cc389c5a7a3cd73678d33fc53ba3c04ee5bb0a",
+          "release_ttft_mean_ms": 478.7926475692075,
+          "max_rank_prefill_gpu_ms": 472.83184814453125,
+          "mean_rank_prefill_gpu_ms": 472.71216583251953,
+          "local_token_shapes": [
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ]
+          ]
+        },
+        {
+          "kind": "whole32",
+          "repeat": 3,
+          "input_sha256": "67057c4287cb9b874c510d5efa3a07f79988cc26cbc224fb29622a2f630b25f8",
+          "membership_sha256": "4270c404d2420b7c63a47788f38c53c4b98c0e6028dcd633ea26f1aed7e6518c",
+          "release_ttft_mean_ms": 487.1944563346915,
+          "max_rank_prefill_gpu_ms": 481.0100402832031,
+          "mean_rank_prefill_gpu_ms": 480.8852138519287,
+          "local_token_shapes": [
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ],
+            [
+              1024
+            ]
+          ]
+        }
+      ],
+      "summary": {
+        "skew32": {
+          "release_ttft_mean_ms": {
+            "mean": 545.4601844636878,
+            "min": 542.7898996276781,
+            "max": 550.5442408029921
+          },
+          "max_rank_prefill_gpu_ms": {
+            "mean": 586.7740885416666,
+            "min": 583.3318710327148,
+            "max": 592.6458740234375
+          },
+          "mean_rank_prefill_gpu_ms": {
+            "mean": 584.4825886090597,
+            "min": 581.2374501228333,
+            "max": 590.5503525733948
+          }
+        },
+        "split32": {
+          "release_ttft_mean_ms": {
+            "mean": 419.75719302233,
+            "min": 410.9208584704902,
+            "max": 428.801311616553
+          },
+          "max_rank_prefill_gpu_ms": {
+            "mean": 482.66721598307294,
+            "min": 473.2667236328125,
+            "max": 492.1142120361328
+          },
+          "mean_rank_prefill_gpu_ms": {
+            "mean": 482.3082774480184,
+            "min": 472.62305641174316,
+            "max": 491.9921884536743
+          }
+        },
+        "whole32": {
+          "release_ttft_mean_ms": {
+            "mean": 481.8883422606935,
+            "min": 478.7926475692075,
+            "max": 487.1944563346915
+          },
+          "max_rank_prefill_gpu_ms": {
+            "mean": 475.70201619466144,
+            "min": 472.83184814453125,
+            "max": 481.0100402832031
+          },
+          "mean_rank_prefill_gpu_ms": {
+            "mean": 475.48156992594403,
+            "min": 472.71216583251953,
+            "max": 480.8852138519287
+          }
+        }
+      }
+    }
+  },
+  "protocol_barriers_per_layer": 4,
+  "sanity_outputs": [
+    "2 + 2 = 4",
+    "Paris"
+  ],
+  "limitations": [
+    "Synthetic token prompts with real model routing; not a model accuracy evaluation.",
+    "Three NCCL samples; original and active-QP both have six samples across two independent server starts; other candidates have three samples.",
+    "Normal measurements in the repeat runs completed before a separate admission probe failed on shared-file plan visibility. Failed diagnostic samples are excluded; corrected admission diagnostics completed.",
+    "Only this model, topology and NCCL release are validated. No hybrid host forwarding was added."
+  ],
+  "validation": {
+    "focused_ep16": "passed_all_16_ranks",
+    "hidden_size": 2050,
+    "large_sparse_tokens": 257,
+    "graph_replays": 8,
+    "retained_test_sha256": "50379a05dc78b1038dc515be80166aeb8afc7e2e939130fe9b9922bffc9d6736",
+    "full_model_timed_samples": 6,
+    "full_model_sanity_checks": 2
+  }
+}
