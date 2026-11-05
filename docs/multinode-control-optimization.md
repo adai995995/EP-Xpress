@@ -6,6 +6,10 @@ TTFT alongside that gain. The retained implementation keeps the original four
 publication/reuse barriers and fixes a separate receive-count ownership race.
 No hybrid forwarding or new selectable performance mode was added.
 
+The [subsequent work-distribution profiling](multinode-work-balance.md) separates
+context assignment, route volume and expert computation, and records the rejected
+task-interleaving experiment. It retains the same production transport.
+
 ## Final complete-model verification
 
 This is a new matched two-node allocation with eight NVIDIA H20D GPUs per host.
