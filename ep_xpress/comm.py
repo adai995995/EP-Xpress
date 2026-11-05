@@ -1,4 +1,7 @@
-"""Upper-layer NCCL handles for control metadata, never token payloads.
+"""Borrowed upper-layer NCCL handles and initialization metadata helpers.
+
+Single-node transports use these helpers only for control metadata. The opt-in
+GIN transport also borrows the handle to create its NCCL device communicator.
 
 Handles borrow a communicator and retain its owner. Close EP contexts before
 explicitly destroying the owner's communicator/process group. Metadata calls

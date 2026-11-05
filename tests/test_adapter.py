@@ -190,6 +190,17 @@ class AdapterValidationTest(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 validate_server_args(SimpleNamespace(**(values | changes)), model)
 
+    def test_multinode_requires_explicit_gin_with_host_local_transport(self):
+        model = SimpleNamespace(architectures=["Qwen3MoeForCausalLM"])
+        args = SimpleNamespace(tp_size=16, ep_size=16, dp_size=16, nnodes=2,
+                               enable_dp_attention=True, moe_runner_backend="triton", dtype="bfloat16")
+        with patch.dict(os.environ, {"EP_XPRESS_INTERNODE_TRANSPORT": "gin", "EP_XPRESS_TRANSPORT": "host_sm"}):
+            validate_server_args(args, model)
+        for values in ({"EP_XPRESS_INTERNODE_TRANSPORT": "none", "EP_XPRESS_TRANSPORT": "host_sm"},
+                       {"EP_XPRESS_INTERNODE_TRANSPORT": "gin", "EP_XPRESS_TRANSPORT": "host_ce"}):
+            with patch.dict(os.environ, values), self.assertRaises(ValueError):
+                validate_server_args(args, model)
+
 
 class AdapterContractTest(unittest.TestCase):
     def test_host_sm_borrows_upper_layer_ep_communicator_once(self):

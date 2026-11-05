@@ -26,8 +26,21 @@ class Config:
     decode_max_tokens: int = 0  # 0: no decode mailbox; otherwise per-source capacity
     combine_warp_specialization: bool = False  # independent pair-queue send/receive groups
     decode_single_frame: bool = False  # bounded dispatch with one final frame per channel
+    internode_transport: str = "none"  # opt-in direct GIN; local payloads still use host memory
+    gin_contexts: int = 4
+    gin_gpu_budget_bytes: int = 2 << 30  # registered staging per rank, excluding expert outputs
 
     def __post_init__(self):
+        if self.internode_transport not in ("none", "gin"):
+            raise ValueError("internode_transport must be none or gin")
+        if self.internode_transport == "gin" and self.transport != "host_sm":
+            raise ValueError("GIN requires host_sm for intra-node payloads")
+        if (isinstance(self.gin_contexts, bool) or not isinstance(self.gin_contexts, int)
+                or not 1 <= self.gin_contexts <= 32):
+            raise ValueError("gin_contexts must be an integer in [1, 32]")
+        if (isinstance(self.gin_gpu_budget_bytes, bool) or
+                not isinstance(self.gin_gpu_budget_bytes, int) or self.gin_gpu_budget_bytes <= 0):
+            raise ValueError("gin_gpu_budget_bytes must be positive")
         if not isinstance(self.decode_single_frame, bool):
             raise ValueError("decode_single_frame must be a bool")
         if self.decode_single_frame and (self.transport != "host_sm" or not self.decode_max_tokens):
@@ -87,7 +100,33 @@ class Config:
     def slot_bytes(self):
         return ((self.chunk_rows * self.hidden_size * 2 + 4095) // 4096) * 4096
 
-    def pool_bytes(self, world_size):
+    def gin_producer_bytes(self, local_world_size):
+        """One producer's host dispatch records and rank-pair combine slots."""
+        if (isinstance(local_world_size, bool) or not isinstance(local_world_size, int)
+                or not 1 <= local_world_size <= 256):
+            raise ValueError("local_world_size must be an integer in [1, 256]")
+        stride = ((self.hidden_size * 2 + self.topk * 8 + 4 + 127) // 128) * 128
+        combine_start = ((128 + self.max_tokens_per_rank * stride + 4095) // 4096) * 4096
+        return ((combine_start + local_world_size * self.max_tokens_per_rank * self.hidden_size * 2
+                 + 4095) // 4096) * 4096
+
+    def gin_registered_bytes(self, world_size):
+        """Registered GPU staging per rank, excluding outputs and NCCL internals."""
+        if (isinstance(world_size, bool) or not isinstance(world_size, int)
+                or not 2 <= world_size <= 256):
+            raise ValueError("GIN world_size must be an integer in [2, 256]")
+        stride = ((self.hidden_size * 2 + self.topk * 8 + 4 + 127) // 128) * 128
+        header = ((world_size * 8 + 127) // 128) * 128
+        size = (header + (world_size + 1) * self.max_tokens_per_rank * stride +
+                world_size * self.max_tokens_per_rank * self.hidden_size * 4)
+        alignment = 2 << 20
+        return ((size + alignment - 1) // alignment) * alignment
+
+    def pool_bytes(self, world_size, *, local_world_size=None):
+        if self.internode_transport == "gin":
+            if local_world_size is None or local_world_size >= world_size:
+                raise ValueError("GIN host budgeting requires this node's local_world_size < world_size")
+            return local_world_size * self.gin_producer_bytes(local_world_size)
         if self.transport == "host_sm":
             return world_size * (self.mapped_arena_bytes(self.topk) +
                                  self.mapped_arena_bytes(0, queue_peers=world_size) +
@@ -151,9 +190,9 @@ class Config:
         return channels * queue_peers * (1 + dispatch_banks) * (
             (128 + self.slots * slot_bytes + notification_bytes + 4095) // 4096) * 4096
 
-    def pinned_working_set_bytes(self, world_size):
+    def pinned_working_set_bytes(self, world_size, *, local_world_size=None):
         """Shared rings plus all ranks' reusable private receive packs."""
         if self.transport == "host_sm":
-            return self.pool_bytes(world_size)
+            return self.pool_bytes(world_size, local_world_size=local_world_size)
         packs = world_size * (world_size - 1) * self.slots * self.chunk_rows * self.hidden_size * 2
         return self.pool_bytes(world_size) + packs

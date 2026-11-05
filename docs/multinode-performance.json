@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-05",
+  "model": "Qwen3-30B-A3B-Instruct-2507",
+  "hardware": {
+    "nodes": 2,
+    "gpus_per_node": 8,
+    "gpu": "NVIDIA H20D"
+  },
+  "software": {
+    "sglang_revision": "e00930c5489053f26d86b179cee0d087f846acbb",
+    "torch": "2.13.0+cu130",
+    "cuda": "13.0",
+    "nccl_runtime": 23007,
+    "triton": "3.7.1",
+    "flashinfer": "0.6.18"
+  },
+  "configuration": {
+    "tp": 16,
+    "ep": 16,
+    "dp": 16,
+    "dtype": "bfloat16",
+    "expert_runner": "triton",
+    "attention_backend": "flashinfer",
+    "decode_graph": "full",
+    "local_graph_buckets": [
+      1,
+      2,
+      4
+    ],
+    "prefill_graph": "disabled",
+    "nvlink_payload": false,
+    "gpu_p2p_payload": false,
+    "gdr": true,
+    "nccl_cumem_enable": 1,
+    "gin_contexts": 4,
+    "max_tokens_per_source": 4096,
+    "gpu_registered_bytes_per_rank": 832569344,
+    "host_bytes_per_producer": 151523328
+  },
+  "workload": {
+    "batch_sizes": [
+      1,
+      32
+    ],
+    "input_tokens": 512,
+    "output_tokens": 32,
+    "repeats": 3,
+    "warmups_per_case": 16,
+    "warmup_output_tokens": 16,
+    "seed": 20261017,
+    "radix_cache": false,
+    "load_balance": "round_robin"
+  },
+  "metrics": {
+    "ttft_mean_ms": "Mean request first-token latency, then arithmetic mean over three batches. Includes admission, prefill and first decode.",
+    "steady_state_output_tokens_per_s": "Aggregate output rate from last request first-token arrival to first request completion, using token-count interpolation."
+  },
+  "results": {
+    "nccl": {
+      "1": {
+        "ttft_mean_ms": {
+          "mean": 139.07186718036732,
+          "min": 109.75577682256699,
+          "max": 165.54469894617796
+        },
+        "ttft_last_ms": {
+          "mean": 139.07186718036732,
+          "min": 109.75577682256699,
+          "max": 165.54469894617796
+        },
+        "steady_state_output_tokens_per_s": {
+          "mean": 52.80985220840947,
+          "min": 52.72799106914529,
+          "max": 52.86556055944036
+        },
+        "latency_ms": {
+          "mean": 726.2659668922424,
+          "min": 696.427546441555,
+          "max": 752.3828698322177
+        }
+      },
+      "32": {
+        "ttft_mean_ms": {
+          "mean": 809.0022316804001,
+          "min": 800.0866867951117,
+          "max": 822.5500499538612
+        },
+        "ttft_last_ms": {
+          "mean": 893.9501876011491,
+          "min": 857.0140395313501,
+          "max": 942.7715465426445
+        },
+        "steady_state_output_tokens_per_s": {
+          "mean": 1520.8929047051565,
+          "min": 1518.2830665291574,
+          "max": 1523.4094517879178
+        },
+        "latency_ms": {
+          "mean": 1542.5955019891262,
+          "min": 1506.6510327160358,
+          "max": 1591.0087749361992
+        }
+      }
+    },
+    "ep_xpress": {
+      "1": {
+        "ttft_mean_ms": {
+          "mean": 101.25478046635787,
+          "min": 99.73014798015356,
+          "max": 103.23921591043472
+        },
+        "ttft_last_ms": {
+          "mean": 101.25478046635787,
+          "min": 99.73014798015356,
+          "max": 103.23921591043472
+        },
+        "steady_state_output_tokens_per_s": {
+          "mean": 68.33907635296602,
+          "min": 68.06125822223014,
+          "max": 68.49200564708681
+        },
+        "latency_ms": {
+          "mean": 555.0328561415275,
+          "min": 552.620604634285,
+          "max": 558.8118117302656
+        }
+      },
+      "32": {
+        "ttft_mean_ms": {
+          "mean": 531.655619784336,
+          "min": 497.96099177910946,
+          "max": 552.2910689760465
+        },
+        "ttft_last_ms": {
+          "mean": 549.8478095978498,
+          "min": 524.4052549824119,
+          "max": 563.0672117695212
+        },
+        "steady_state_output_tokens_per_s": {
+          "mean": 2009.2971934491777,
+          "min": 2002.5851686044596,
+          "max": 2017.8504744870665
+        },
+        "latency_ms": {
+          "mean": 1042.179369367659,
+          "min": 1015.2722354978323,
+          "max": 1057.8223336488008
+        }
+      }
+    }
+  },
+  "sanity_outputs_match": [
+    "2 + 2 = 4",
+    "Paris"
+  ],
+  "transport_source_sha256": {
+    "ep_xpress/csrc/gin.cu": "db88bcca3848f00c5536223f7971870f7ea9c37d7c6759af1e61f707022c0eb2",
+    "ep_xpress/multinode.py": "8d8b19bae6e46601aa7fa0d85ce6b053ae82ceea4327f8e8b4d93e5e6bc4a683",
+    "ep_xpress/gin_native.py": "471f6676a0bcb4f98f7f98c50f4505b133aa7a1eca84281db6638ccf28199bef"
+  },
+  "prompt_sha256": [
+    "759c6d4a24448ea672c2e2ce687e7daafa9fd8a9b21ec8070c8669b69cd75836",
+    "63d494b0759f61767638c611fc042f6635a76b9af4ce465b9f4699f3f11f8029",
+    "61b434a8a0f7c55149fa7086a306659d380ece87dd080a72afdbd96219d88009",
+    "4bb451ecb23853c0adcda0b54c37b1473185746882831cc3ca21f40c374bdb1b",
+    "ced2527915210938eb42df6f623f64215af81da2beb6496a1e2c8450816502b4",
+    "d07bd57c0716c9832f0ea0fa400bf018e5d64368c1a20d887642ea1abca318c9"
+  ],
+  "observed_prefill_splits_32": {
+    "nccl": [
+      {
+        "repeat": 0,
+        "ranks_one_prefill_batch": 9,
+        "ranks_two_prefill_batches": 7,
+        "total_prefill_calls": 23
+      },
+      {
+        "repeat": 1,
+        "ranks_one_prefill_batch": 11,
+        "ranks_two_prefill_batches": 5,
+        "total_prefill_calls": 21
+      },
+      {
+        "repeat": 2,
+        "ranks_one_prefill_batch": 13,
+        "ranks_two_prefill_batches": 3,
+        "total_prefill_calls": 19
+      }
+    ],
+    "ep_xpress": [
+      {
+        "repeat": 0,
+        "ranks_one_prefill_batch": 15,
+        "ranks_two_prefill_batches": 1,
+        "total_prefill_calls": 17
+      },
+      {
+        "repeat": 1,
+        "ranks_one_prefill_batch": 14,
+        "ranks_two_prefill_batches": 2,
+        "total_prefill_calls": 18
+      },
+      {
+        "repeat": 2,
+        "ranks_one_prefill_batch": 10,
+        "ranks_two_prefill_batches": 6,
+        "total_prefill_calls": 22
+      }
+    ]
+  }
+}

@@ -1,10 +1,15 @@
 """Dependency-free validation for the experimental SGLang adapter."""
 
+import os
+
 
 def validate_server_args(args, hf_config):
     """Fail closed outside the first integration's explicitly supported scope."""
-    if getattr(args, "nnodes", 1) != 1:
-        raise ValueError("EP-Xpress requires a single host")
+    if getattr(args, "nnodes", 1) != 1 and not (
+        os.environ.get("EP_XPRESS_TRANSPORT", "host_ce") == "host_sm" and
+        os.environ.get("EP_XPRESS_INTERNODE_TRANSPORT", "none") == "gin"
+    ):
+        raise ValueError("multi-node EP-Xpress requires host_sm and EP_XPRESS_INTERNODE_TRANSPORT=gin")
     if getattr(args, "pp_size", 1) != 1:
         raise ValueError("EP-Xpress does not support pipeline parallelism")
     tp = getattr(args, "tp_size", 1)

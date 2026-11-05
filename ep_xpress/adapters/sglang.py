@@ -39,7 +39,7 @@ def _get_ep_nccl_comm(group, device):
     from ep_xpress.comm import get_nccl_comm_handle
 
     handle = get_nccl_comm_handle(group, device=device)
-    _logger.info("EP-Xpress communicator: upper-layer EP NCCL; bootstrap=NCCL; token transport=host_sm")
+    _logger.info("EP-Xpress communicator: upper-layer EP NCCL; bootstrap=NCCL")
     return handle
 
 
@@ -148,6 +148,9 @@ class HostEPDispatcher(BaseDispatcher):
             channels=int(os.environ.get("EP_XPRESS_CHANNELS", "4")),
             host_pool_budget_bytes=int(os.environ.get("EP_XPRESS_HOST_BUDGET_BYTES", str(512 << 20))),
             transport=transport,
+            internode_transport=os.environ.get("EP_XPRESS_INTERNODE_TRANSPORT", "none"),
+            gin_contexts=int(os.environ.get("EP_XPRESS_GIN_CONTEXTS", "4")),
+            gin_gpu_budget_bytes=int(os.environ.get("EP_XPRESS_GIN_GPU_BUDGET_BYTES", str(2 << 30))),
             fatal_errors=transport == "host_sm",
             diagnostics=diagnostics == "1",
             combine_frame_rows=(int(os.environ.get("EP_XPRESS_COMBINE_FRAME_ROWS", "0"))
@@ -208,6 +211,9 @@ class HostEPDispatcher(BaseDispatcher):
                     self._config.channels,
                     _contexts[self._context_key].effective_channels,
                 )
+            if self._config.internode_transport == "gin":
+                _logger.info("EP-Xpress multi-node transport: %s",
+                             _contexts[self._context_key].transport_info)
         self._resolved_context = _contexts[self._context_key]
         return self._resolved_context
 

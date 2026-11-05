@@ -1,7 +1,9 @@
 # EP-Xpress
 
-An independent expert-parallel communication library for single-node MoE
-inference through host memory, without GPU peer access or NVLink payloads.
+An independent expert-parallel communication library for MoE inference.
+Intra-node payloads pass through host memory without GPU peer access or NVLink.
+An opt-in [multi-node GIN transport](docs/multinode-gin.md) adds direct GDR
+between GPUs on different hosts.
 
 **Status: experimental BF16 inference implementation.** Two selectable transports
 share the dispatch/combine interface: `host_ce` uses CPU routing and copy
@@ -19,7 +21,9 @@ End-to-end performance must be measured against the intended inference framework
   receive packs in `host_ce`. The `host_sm` path uses GPU loads/stores to
   registered shared host pages, with GPU routing, destination deduplication,
   publication, acknowledgments, and inverse routing.
-- No remote GPU pointers, GPU IPC, peer copies, or RDMA in either transport.
+- The default single-node transports use no remote GPU pointers, GPU IPC,
+  peer copies, or RDMA. `internode_transport="gin"` explicitly adds GDAKI/GDR
+  for remote hosts while retaining host staging for local peers.
 - Bounded host rings with configurable slot count, immutable published chunks,
   generation IDs, consumer ACKs, and simultaneous send/receive progress.
   General prepared `host_sm` dispatch shares each producer's payload among its actual
@@ -55,7 +59,7 @@ bandwidth.
 ## Requirements and install
 
 The CUDA path requires Linux, NVIDIA GPUs supporting BF16, a matching CUDA
-toolkit with `nvcc`, PyTorch, a C++ compiler, and Ninja. All ranks must share a
+toolkit with `nvcc`, PyTorch, a C++ compiler, and Ninja. Ranks on each host must share a
 host-memory filesystem, normally `/dev/shm`. Allocate sufficient shared memory
 when using containers. One process owns one GPU.
 

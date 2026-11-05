@@ -7,7 +7,9 @@ The EP-Xpress core has no SGLang dependency.
 
 ## Supported contract
 
-- One Linux host, NVIDIA CUDA, BF16 activations and unquantized BF16 experts.
+- Linux hosts, NVIDIA CUDA, BF16 activations and unquantized BF16 experts.
+  Single-node host transport is the default. The opt-in multi-node transport
+  requires GDAKI-capable GDR networking; see [GIN setup](../../docs/multinode-gin.md).
 - `Qwen3MoeForCausalLM`, evenly partitioned contiguous experts.
 - Attention DP = TP = EP; MoE TP = 1, MoE DP = 1, pipeline parallelism = 1.
 - Eager prefill; eager decode by default, opt-in full decode CUDA Graph.

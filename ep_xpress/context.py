@@ -111,6 +111,9 @@ class Context:
     """
 
     def __new__(cls, nccl_comm, expert_to_rank, config, device=None, shared_directory=None):
+        if cls is Context and config.internode_transport == "gin":
+            from .multinode import MultiNodeContext
+            return object.__new__(MultiNodeContext)
         if cls is Context and config.transport == "host_sm":
             from .host_sm import HostSMContext
             return object.__new__(HostSMContext)
